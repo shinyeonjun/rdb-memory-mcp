@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: dbmcp-postgres
+    environment:
+      POSTGRES_USER: dbmcp
+      POSTGRES_PASSWORD: dbmcp
+      POSTGRES_DB: dbmcp
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbmcp -d dbmcp"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mysql:
+    image: mysql:8.4
+    container_name: dbmcp-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: dbmcp
+      MYSQL_USER: dbmcp
+      MYSQL_PASSWORD: dbmcp
+    ports:
+      - "13306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-udbmcp", "-pdbmcp"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: dbmcp-sqlserver
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Password123!"
+    ports:
+      - "11433:1433"
+
+  oracle:
+    image: gvenzl/oracle-free:23-slim-faststart
+    container_name: dbmcp-oracle
+    environment:
+      ORACLE_PASSWORD: oracle
+    ports:
+      - "11521:1521"

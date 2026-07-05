@@ -1,0 +1,35 @@
+# Rust build output
+/target/
+/target-*/
+
+# Local database-memory caches and generated databases
+/.database-memory/
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+
+# Keep checked-in SQL examples, but ignore generated example DB/cache files
+/examples/*.sqlite
+/examples/*.sqlite3
+/examples/*.db
+
+# Agent/session logs
+/.codex-*.log
+/codex-logs/
+
+# Local env and secrets
+.env
+.env.*
+!.env.example
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini

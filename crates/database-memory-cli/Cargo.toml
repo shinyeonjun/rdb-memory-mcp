@@ -1,0 +1,13 @@
+[package]
+name = "database-memory-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "database-memory"
+path = "src/main.rs"
+
+[dependencies]
+database-memory-core = { path = "../database-memory-core" }
+serde_json = "1"

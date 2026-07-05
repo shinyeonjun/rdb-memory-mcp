@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "crates/database-memory-core",
+    "crates/database-memory-cli",
+    "crates/database-memory-mcp",
+]
+resolver = "2"

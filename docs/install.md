@@ -1,0 +1,75 @@
+# Database Memory MCP Install
+
+Database Memory MCP indexes relational database schema metadata into a local graph and exposes that graph through a CLI and an MCP stdio server. It is metadata-focused: the default adapters introspect catalogs/schema objects, not user table rows.
+
+## Build From Source
+
+Prerequisites:
+
+- Rust toolchain with Cargo installed.
+- A C compiler/toolchain available to Cargo, because some adapter dependencies build native code.
+- On Windows, use the MSVC Rust toolchain with Visual Studio Build Tools or another working MSVC C/C++ build environment.
+- On macOS or Linux, a normal system C compiler such as clang or gcc is expected.
+
+Build the whole workspace in release mode:
+
+```powershell
+cargo build --release
+```
+
+Release binaries are written under `target/release/`:
+
+- CLI: `target/release/database-memory` on macOS/Linux, `target/release/database-memory.exe` on Windows.
+- MCP stdio server: `target/release/database-memory-mcp` on macOS/Linux, `target/release/database-memory-mcp.exe` on Windows.
+
+## Platform Notes
+
+Windows:
+
+- This project has been built with the MSVC Rust toolchain.
+- Install Rust with rustup and make sure an MSVC C/C++ build environment is available before running the release build.
+- Native/build-heavy dependencies include bundled SQLite through `rusqlite`, SQL Server support through `tiberius`/rustls/ring, Oracle support through `odpic-sys` vendored C sources, and MySQL support through the `mysql` crate dependency tree.
+
+macOS:
+
+- Install Rust with rustup.
+- Ensure Xcode Command Line Tools or another clang-based C toolchain is installed.
+- The same native adapter dependencies are compiled during `cargo build --release`.
+
+Linux:
+
+- Install Rust with rustup or your distribution package manager.
+- Ensure gcc or clang plus typical build tooling is installed.
+- The same native adapter dependencies are compiled during `cargo build --release`.
+
+## MCP Client Configuration
+
+Register `database-memory-mcp` as a stdio MCP server. The server does not need command-line arguments for stdio mode.
+
+Claude Code / Claude Desktop-style clients commonly use an `mcpServers` map:
+
+```json
+{
+  "mcpServers": {
+    "database-memory": {
+      "command": "/absolute/path/to/target/release/database-memory-mcp",
+      "args": []
+    }
+  }
+}
+```
+
+Some MCP clients use a `servers` map instead:
+
+```json
+{
+  "servers": {
+    "database-memory": {
+      "command": "/absolute/path/to/target/release/database-memory-mcp",
+      "args": []
+    }
+  }
+}
+```
+
+On Windows, point `command` at the built `.exe`, for example `C:\path\to\target\release\database-memory-mcp.exe`. Keep the path specific to your local checkout or copied release binary.
