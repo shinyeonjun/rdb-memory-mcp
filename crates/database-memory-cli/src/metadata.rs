@@ -336,32 +336,34 @@ pub(crate) fn render_find_table(
     store: &GraphStore,
     snapshot_key: &str,
     query: &str,
+    format: OutputFormat,
 ) -> Result<String, String> {
     let needle = query.to_lowercase();
-    let mut out = String::new();
+    let mut tables = Vec::new();
     for node in store
         .nodes_by_label(snapshot_key, "Table")
         .map_err(|err| err.to_string())?
     {
         let key = object_key(&node)?;
         if key.object_name.to_lowercase().contains(&needle) {
-            out.push_str(&format!(
-                "{}
-",
-                key.object_name
-            ));
+            tables.push(key.object_name);
         }
     }
-    Ok(out)
+    tables.sort();
+    match format {
+        OutputFormat::Text => Ok(lines(&tables)),
+        OutputFormat::Json => Ok(json_line(json!({ "tables": tables }))),
+    }
 }
 
 pub(crate) fn render_find_column(
     store: &GraphStore,
     snapshot_key: &str,
     query: &str,
+    format: OutputFormat,
 ) -> Result<String, String> {
     let needle = query.to_lowercase();
-    let mut out = String::new();
+    let mut columns = Vec::new();
     for node in store
         .nodes_by_label(snapshot_key, "Column")
         .map_err(|err| err.to_string())?
@@ -369,14 +371,44 @@ pub(crate) fn render_find_column(
         let key = object_key(&node)?;
         let column_name = key.sub_object.as_deref().unwrap_or(&key.object_name);
         if column_name.to_lowercase().contains(&needle) {
-            out.push_str(&format!(
-                "{}.{}
-",
-                key.object_name, column_name
-            ));
+            columns.push(json!({
+                "table": key.object_name,
+                "column": column_name,
+            }));
         }
     }
-    Ok(out)
+    columns.sort_by(|left, right| {
+        left["table"]
+            .as_str()
+            .cmp(&right["table"].as_str())
+            .then_with(|| left["column"].as_str().cmp(&right["column"].as_str()))
+    });
+    match format {
+        OutputFormat::Text => Ok(lines(
+            &columns
+                .iter()
+                .map(|column| {
+                    format!(
+                        "{}.{}",
+                        column["table"].as_str().unwrap_or_default(),
+                        column["column"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )),
+        OutputFormat::Json => Ok(json_line(json!({ "columns": columns }))),
+    }
+}
+
+fn lines(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("{value}\n"))
+        .collect::<String>()
+}
+
+fn json_line(value: serde_json::Value) -> String {
+    format!("{}\n", serde_json::to_string_pretty(&value).unwrap())
 }
 
 fn required_node(
@@ -491,11 +523,11 @@ mod tests {
         assert!(text.contains("fk_orders_user: orders(user_id) -> users(id)"));
         assert!(json.contains(r#""table": "orders""#));
         assert_eq!(
-            render_find_table(&store, SNAPSHOT, "ord").unwrap(),
+            render_find_table(&store, SNAPSHOT, "ord", OutputFormat::Text).unwrap(),
             "orders\n"
         );
         assert_eq!(
-            render_find_column(&store, SNAPSHOT, "USER").unwrap(),
+            render_find_column(&store, SNAPSHOT, "USER", OutputFormat::Text).unwrap(),
             "orders.user_id\n"
         );
     }

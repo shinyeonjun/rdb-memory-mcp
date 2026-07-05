@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Package Windows amd64 zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/rdb-memory-mcp-windows-amd64 | Out-Null
+          Copy-Item target/release/database-memory.exe dist/rdb-memory-mcp-windows-amd64/
+          Copy-Item target/release/database-memory-mcp.exe dist/rdb-memory-mcp-windows-amd64/
+          Copy-Item README.md, LICENSE dist/rdb-memory-mcp-windows-amd64/
+          Compress-Archive -Path dist/rdb-memory-mcp-windows-amd64/* -DestinationPath dist/rdb-memory-mcp-windows-amd64.zip -Force
+          Get-FileHash dist/rdb-memory-mcp-windows-amd64.zip -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  rdb-memory-mcp-windows-amd64.zip" } |
+            Set-Content dist/checksums.txt
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/rdb-memory-mcp-windows-amd64.zip
+            dist/checksums.txt

@@ -12,6 +12,7 @@ pub(crate) enum Command {
         path: Option<PathBuf>,
         connection_string: Option<String>,
         alias: String,
+        format: OutputFormat,
         cache_path: PathBuf,
     },
     DescribeTable {
@@ -23,11 +24,13 @@ pub(crate) enum Command {
     FindTable {
         alias: String,
         query: String,
+        format: OutputFormat,
         cache_path: PathBuf,
     },
     FindColumn {
         alias: String,
         query: String,
+        format: OutputFormat,
         cache_path: PathBuf,
     },
 }
@@ -65,10 +68,15 @@ fn parse_index_args(
     let mut path = None;
     let mut alias = None;
     let mut connection_string = None;
+    let mut format = OutputFormat::Text;
     let mut cache_path = None;
     let mut config_path = None;
 
     while let Some(flag) = args.next() {
+        if flag == "--json" {
+            format = OutputFormat::Json;
+            continue;
+        }
         let value = args
             .next()
             .ok_or_else(|| format!("missing value for {flag}"))?;
@@ -77,6 +85,7 @@ fn parse_index_args(
             "--path" => path = Some(PathBuf::from(value)),
             "--connection-string" => connection_string = Some(value),
             "--alias" => alias = Some(value),
+            "--format" => format = parse_format(&value)?,
             "--cache-path" => cache_path = Some(PathBuf::from(value)),
             "--config-path" => config_path = Some(PathBuf::from(value)),
             _ => return Err(format!("unknown index flag '{flag}'")),
@@ -109,6 +118,7 @@ fn parse_index_args(
         path,
         connection_string,
         alias: alias.ok_or("missing --alias")?,
+        format,
         cache_path: cache_path
             .or_else(|| profile.and_then(|profile| profile.cache_path))
             .unwrap_or_else(default_cache_path),
@@ -126,6 +136,7 @@ fn parse_describe_table_args(
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--json" => format = OutputFormat::Json,
             "--format" => {
                 let value = args.next().ok_or("missing value for --format")?;
                 format = parse_format(&value)?;
@@ -169,11 +180,17 @@ fn parse_find_args(
     config_loader: &impl Fn(&Path) -> Option<DatabaseMemoryConfig>,
 ) -> Result<Command, String> {
     let mut positionals = Vec::new();
+    let mut format = OutputFormat::Text;
     let mut cache_path = None;
     let mut config_path = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--json" => format = OutputFormat::Json,
+            "--format" => {
+                let value = args.next().ok_or("missing value for --format")?;
+                format = parse_format(&value)?;
+            }
             "--cache-path" => {
                 let value = args.next().ok_or("missing value for --cache-path")?;
                 cache_path = Some(PathBuf::from(value));
@@ -204,11 +221,13 @@ fn parse_find_args(
         "find-table" => Ok(Command::FindTable {
             alias,
             query,
+            format,
             cache_path,
         }),
         "find-column" => Ok(Command::FindColumn {
             alias,
             query,
+            format,
             cache_path,
         }),
         _ => unreachable!(),
@@ -232,14 +251,14 @@ fn parse_format(value: &str) -> Result<OutputFormat, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: database-memory index --source sqlite --path <db> --alias <name> [--cache-path <path>] [--config-path <path>]\n       database-memory index --source ddl-sqlite --path <sql-file-or-dir> --alias <name> [--cache-path <path>]
-       database-memory index --source postgres --connection-string <url> --alias <name> [--cache-path <path>]
-       database-memory index --source mysql --connection-string <url> --alias <name> [--cache-path <path>]
-       database-memory index --source sqlserver --connection-string <ado-connection-string> --alias <name> [--cache-path <path>]
-       database-memory index --source oracle --connection-string <user/password@connect_string> --alias <name> [--cache-path <path>]
+    "usage: database-memory index --source sqlite --path <db> --alias <name> [--format text|json] [--cache-path <path>] [--config-path <path>]\n       database-memory index --source ddl-sqlite --path <sql-file-or-dir> --alias <name> [--format text|json] [--cache-path <path>]
+       database-memory index --source postgres --connection-string <url> --alias <name> [--format text|json] [--cache-path <path>]
+       database-memory index --source mysql --connection-string <url> --alias <name> [--format text|json] [--cache-path <path>]
+       database-memory index --source sqlserver --connection-string <ado-connection-string> --alias <name> [--format text|json] [--cache-path <path>]
+       database-memory index --source oracle --connection-string <user/password@connect_string> --alias <name> [--format text|json] [--cache-path <path>]
        database-memory describe-table <alias> <table-name> [--format text|json] [--cache-path <path>] [--config-path <path>]
-       database-memory find-table <alias> <query> [--cache-path <path>] [--config-path <path>]
-       database-memory find-column <alias> <query> [--cache-path <path>] [--config-path <path>]"
+       database-memory find-table <alias> <query> [--format text|json] [--cache-path <path>] [--config-path <path>]
+       database-memory find-column <alias> <query> [--format text|json] [--cache-path <path>] [--config-path <path>]"
 }
 
 fn default_cache_path() -> PathBuf {
@@ -272,6 +291,7 @@ mod tests {
                 path: Some(PathBuf::from("sample.sqlite")),
                 connection_string: None,
                 alias: "sample".to_owned(),
+                format: OutputFormat::Text,
                 cache_path: PathBuf::from(".database-memory").join("graph.sqlite"),
             }
         );

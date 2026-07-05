@@ -16,6 +16,20 @@ It is metadata-only by product boundary. It is not a live SQL query tool, not a 
 
 For build, install, and MCP client setup, see [docs/install.md](docs/install.md). For the full phase history and design details, see [docs/plans/database-memory-mcp.md](docs/plans/database-memory-mcp.md).
 
+## Release Binaries
+
+Tagged releases build a Windows zip:
+
+~~~text
+rdb-memory-mcp-windows-amd64.zip
+  database-memory.exe
+  database-memory-mcp.exe
+  README.md
+  LICENSE
+~~~
+
+The CLI supports machine-readable output with `--format json` or `--json` on `index`, `describe-table`, `find-table`, and `find-column`.
+
 ## MCP Client Config
 
 Use the built MCP stdio server binary. Full platform notes and alternate client shapes are in [docs/install.md](docs/install.md).
