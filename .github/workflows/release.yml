@@ -11,32 +11,40 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.96.1 --profile minimal --component clippy --component rustfmt --target x86_64-pc-windows-msvc
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked --workspace
 
       - name: Build release binaries
-        run: cargo build --release
+        run: cargo build --locked --release
 
-      - name: Package Windows amd64 zip
+      - name: Package and verify metadata-only release
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist/rdb-memory-mcp-windows-amd64 | Out-Null
-          Copy-Item target/release/database-memory.exe dist/rdb-memory-mcp-windows-amd64/
-          Copy-Item target/release/database-memory-mcp.exe dist/rdb-memory-mcp-windows-amd64/
-          Copy-Item README.md, LICENSE dist/rdb-memory-mcp-windows-amd64/
-          Compress-Archive -Path dist/rdb-memory-mcp-windows-amd64/* -DestinationPath dist/rdb-memory-mcp-windows-amd64.zip -Force
-          Get-FileHash dist/rdb-memory-mcp-windows-amd64.zip -Algorithm SHA256 |
-            ForEach-Object { "$($_.Hash.ToLower())  rdb-memory-mcp-windows-amd64.zip" } |
-            Set-Content dist/checksums.txt
+        run: .\scripts\package-release.ps1
 
-      - name: Upload release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/rdb-memory-mcp-windows-amd64.zip
-            dist/checksums.txt
+      - name: Publish release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag dist/rdb-memory-mcp-windows-amd64.zip dist/checksums.txt --clobber
+          } else {
+            gh release create $tag dist/rdb-memory-mcp-windows-amd64.zip dist/checksums.txt --verify-tag --generate-notes --title $tag
+          }

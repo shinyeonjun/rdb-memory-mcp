@@ -28,7 +28,16 @@ rdb-memory-mcp-windows-amd64.zip
   LICENSE
 ~~~
 
-The CLI supports machine-readable output with `--format json` or `--json` on `index`, `describe-table`, `find-table`, and `find-column`.
+The CLI exposes a versioned metadata-only JSON contract. Machine-readable output is available for `contract`, `index`, `describe-table`, `inventory`, `find-table`, `find-column`, `impact-analysis`, and `trace-relationships`.
+
+~~~powershell
+database-memory contract --format json
+database-memory inventory ddl-sqlite:shop --limit 100 --format json --cache-path examples/shop-cache.sqlite
+database-memory impact-analysis ddl-sqlite:shop --object-key sqlite:shop:main:main:table:orders --max-depth 3 --limit 50 --format json --cache-path examples/shop-cache.sqlite
+database-memory trace-relationships ddl-sqlite:shop sqlite:shop:main:main:table:orders --max-depth 4 --limit 20 --format json --cache-path examples/shop-cache.sqlite
+~~~
+
+The contract reports `metadata_only: true` and `row_data_access: false`; traversal and inventory limits are bounded by the binary contract.
 
 ## MCP Client Config
 

@@ -18,8 +18,6 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 pub const PRODUCT_BOUNDARY: &str = "RDB schema graph memory";
-/// Future row-data sampling must be guarded by this default-off Cargo feature.
-pub const UNSAFE_ROW_SAMPLING_FEATURE: &str = "unsafe-row-sampling";
 
 pub fn product_boundary() -> &'static str {
     PRODUCT_BOUNDARY
@@ -418,11 +416,6 @@ mod tests {
     #[test]
     fn product_boundary_stays_rdb_first() {
         assert_eq!("RDB schema graph memory", product_boundary());
-    }
-
-    #[test]
-    fn unsafe_row_sampling_feature_is_named_guardrail_only() {
-        assert_eq!("unsafe-row-sampling", UNSAFE_ROW_SAMPLING_FEATURE);
     }
 
     #[test]

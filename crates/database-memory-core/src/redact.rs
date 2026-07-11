@@ -30,7 +30,7 @@ fn redact_url_passwords(value: &str) -> String {
 
         let after_scheme = &rest[authority_start..];
         let authority_end = after_scheme
-            .find(|ch| matches!(ch, '/' | '?' | '#'))
+            .find(['/', '?', '#'])
             .unwrap_or(after_scheme.len());
         let authority = &after_scheme[..authority_end];
 

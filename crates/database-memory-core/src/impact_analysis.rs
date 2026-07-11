@@ -35,6 +35,14 @@ pub struct ImpactAnalysisNode {
     pub display_name: Option<String>,
     pub depth: u32,
     pub edge_type_used: String,
+    pub edge_from: String,
+    pub edge_to: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedImpactAnalysisResult {
+    pub result: ImpactAnalysisResult,
+    pub truncated: bool,
 }
 
 pub fn impact_analysis(
@@ -44,26 +52,51 @@ pub fn impact_analysis(
     direction: Direction,
     max_depth: u32,
 ) -> GraphStoreResult<ImpactAnalysisResult> {
+    Ok(impact_analysis_bounded(
+        store,
+        snapshot_key,
+        object_key,
+        direction,
+        max_depth,
+        usize::MAX,
+    )?
+    .result)
+}
+
+pub fn impact_analysis_bounded(
+    store: &GraphStore,
+    snapshot_key: &str,
+    object_key: &str,
+    direction: Direction,
+    max_depth: u32,
+    max_results: usize,
+) -> GraphStoreResult<BoundedImpactAnalysisResult> {
     let mut visited = HashSet::from([object_key.to_owned()]);
     let mut queue = VecDeque::from([(object_key.to_owned(), 0)]);
     let mut nodes = Vec::new();
+    let mut truncated = false;
+    let mut remaining_budget = max_results;
 
     if store.get_node(snapshot_key, object_key)?.is_none() {
-        return Ok(result(
-            snapshot_key,
-            object_key,
-            direction,
-            max_depth,
-            nodes,
-        ));
+        return Ok(BoundedImpactAnalysisResult {
+            result: result(snapshot_key, object_key, direction, max_depth, nodes),
+            truncated,
+        });
     }
 
-    while let Some((node_key, depth)) = queue.pop_front() {
+    'traversal: while let Some((node_key, depth)) = queue.pop_front() {
         if depth == max_depth {
             continue;
         }
 
-        for (edge, next_key) in next_edges(store, snapshot_key, &node_key, direction)? {
+        let (edges, has_more_edges) =
+            next_edges_bounded(store, snapshot_key, &node_key, direction, remaining_budget)?;
+        if max_results != usize::MAX {
+            remaining_budget -= edges.len();
+        }
+        truncated |= has_more_edges;
+
+        for (edge, next_key) in edges {
             if !visited.insert(next_key.clone()) {
                 continue;
             }
@@ -77,18 +110,21 @@ pub fn impact_analysis(
                     display_name: node.display_name,
                     depth: next_depth,
                     edge_type_used: edge.edge_type,
+                    edge_from: edge.edge_from,
+                    edge_to: edge.edge_to,
                 });
             }
         }
+
+        if has_more_edges {
+            break 'traversal;
+        }
     }
 
-    Ok(result(
-        snapshot_key,
-        object_key,
-        direction,
-        max_depth,
-        nodes,
-    ))
+    Ok(BoundedImpactAnalysisResult {
+        result: result(snapshot_key, object_key, direction, max_depth, nodes),
+        truncated,
+    })
 }
 
 pub(crate) fn next_edges(
@@ -123,6 +159,51 @@ pub(crate) fn next_edges(
     }
 
     Ok(edges)
+}
+
+pub(crate) fn next_edges_bounded(
+    store: &GraphStore,
+    snapshot_key: &str,
+    node_key: &str,
+    direction: Direction,
+    max_edges: usize,
+) -> GraphStoreResult<(Vec<(GraphEdgeRecord, String)>, bool)> {
+    if max_edges == usize::MAX {
+        return Ok((next_edges(store, snapshot_key, node_key, direction)?, false));
+    }
+
+    let mut edges = Vec::new();
+    if matches!(direction, Direction::Outbound | Direction::Both) {
+        let mut outbound =
+            store.edges_from_limited(snapshot_key, node_key, max_edges.saturating_add(1))?;
+        if outbound.len() > max_edges {
+            outbound.truncate(max_edges);
+            edges.extend(outbound.into_iter().map(|edge| {
+                let next = edge.edge_to.clone();
+                (edge, next)
+            }));
+            return Ok((edges, true));
+        }
+        edges.extend(outbound.into_iter().map(|edge| {
+            let next = edge.edge_to.clone();
+            (edge, next)
+        }));
+    }
+
+    if matches!(direction, Direction::Inbound | Direction::Both) {
+        let remaining = max_edges - edges.len();
+        let mut inbound =
+            store.edges_to_limited(snapshot_key, node_key, remaining.saturating_add(1))?;
+        let has_more = inbound.len() > remaining;
+        inbound.truncate(remaining);
+        edges.extend(inbound.into_iter().map(|edge| {
+            let next = edge.edge_from.clone();
+            (edge, next)
+        }));
+        return Ok((edges, has_more));
+    }
+
+    Ok((edges, false))
 }
 
 fn result(
@@ -207,6 +288,65 @@ mod impact_analysis_tests {
         let reached = reached_keys(&result);
 
         assert_eq!(reached, vec!["B".to_owned()]);
+    }
+
+    #[test]
+    fn bounded_impact_analysis_stops_and_reports_truncation() {
+        let store = empty_store();
+        node(&store, "A", "Table");
+        node(&store, "B", "Column");
+        node(&store, "C", "Index");
+        edge(&store, "A_TO_B", "A", "B", "A_TO_B");
+        edge(&store, "A_TO_C", "A", "C", "A_TO_C");
+
+        let bounded =
+            impact_analysis_bounded(&store, SNAPSHOT, "A", Direction::Outbound, 2, 1).unwrap();
+
+        assert!(bounded.truncated);
+        assert_eq!(reached_keys(&bounded.result), vec!["B".to_owned()]);
+    }
+
+    #[test]
+    fn impact_analysis_preserves_stored_endpoints_for_every_direction() {
+        let store = empty_store();
+        node(&store, "A", "Table");
+        node(&store, "B", "Table");
+        node(&store, "C", "Table");
+        edge(&store, "B_TO_A", "B", "A", "INBOUND_EDGE");
+        edge(&store, "A_TO_C", "A", "C", "OUTBOUND_EDGE");
+
+        let inbound = impact_analysis(&store, SNAPSHOT, "A", Direction::Inbound, 1).unwrap();
+        assert_endpoints(&inbound, "B", "B", "A");
+
+        let outbound = impact_analysis(&store, SNAPSHOT, "A", Direction::Outbound, 1).unwrap();
+        assert_endpoints(&outbound, "C", "A", "C");
+
+        let both = impact_analysis(&store, SNAPSHOT, "A", Direction::Both, 1).unwrap();
+        assert_endpoints(&both, "B", "B", "A");
+        assert_endpoints(&both, "C", "A", "C");
+    }
+
+    #[test]
+    fn bounded_edge_fetch_caps_high_degree_work_at_limit_plus_one() {
+        let store = empty_store();
+        node(&store, "A", "Table");
+        for index in 0..512 {
+            let next = format!("N{index:03}");
+            node(&store, &next, "Column");
+            edge(&store, &format!("EDGE_{index:03}"), "A", &next, "A_TO_N");
+        }
+
+        let (edges, has_more) =
+            next_edges_bounded(&store, SNAPSHOT, "A", Direction::Outbound, 2).unwrap();
+        assert!(has_more);
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0].1, "N000");
+        assert_eq!(edges[1].1, "N001");
+
+        let bounded =
+            impact_analysis_bounded(&store, SNAPSHOT, "A", Direction::Outbound, 1, 2).unwrap();
+        assert!(bounded.truncated);
+        assert_eq!(reached_keys(&bounded.result), vec!["N000", "N001"]);
     }
 
     fn seeded_store() -> GraphStore {
@@ -303,5 +443,21 @@ mod impact_analysis_tests {
             .flat_map(|group| group.nodes.iter())
             .find(|node| node.node_key == node_key)
             .map(|node| node.depth)
+    }
+
+    fn assert_endpoints(
+        result: &ImpactAnalysisResult,
+        node_key: &str,
+        edge_from: &str,
+        edge_to: &str,
+    ) {
+        let node = result
+            .groups
+            .iter()
+            .flat_map(|group| &group.nodes)
+            .find(|node| node.node_key == node_key)
+            .unwrap();
+        assert_eq!(node.edge_from, edge_from);
+        assert_eq!(node.edge_to, edge_to);
     }
 }

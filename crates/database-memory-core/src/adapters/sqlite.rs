@@ -272,6 +272,7 @@ fn table_columns(
         .map_err(SqliteAdapterError::from)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn table_foreign_keys(
     conn: &Connection,
     object_source_kind: &str,

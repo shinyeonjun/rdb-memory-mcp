@@ -711,14 +711,18 @@ fn routine_rows(client: &mut Client) -> PostgresAdapterResult<Vec<RoutineRow>> {
             schema: row.get(0),
             name: row.get(1),
             specific_name: row.get(2),
-            kind: match row.get::<_, String>(3).as_str() {
-                "PROCEDURE" => RoutineKind::Procedure,
-                _ => RoutineKind::Function,
-            },
+            kind: routine_kind_from_information_schema(row.get::<_, Option<String>>(3).as_deref()),
             definition: row.get(4),
             oid: row.get(5),
         })
         .collect())
+}
+
+fn routine_kind_from_information_schema(routine_type: Option<&str>) -> RoutineKind {
+    match routine_type {
+        Some("PROCEDURE") => RoutineKind::Procedure,
+        _ => RoutineKind::Function,
+    }
 }
 
 fn routine_dependency_rows(
@@ -915,6 +919,22 @@ mod postgres_adapter_tests {
         assert_eq!(capabilities.triggers, CapabilitySupport::Supported);
         assert_eq!(capabilities.routines, CapabilitySupport::Supported);
         assert_eq!(capabilities.dependencies, CapabilitySupport::Partial);
+    }
+
+    #[test]
+    fn postgres_null_routine_type_defaults_to_function() {
+        assert_eq!(
+            routine_kind_from_information_schema(Some("PROCEDURE")),
+            RoutineKind::Procedure
+        );
+        assert_eq!(
+            routine_kind_from_information_schema(Some("FUNCTION")),
+            RoutineKind::Function
+        );
+        assert_eq!(
+            routine_kind_from_information_schema(None),
+            RoutineKind::Function
+        );
     }
 
     #[test]

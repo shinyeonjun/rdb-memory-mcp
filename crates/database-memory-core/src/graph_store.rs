@@ -395,6 +395,28 @@ impl GraphStore {
         collect_edges(rows)
     }
 
+    pub fn edges_from_limited(
+        &self,
+        snapshot_key: &str,
+        edge_from: &str,
+        limit: usize,
+    ) -> GraphStoreResult<Vec<GraphEdgeRecord>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT snapshot_key, edge_key, edge_from, edge_to, edge_type, payload_json
+            FROM graph_edges
+            WHERE snapshot_key = ?1 AND edge_from = ?2
+            ORDER BY edge_key
+            LIMIT ?3
+            ",
+        )?;
+        let rows = stmt.query_map(
+            params![snapshot_key, edge_from, sqlite_limit(limit)],
+            map_edge,
+        )?;
+        collect_edges(rows)
+    }
+
     pub fn edges_to(
         &self,
         snapshot_key: &str,
@@ -409,6 +431,28 @@ impl GraphStore {
             ",
         )?;
         let rows = stmt.query_map(params![snapshot_key, edge_to], map_edge)?;
+        collect_edges(rows)
+    }
+
+    pub fn edges_to_limited(
+        &self,
+        snapshot_key: &str,
+        edge_to: &str,
+        limit: usize,
+    ) -> GraphStoreResult<Vec<GraphEdgeRecord>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT snapshot_key, edge_key, edge_from, edge_to, edge_type, payload_json
+            FROM graph_edges
+            WHERE snapshot_key = ?1 AND edge_to = ?2
+            ORDER BY edge_key
+            LIMIT ?3
+            ",
+        )?;
+        let rows = stmt.query_map(
+            params![snapshot_key, edge_to, sqlite_limit(limit)],
+            map_edge,
+        )?;
         collect_edges(rows)
     }
 
@@ -471,6 +515,10 @@ fn collect_edges(
 ) -> GraphStoreResult<Vec<GraphEdgeRecord>> {
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(GraphStoreError::from)
+}
+
+fn sqlite_limit(limit: usize) -> i64 {
+    i64::try_from(limit).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]

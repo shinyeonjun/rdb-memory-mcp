@@ -1,6 +1,6 @@
 [package]
 name = "database-memory-core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 
@@ -9,7 +9,6 @@ path = "src/lib.rs"
 
 [features]
 bench-support = []
-unsafe-row-sampling = []
 
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
