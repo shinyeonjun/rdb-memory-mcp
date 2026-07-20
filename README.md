@@ -1,8 +1,26 @@
 # Database Memory MCP
 
-Database Memory MCP is an RDB schema graph memory server and CLI. It indexes relational database metadata into a local graph so agents can answer schema structure, dependency, diff, and impact questions through MCP.
+[![Release](https://img.shields.io/github/v/release/shinyeonjun/rdb-memory-mcp?display_name=tag)](https://github.com/shinyeonjun/rdb-memory-mcp/releases)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-It is metadata-only by product boundary. It is not a live SQL query tool, not a row-data assistant, and not a deployment or migration runner. Default adapters read catalogs, schema objects, PRAGMA metadata, or DDL-derived metadata; they do not read user table rows.
+Database Memory MCP is a metadata-only RDB schema graph CLI and MCP server. It indexes relational database metadata into a local graph so people and agents can answer schema structure, dependency, diff, and impact questions without exposing table rows.
+
+```text
+Database catalog or DDL -> schema graph cache -> CLI / MCP typed queries
+```
+
+It is not a live SQL query tool, row-data assistant, deployment tool, or migration runner. Default adapters read catalogs, schema objects, PRAGMA metadata, or DDL-derived metadata; they do not read user table rows.
+
+## Quick start
+
+Download a tagged Windows zip from [Releases](https://github.com/shinyeonjun/rdb-memory-mcp/releases), or build from source with Rust. Then index the included sample DDL and inspect its impact graph:
+
+~~~powershell
+database-memory index --source ddl-sqlite --path examples/sample-schema.sql --alias shop --cache-path examples/shop-cache.sqlite
+database-memory impact-analysis ddl-sqlite:shop --object-key sqlite:shop:main:main:table:orders --max-depth 3 --limit 50 --format json --cache-path examples/shop-cache.sqlite
+~~~
+
+For installation and MCP client configuration, see [docs/install.md](docs/install.md).
 
 ## Features
 
@@ -14,7 +32,7 @@ It is metadata-only by product boundary. It is not a live SQL query tool, not a 
 - Diff two indexed schema snapshots.
 - Use query_graph as a constrained, read-only graph query escape hatch after typed tools are not enough.
 
-For build, install, and MCP client setup, see [docs/install.md](docs/install.md). For the full phase history and design details, see [docs/plans/database-memory-mcp.md](docs/plans/database-memory-mcp.md).
+For the full product boundary and design history, see [docs/plans/database-memory-mcp.md](docs/plans/database-memory-mcp.md).
 
 ## Release Binaries
 
