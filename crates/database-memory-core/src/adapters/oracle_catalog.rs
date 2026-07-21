@@ -8,7 +8,8 @@ use crate::analysis_outcome::{
     AnalysisFailure, AnalysisFailureCode, AnalysisOutcome, AnalysisStage,
 };
 use crate::canonical::{
-    CanonicalMetadata, CanonicalSchemaSnapshot, MetadataObject, MetadataValue, ObjectAnnotation,
+    CanonicalMetadata, CanonicalSchemaSnapshot, MetadataObject, MetadataRelationship,
+    MetadataRelationshipKind, MetadataValue, ObjectAnnotation,
 };
 use crate::certification::{
     AdapterIdentity, CapabilityCheck, DiscoveredCount, DiscoveryCounts, IntrospectionScope,
@@ -750,6 +751,33 @@ struct RawColumn {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct RawSequence {
+    owner: String,
+    name: String,
+    min_value: Option<String>,
+    max_value: Option<String>,
+    increment_by: String,
+    cycle: Option<String>,
+    ordered: Option<String>,
+    cache_size: String,
+    scale: Option<String>,
+    extend: Option<String>,
+    sharded: Option<String>,
+    session: Option<String>,
+    keep_value: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawIdentityColumn {
+    owner: String,
+    table: String,
+    column: String,
+    generation_type: Option<String>,
+    sequence_name: String,
+    options: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RawConstraintColumn {
     name: String,
     position: Option<i64>,
@@ -820,6 +848,8 @@ struct RawOracleCatalog {
     inventory: Vec<RawInventoryObject>,
     tables: Vec<RawTable>,
     columns: Vec<RawColumn>,
+    sequences: Vec<RawSequence>,
+    identity_columns: Vec<RawIdentityColumn>,
     constraints: Vec<RawConstraint>,
     indexes: Vec<RawIndex>,
     dependencies: Vec<RawDependency>,
@@ -839,6 +869,10 @@ impl RawOracleCatalog {
             .map_err(|error| error.catalog_context("table"))?;
         let columns = read_columns(connection, scope, &recycle, deadline)
             .map_err(|error| error.catalog_context("column"))?;
+        let sequences = read_sequences(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("sequence"))?;
+        let identity_columns = read_identity_columns(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("identity-column"))?;
         let mut constraints = read_constraints(connection, scope, &recycle, deadline)
             .map_err(|error| error.catalog_context("constraint"))?;
         attach_constraint_columns(connection, scope, &mut constraints, deadline)
@@ -856,6 +890,8 @@ impl RawOracleCatalog {
             inventory,
             tables,
             columns,
+            sequences,
+            identity_columns,
             constraints,
             indexes,
             dependencies,
@@ -1344,6 +1380,169 @@ fn read_columns(
         ))
     });
     Ok(columns)
+}
+
+fn read_sequences(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawSequence>, CatalogError> {
+    type SequenceTuple = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let mut sequences = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let sql = match scope.mode {
+            DictionaryScopeMode::User => {
+                "
+                SELECT :1,
+                       SEQUENCE_NAME,
+                       TO_CHAR(MIN_VALUE, 'TM9'),
+                       TO_CHAR(MAX_VALUE, 'TM9'),
+                       TO_CHAR(INCREMENT_BY, 'TM9'),
+                       CYCLE_FLAG,
+                       ORDER_FLAG,
+                       TO_CHAR(CACHE_SIZE, 'TM9'),
+                       SCALE_FLAG,
+                       EXTEND_FLAG,
+                       SHARDED_FLAG,
+                       SESSION_FLAG,
+                       KEEP_VALUE
+                FROM USER_SEQUENCES
+                ORDER BY SEQUENCE_NAME
+                "
+            }
+            DictionaryScopeMode::Dba => {
+                "
+                SELECT SEQUENCE_OWNER,
+                       SEQUENCE_NAME,
+                       TO_CHAR(MIN_VALUE, 'TM9'),
+                       TO_CHAR(MAX_VALUE, 'TM9'),
+                       TO_CHAR(INCREMENT_BY, 'TM9'),
+                       CYCLE_FLAG,
+                       ORDER_FLAG,
+                       TO_CHAR(CACHE_SIZE, 'TM9'),
+                       SCALE_FLAG,
+                       EXTEND_FLAG,
+                       SHARDED_FLAG,
+                       SESSION_FLAG,
+                       KEEP_VALUE
+                FROM DBA_SEQUENCES
+                WHERE SEQUENCE_OWNER = :1
+                ORDER BY SEQUENCE_OWNER, SEQUENCE_NAME
+                "
+            }
+        };
+        let rows = connection.query_as::<SequenceTuple>(sql, &[owner])?;
+        for row in rows {
+            let (
+                owner,
+                name,
+                min_value,
+                max_value,
+                increment_by,
+                cycle,
+                ordered,
+                cache_size,
+                scale,
+                extend,
+                sharded,
+                session,
+                keep_value,
+            ) = row?;
+            sequences.push(RawSequence {
+                owner,
+                name,
+                min_value,
+                max_value,
+                increment_by,
+                cycle,
+                ordered,
+                cache_size,
+                scale,
+                extend,
+                sharded,
+                session,
+                keep_value,
+            });
+        }
+    }
+    sequences.sort_by(|left, right| (&left.owner, &left.name).cmp(&(&right.owner, &right.name)));
+    Ok(sequences)
+}
+
+fn read_identity_columns(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawIdentityColumn>, CatalogError> {
+    let mut identities = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let sql = match scope.mode {
+            DictionaryScopeMode::User => {
+                "
+                SELECT :1,
+                       TABLE_NAME,
+                       COLUMN_NAME,
+                       GENERATION_TYPE,
+                       SEQUENCE_NAME,
+                       IDENTITY_OPTIONS
+                FROM USER_TAB_IDENTITY_COLS
+                ORDER BY TABLE_NAME, COLUMN_NAME
+                "
+            }
+            DictionaryScopeMode::Dba => {
+                "
+                SELECT OWNER,
+                       TABLE_NAME,
+                       COLUMN_NAME,
+                       GENERATION_TYPE,
+                       SEQUENCE_NAME,
+                       IDENTITY_OPTIONS
+                FROM DBA_TAB_IDENTITY_COLS
+                WHERE OWNER = :1
+                ORDER BY OWNER, TABLE_NAME, COLUMN_NAME
+                "
+            }
+        };
+        let rows = connection.query_as::<(
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+        )>(sql, &[owner])?;
+        for row in rows {
+            let (owner, table, column, generation_type, sequence_name, options) = row?;
+            identities.push(RawIdentityColumn {
+                owner,
+                table,
+                column,
+                generation_type,
+                sequence_name,
+                options: normalize_definition(options)?,
+            });
+        }
+    }
+    identities.sort_by(|left, right| {
+        (&left.owner, &left.table, &left.column).cmp(&(&right.owner, &right.table, &right.column))
+    });
+    Ok(identities)
 }
 
 fn normalize_definition(value: Option<String>) -> Result<Option<String>, CatalogError> {
@@ -1923,7 +2122,7 @@ fn validate_raw_catalog(
         .collect::<Vec<_>>();
     let unsupported = inventory
         .iter()
-        .filter(|object| !matches!(object.object_type.as_str(), "TABLE" | "INDEX"))
+        .filter(|object| !matches!(object.object_type.as_str(), "TABLE" | "INDEX" | "SEQUENCE"))
         .take(8)
         .map(|object| format!("{}.{} ({})", object.owner, object.name, object.object_type))
         .collect::<Vec<_>>();
@@ -1993,21 +2192,15 @@ fn validate_raw_catalog(
                 table.owner, table.name
             )));
         }
-        if table.partitioned
-            || table.iot_type.is_some()
-            || table.nested
-            || table.external
-            || table.has_identity
-        {
+        if table.partitioned || table.iot_type.is_some() || table.nested || table.external {
             return Err(CatalogError::UnsupportedMetadata(format!(
-                "Oracle table shape is not yet covered for {}.{} (partitioned={}, iot_type={}, nested={}, external={}, identity={})",
+                "Oracle table shape is not yet covered for {}.{} (partitioned={}, iot_type={}, nested={}, external={})",
                 table.owner,
                 table.name,
                 table.partitioned,
                 table.iot_type.as_deref().unwrap_or("none"),
                 table.nested,
-                table.external,
-                table.has_identity
+                table.external
             )));
         }
         if !inventory_keys.contains(&(table.owner.clone(), "TABLE".to_owned(), table.name.clone()))
@@ -2058,6 +2251,109 @@ fn validate_raw_catalog(
             return Err(CatalogError::Mapping(format!(
                 "duplicate Oracle internal column ordinal {} for {}.{}",
                 column.internal_column_id, column.owner, column.table
+            )));
+        }
+    }
+
+    let mut sequences = BTreeSet::new();
+    for sequence in &raw.sequences {
+        ensure_owner(scope, &sequence.owner, "sequence")?;
+        if sequence.increment_by.trim().is_empty() || sequence.cache_size.trim().is_empty() {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle sequence {}.{} has incomplete numeric metadata",
+                sequence.owner, sequence.name
+            )));
+        }
+        if !sequences.insert((sequence.owner.clone(), sequence.name.clone())) {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle sequence {}.{}",
+                sequence.owner, sequence.name
+            )));
+        }
+        if !inventory_keys.contains(&(
+            sequence.owner.clone(),
+            "SEQUENCE".to_owned(),
+            sequence.name.clone(),
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle sequence {}.{} is missing from the independent object inventory",
+                sequence.owner, sequence.name
+            )));
+        }
+    }
+    let inventory_sequence_count = inventory
+        .iter()
+        .filter(|object| object.object_type == "SEQUENCE")
+        .count();
+    if inventory_sequence_count != raw.sequences.len() {
+        return Err(CatalogError::Mapping(format!(
+            "Oracle sequence inventory mismatch: USER/DBA_OBJECTS reports {inventory_sequence_count}, USER/DBA_SEQUENCES reports {}",
+            raw.sequences.len()
+        )));
+    }
+
+    let identity_columns = raw
+        .columns
+        .iter()
+        .filter(|column| column.identity)
+        .map(|column| {
+            (
+                column.owner.clone(),
+                column.table.clone(),
+                column.name.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut identity_details = BTreeSet::new();
+    for identity in &raw.identity_columns {
+        ensure_owner(scope, &identity.owner, "identity column")?;
+        let key = (
+            identity.owner.clone(),
+            identity.table.clone(),
+            identity.column.clone(),
+        );
+        if !identity_details.insert(key.clone()) {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle identity metadata for {}.{}.{}",
+                identity.owner, identity.table, identity.column
+            )));
+        }
+        if !identity_columns.contains(&key) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle identity catalog references a non-identity column {}.{}.{}",
+                identity.owner, identity.table, identity.column
+            )));
+        }
+        if !sequences.contains(&(identity.owner.clone(), identity.sequence_name.clone())) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle identity column {}.{}.{} references missing sequence {}.{}",
+                identity.owner,
+                identity.table,
+                identity.column,
+                identity.owner,
+                identity.sequence_name
+            )));
+        }
+    }
+    if identity_columns != identity_details {
+        return match identity_columns.difference(&identity_details).next() {
+            Some(missing) => Err(CatalogError::Mapping(format!(
+                "Oracle identity column {}.{}.{} is missing *_TAB_IDENTITY_COLS metadata",
+                missing.0, missing.1, missing.2
+            ))),
+            None => Err(CatalogError::Mapping(
+                "Oracle identity-column catalogs disagree".to_owned(),
+            )),
+        };
+    }
+    for table in &raw.tables {
+        let discovered_identity = identity_columns
+            .iter()
+            .any(|(owner, name, _)| owner == &table.owner && name == &table.name);
+        if table.has_identity != discovered_identity {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle table identity flag mismatch for {}.{}",
+                table.owner, table.name
             )));
         }
     }
@@ -2364,6 +2660,61 @@ impl<'a> OracleSnapshotMapper<'a> {
             })
             .collect::<BTreeMap<_, _>>();
 
+        let mut sequence_keys = BTreeMap::new();
+        for sequence in &raw.sequences {
+            let schema_key = required(
+                schema_keys.get(&sequence.owner),
+                format!(
+                    "schema key for Oracle sequence {}.{}",
+                    sequence.owner, sequence.name
+                ),
+            )?;
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &sequence.owner,
+                ObjectKind::Sequence,
+                &sequence.name,
+                None,
+            );
+            sequence_keys.insert((sequence.owner.clone(), sequence.name.clone()), key.clone());
+            let inventory_object = required(
+                inventory.get(&(
+                    sequence.owner.clone(),
+                    "SEQUENCE".to_owned(),
+                    sequence.name.clone(),
+                )),
+                format!(
+                    "inventory row for Oracle sequence {}.{}",
+                    sequence.owner, sequence.name
+                ),
+            )?;
+            let mut properties = inventory_properties(inventory_object);
+            insert_optional_string(&mut properties, "minimum", sequence.min_value.as_deref());
+            insert_optional_string(&mut properties, "maximum", sequence.max_value.as_deref());
+            insert_string(&mut properties, "increment", &sequence.increment_by);
+            insert_string(&mut properties, "cache_size", &sequence.cache_size);
+            insert_optional_string(&mut properties, "cycle", sequence.cycle.as_deref());
+            insert_optional_string(&mut properties, "ordered", sequence.ordered.as_deref());
+            insert_optional_string(&mut properties, "scale", sequence.scale.as_deref());
+            insert_optional_string(&mut properties, "extend", sequence.extend.as_deref());
+            insert_optional_string(&mut properties, "sharded", sequence.sharded.as_deref());
+            insert_optional_string(&mut properties, "session", sequence.session.as_deref());
+            insert_optional_string(
+                &mut properties,
+                "keep_value",
+                sequence.keep_value.as_deref(),
+            );
+            metadata.objects.push(MetadataObject {
+                key,
+                parent_key: Some(schema_key.clone()),
+                name: sequence.name.clone(),
+                extension_kind: None,
+                definition: None,
+                properties,
+            });
+        }
+
         let mut tables = Vec::new();
         let mut table_keys = BTreeMap::new();
         for table in &raw.tables {
@@ -2401,6 +2752,7 @@ impl<'a> OracleSnapshotMapper<'a> {
             insert_string(&mut properties, "table_status", &table.status);
             insert_bool(&mut properties, "temporary", table.temporary);
             insert_bool(&mut properties, "read_only", table.read_only);
+            insert_bool(&mut properties, "has_identity", table.has_identity);
             insert_optional_string(&mut properties, "duration", table.duration.as_deref());
             metadata.annotations.push(ObjectAnnotation {
                 object_key: key,
@@ -2409,6 +2761,20 @@ impl<'a> OracleSnapshotMapper<'a> {
             });
         }
 
+        let identities = raw
+            .identity_columns
+            .iter()
+            .map(|identity| {
+                (
+                    (
+                        identity.owner.clone(),
+                        identity.table.clone(),
+                        identity.column.clone(),
+                    ),
+                    identity,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut columns = Vec::new();
         let mut column_keys = BTreeMap::new();
         for column in &raw.columns {
@@ -2446,7 +2812,10 @@ impl<'a> OracleSnapshotMapper<'a> {
                 data_type: format_oracle_data_type(column),
                 is_nullable: column.nullable,
                 default_value: column.default_value.clone(),
-                is_generated: column.virtual_column || column.hidden || !column.user_generated,
+                is_generated: column.virtual_column
+                    || column.hidden
+                    || !column.user_generated
+                    || column.identity,
             });
             let mut properties = BTreeMap::new();
             insert_optional_i64(&mut properties, "column_id", column.column_id);
@@ -2471,6 +2840,47 @@ impl<'a> OracleSnapshotMapper<'a> {
             insert_bool(&mut properties, "user_generated", column.user_generated);
             insert_bool(&mut properties, "default_on_null", column.default_on_null);
             insert_bool(&mut properties, "identity", column.identity);
+            if let Some(identity) = identities.get(&(
+                column.owner.clone(),
+                column.table.clone(),
+                column.name.clone(),
+            )) {
+                insert_optional_string(
+                    &mut properties,
+                    "identity_generation_type",
+                    identity.generation_type.as_deref(),
+                );
+                insert_optional_string(
+                    &mut properties,
+                    "identity_options",
+                    identity.options.as_deref(),
+                );
+                let sequence_key = required(
+                    sequence_keys.get(&(identity.owner.clone(), identity.sequence_name.clone())),
+                    format!(
+                        "identity sequence key {}.{}",
+                        identity.owner, identity.sequence_name
+                    ),
+                )?;
+                let mut relationship_properties = BTreeMap::new();
+                insert_optional_string(
+                    &mut relationship_properties,
+                    "generation_type",
+                    identity.generation_type.as_deref(),
+                );
+                insert_optional_string(
+                    &mut relationship_properties,
+                    "identity_options",
+                    identity.options.as_deref(),
+                );
+                metadata.relationships.push(MetadataRelationship {
+                    kind: MetadataRelationshipKind::UsesSequence,
+                    from_key: key.clone(),
+                    to_key: sequence_key.clone(),
+                    ordinal: None,
+                    properties: relationship_properties,
+                });
+            }
             metadata.annotations.push(ObjectAnnotation {
                 object_key: key,
                 definition: None,
@@ -2951,6 +3361,7 @@ fn discovery_counts_from_catalog(
     set_object_count(&mut objects, ObjectCategory::Table, raw.tables.len());
     set_object_count(&mut objects, ObjectCategory::Column, raw.columns.len());
     set_object_count(&mut objects, ObjectCategory::Index, raw.indexes.len());
+    set_object_count(&mut objects, ObjectCategory::Sequence, raw.sequences.len());
     set_object_count(
         &mut objects,
         ObjectCategory::Principal,
@@ -3018,7 +3429,12 @@ fn discovery_counts_from_catalog(
     set_relationship_count(
         &mut relationships,
         RelationshipCategory::MetadataParent,
-        scope.principals.len(),
+        scope.principals.len() + raw.sequences.len(),
+    );
+    set_relationship_count(
+        &mut relationships,
+        RelationshipCategory::MetadataRelationship,
+        raw.identity_columns.len(),
     );
 
     DiscoveryCounts {
@@ -3220,7 +3636,7 @@ mod tests {
             .admin
             .execute(
                 &format!(
-                    "GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE TO {}",
+                    "GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW TO {}",
                     cleanup.username
                 ),
                 &[],
@@ -3232,7 +3648,7 @@ mod tests {
             .expect("connect as isolated Oracle test user");
         setup
             .execute(
-                "CREATE TABLE PARENT_ENTITY (ID NUMBER(10) NOT NULL, CODE VARCHAR2(32 CHAR), CONSTRAINT PK_PARENT_ENTITY PRIMARY KEY (ID), CONSTRAINT UQ_PARENT_ENTITY_CODE UNIQUE (CODE), CONSTRAINT CK_PARENT_ENTITY_ID CHECK (ID > 0))",
+                "CREATE TABLE PARENT_ENTITY (ID NUMBER GENERATED BY DEFAULT AS IDENTITY, CODE VARCHAR2(32 CHAR), CONSTRAINT PK_PARENT_ENTITY PRIMARY KEY (ID), CONSTRAINT UQ_PARENT_ENTITY_CODE UNIQUE (CODE), CONSTRAINT CK_PARENT_ENTITY_ID CHECK (ID > 0))",
                 &[],
             )
             .expect("create parent table");
@@ -3248,6 +3664,9 @@ mod tests {
                 &[],
             )
             .expect("create secondary index");
+        setup
+            .execute("CREATE SEQUENCE AUDIT_SEQUENCE START WITH 10", &[])
+            .expect("create explicit sequence");
         drop(setup);
 
         let complete = analyze_oracle(&user_url, "oracle-live", Vec::new(), Vec::new(), 30_000);
@@ -3268,11 +3687,30 @@ mod tests {
             .iter()
             .any(|constraint| constraint.kind == ConstraintKind::ForeignKey));
         assert!(certified.snapshot.schema.indexes.len() >= 3);
+        assert!(
+            certified
+                .snapshot
+                .metadata
+                .objects
+                .iter()
+                .filter(|object| object.key.object_kind == ObjectKind::Sequence)
+                .count()
+                >= 2
+        );
+        assert!(certified
+            .snapshot
+            .metadata
+            .relationships
+            .iter()
+            .any(|relationship| relationship.kind == MetadataRelationshipKind::UsesSequence));
 
         let setup = Connection::connect(&cleanup.username, password, &connect_string)
             .expect("reconnect as isolated Oracle test user");
         setup
-            .execute("CREATE SEQUENCE UNSUPPORTED_SEQUENCE START WITH 1", &[])
+            .execute(
+                "CREATE VIEW UNSUPPORTED_VIEW AS SELECT ID, CODE FROM PARENT_ENTITY",
+                &[],
+            )
             .expect("create fail-closed fixture");
         drop(setup);
 
