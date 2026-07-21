@@ -1,5 +1,10 @@
 pub mod mysql;
+mod mysql_catalog;
 pub mod oracle;
 pub mod postgres;
+pub(crate) mod postgres_catalog;
 pub mod sqlite;
+pub(crate) mod sqlite_catalog;
+pub(crate) mod sqlite_sql;
 pub mod sqlserver;
+mod sqlserver_catalog;

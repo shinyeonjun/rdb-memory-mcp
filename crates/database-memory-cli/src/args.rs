@@ -229,7 +229,9 @@ fn parse_index_args(
 
     match source.as_str() {
         "sqlite" | "ddl-sqlite" if path.is_none() => return Err("missing --path".to_owned()),
-        "postgres" | "mysql" | "sqlserver" | "oracle" if connection_string.is_none() => {
+        "postgres" | "mysql" | "mariadb" | "sqlserver" | "oracle"
+            if connection_string.is_none() =>
+        {
             return Err("missing --connection-string".to_owned());
         }
         _ => {}
@@ -537,6 +539,7 @@ fn usage() -> &'static str {
     "usage: database-memory contract [--format text|json]\n       database-memory index --source sqlite --path <db> --alias <name> [--format text|json] [--cache-path <path>] [--config-path <path>]\n       database-memory index --source ddl-sqlite --path <sql-file-or-dir> --alias <name> [--format text|json] [--cache-path <path>]
        database-memory index --source postgres --connection-string <url> --alias <name> [--format text|json] [--cache-path <path>]
        database-memory index --source mysql --connection-string <url> --alias <name> [--format text|json] [--cache-path <path>]
+       database-memory index --source mariadb --connection-string <url> --alias <name> [--format text|json] [--cache-path <path>]
        database-memory index --source sqlserver --connection-string <ado-connection-string> --alias <name> [--format text|json] [--cache-path <path>]
        database-memory index --source oracle --connection-string <user/password@connect_string> --alias <name> [--format text|json] [--cache-path <path>]
        database-memory describe-table <alias> [<table-name> | --object-key <stable-key>] [--format text|json] [--cache-path <path>] [--config-path <path>]

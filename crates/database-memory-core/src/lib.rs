@@ -1,15 +1,21 @@
 pub mod adapters;
+pub mod analysis_outcome;
 #[cfg(any(test, feature = "bench-support"))]
 pub mod bench_support;
+pub mod canonical;
+pub mod canonical_validation;
+pub mod certification;
 pub mod config;
 pub mod ddl;
 pub mod graph_builder;
 pub mod graph_query;
 pub mod graph_store;
 pub mod impact_analysis;
+pub mod introspection;
 pub mod redact;
 pub mod relationship_trace;
 pub mod schema_diff;
+pub mod snapshot_validation;
 
 use std::fmt::{self, Write};
 use std::path::Path;
@@ -43,7 +49,7 @@ pub fn introspect_schema_source(
             adapters::postgres::introspect_postgres(connection_string, alias)
                 .map_err(|err| redact::redact_error_with_connection_string(err, connection_string))
         }
-        "mysql" => {
+        "mysql" | "mariadb" => {
             let connection_string = connection_string.ok_or("missing connection_string")?;
             adapters::mysql::introspect_mysql(connection_string, alias)
                 .map_err(|err| redact::redact_error_with_connection_string(err, connection_string))
@@ -59,7 +65,7 @@ pub fn introspect_schema_source(
                 .map_err(|err| redact::redact_error_with_connection_string(err, connection_string))
         }
         unsupported_source => Err(format!(
-            "source '{unsupported_source}' is not supported; supported sources: sqlite, ddl-sqlite, postgres, mysql, sqlserver, oracle"
+            "source '{unsupported_source}' is not supported; supported sources: sqlite, ddl-sqlite, postgres, mysql, mariadb, sqlserver, oracle"
         )),
     }
 }
@@ -233,8 +239,22 @@ pub enum ObjectKind {
     CheckConstraint,
     Index,
     View,
+    ViewColumn,
     Trigger,
     Routine,
+    MaterializedView,
+    Sequence,
+    RoutineParameter,
+    UserDefinedType,
+    Domain,
+    EnumValue,
+    Synonym,
+    ExclusionConstraint,
+    Event,
+    Package,
+    Principal,
+    Policy,
+    Extension,
 }
 
 impl fmt::Display for ObjectKind {
@@ -250,8 +270,22 @@ impl fmt::Display for ObjectKind {
             Self::CheckConstraint => "check_constraint",
             Self::Index => "index",
             Self::View => "view",
+            Self::ViewColumn => "view_column",
             Self::Trigger => "trigger",
             Self::Routine => "routine",
+            Self::MaterializedView => "materialized_view",
+            Self::Sequence => "sequence",
+            Self::RoutineParameter => "routine_parameter",
+            Self::UserDefinedType => "user_defined_type",
+            Self::Domain => "domain",
+            Self::EnumValue => "enum_value",
+            Self::Synonym => "synonym",
+            Self::ExclusionConstraint => "exclusion_constraint",
+            Self::Event => "event",
+            Self::Package => "package",
+            Self::Principal => "principal",
+            Self::Policy => "policy",
+            Self::Extension => "extension",
         })
     }
 }
@@ -271,8 +305,22 @@ impl FromStr for ObjectKind {
             "check_constraint" => Ok(Self::CheckConstraint),
             "index" => Ok(Self::Index),
             "view" => Ok(Self::View),
+            "view_column" => Ok(Self::ViewColumn),
             "trigger" => Ok(Self::Trigger),
             "routine" => Ok(Self::Routine),
+            "materialized_view" => Ok(Self::MaterializedView),
+            "sequence" => Ok(Self::Sequence),
+            "routine_parameter" => Ok(Self::RoutineParameter),
+            "user_defined_type" => Ok(Self::UserDefinedType),
+            "domain" => Ok(Self::Domain),
+            "enum_value" => Ok(Self::EnumValue),
+            "synonym" => Ok(Self::Synonym),
+            "exclusion_constraint" => Ok(Self::ExclusionConstraint),
+            "event" => Ok(Self::Event),
+            "package" => Ok(Self::Package),
+            "principal" => Ok(Self::Principal),
+            "policy" => Ok(Self::Policy),
+            "extension" => Ok(Self::Extension),
             _ => Err(ObjectKeyParseError),
         }
     }
@@ -316,6 +364,10 @@ pub enum TableKind {
     BaseTable,
     Temporary,
     Foreign,
+    Partitioned,
+    Partition,
+    Virtual,
+    Shadow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,7 +571,12 @@ mod tests {
             ("sqlite", include_str!("adapters/sqlite.rs")),
             ("postgres", include_str!("adapters/postgres.rs")),
             ("mysql", include_str!("adapters/mysql.rs")),
+            ("mysql-catalog", include_str!("adapters/mysql_catalog.rs")),
             ("sqlserver", include_str!("adapters/sqlserver.rs")),
+            (
+                "sqlserver-catalog",
+                include_str!("adapters/sqlserver_catalog.rs"),
+            ),
             ("oracle", include_str!("adapters/oracle.rs")),
         ];
 
@@ -597,5 +654,41 @@ mod tests {
         assert!("v2:postgres:prod:app:public:table:orders%"
             .parse::<ObjectKey>()
             .is_err());
+    }
+
+    #[test]
+    fn every_canonical_object_kind_has_a_stable_round_trip_name() {
+        let kinds = [
+            ObjectKind::Database,
+            ObjectKind::Schema,
+            ObjectKind::Table,
+            ObjectKind::Column,
+            ObjectKind::PrimaryKey,
+            ObjectKind::ForeignKey,
+            ObjectKind::UniqueConstraint,
+            ObjectKind::CheckConstraint,
+            ObjectKind::Index,
+            ObjectKind::View,
+            ObjectKind::ViewColumn,
+            ObjectKind::Trigger,
+            ObjectKind::Routine,
+            ObjectKind::MaterializedView,
+            ObjectKind::Sequence,
+            ObjectKind::RoutineParameter,
+            ObjectKind::UserDefinedType,
+            ObjectKind::Domain,
+            ObjectKind::EnumValue,
+            ObjectKind::Synonym,
+            ObjectKind::ExclusionConstraint,
+            ObjectKind::Event,
+            ObjectKind::Package,
+            ObjectKind::Principal,
+            ObjectKind::Policy,
+            ObjectKind::Extension,
+        ];
+
+        for kind in kinds {
+            assert_eq!(kind.to_string().parse::<ObjectKind>().unwrap(), kind);
+        }
     }
 }

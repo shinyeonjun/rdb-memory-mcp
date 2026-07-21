@@ -14,6 +14,66 @@ services:
       timeout: 3s
       retries: 30
 
+  postgres14:
+    image: postgres:14-alpine
+    container_name: dbmcp-postgres14
+    environment:
+      POSTGRES_USER: dbmcp
+      POSTGRES_PASSWORD: dbmcp
+      POSTGRES_DB: dbmcp
+    ports:
+      - "15434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbmcp -d dbmcp"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  postgres15:
+    image: postgres:15-alpine
+    container_name: dbmcp-postgres15
+    environment:
+      POSTGRES_USER: dbmcp
+      POSTGRES_PASSWORD: dbmcp
+      POSTGRES_DB: dbmcp
+    ports:
+      - "15435:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbmcp -d dbmcp"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  postgres17:
+    image: postgres:17-alpine
+    container_name: dbmcp-postgres17
+    environment:
+      POSTGRES_USER: dbmcp
+      POSTGRES_PASSWORD: dbmcp
+      POSTGRES_DB: dbmcp
+    ports:
+      - "15437:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbmcp -d dbmcp"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  postgres18:
+    image: postgres:18-alpine
+    container_name: dbmcp-postgres18
+    environment:
+      POSTGRES_USER: dbmcp
+      POSTGRES_PASSWORD: dbmcp
+      POSTGRES_DB: dbmcp
+    ports:
+      - "15438:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbmcp -d dbmcp"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
   mysql:
     image: mysql:8.4
     container_name: dbmcp-mysql
@@ -26,6 +86,102 @@ services:
       - "13306:3306"
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-udbmcp", "-pdbmcp"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  mysql80:
+    image: mysql:8.0
+    container_name: dbmcp-mysql80
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: dbmcp
+      MYSQL_USER: dbmcp
+      MYSQL_PASSWORD: dbmcp
+    ports:
+      - "13308:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-udbmcp", "-pdbmcp"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  mysql97:
+    image: mysql:9.7
+    container_name: dbmcp-mysql97
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: dbmcp
+      MYSQL_USER: dbmcp
+      MYSQL_PASSWORD: dbmcp
+    ports:
+      - "13309:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-udbmcp", "-pdbmcp"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  mariadb1011:
+    image: mariadb:10.11
+    container_name: dbmcp-mariadb1011
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: dbmcp
+      MARIADB_USER: dbmcp
+      MARIADB_PASSWORD: dbmcp
+    ports:
+      - "13311:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  mariadb114:
+    image: mariadb:11.4
+    container_name: dbmcp-mariadb114
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: dbmcp
+      MARIADB_USER: dbmcp
+      MARIADB_PASSWORD: dbmcp
+    ports:
+      - "13314:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  mariadb118:
+    image: mariadb:11.8
+    container_name: dbmcp-mariadb118
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: dbmcp
+      MARIADB_USER: dbmcp
+      MARIADB_PASSWORD: dbmcp
+    ports:
+      - "13318:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  mariadb123:
+    image: mariadb:12.3
+    container_name: dbmcp-mariadb123
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: dbmcp
+      MARIADB_USER: dbmcp
+      MARIADB_PASSWORD: dbmcp
+    ports:
+      - "13323:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 2s
       timeout: 5s
       retries: 60

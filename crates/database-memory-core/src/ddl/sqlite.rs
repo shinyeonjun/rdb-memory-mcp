@@ -6,7 +6,11 @@ use std::path::{Path, PathBuf};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::Connection;
 
-use crate::adapters::sqlite::{introspect_sqlite_ddl_connection, SqliteAdapterError};
+use crate::adapters::sqlite::{
+    introspect_sqlite_ddl_connection, introspect_sqlite_ddl_connection_complete, SqliteAdapterError,
+};
+use crate::adapters::sqlite_sql::validate_schema_ddl;
+use crate::certification::CertifiedSchemaSnapshot;
 use crate::SchemaSnapshot;
 
 pub type SqliteDdlSourceResult<T> = Result<T, SqliteDdlSourceError>;
@@ -20,6 +24,10 @@ pub enum SqliteDdlSourceError {
     Apply {
         path: PathBuf,
         source: rusqlite::Error,
+    },
+    InvalidStatement {
+        path: PathBuf,
+        message: String,
     },
     NoSqlFiles(PathBuf),
     Adapter(SqliteAdapterError),
@@ -36,6 +44,11 @@ impl fmt::Display for SqliteDdlSourceError {
                     path.display()
                 )
             }
+            Self::InvalidStatement { path, message } => write!(
+                f,
+                "unsafe or unsupported SQLite DDL '{}': {message}",
+                path.display()
+            ),
             Self::NoSqlFiles(path) => write!(f, "no .sql files found in '{}'", path.display()),
             Self::Adapter(source) => {
                 write!(f, "failed to introspect SQLite DDL snapshot: {source}")
@@ -49,7 +62,7 @@ impl Error for SqliteDdlSourceError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Apply { source, .. } => Some(source),
-            Self::NoSqlFiles(_) => None,
+            Self::InvalidStatement { .. } | Self::NoSqlFiles(_) => None,
             Self::Adapter(source) => Some(source),
         }
     }
@@ -65,6 +78,20 @@ pub fn introspect_sqlite_ddl(
     path: &Path,
     connection_alias: &str,
 ) -> SqliteDdlSourceResult<SchemaSnapshot> {
+    let conn = load_ddl_connection(path)?;
+    introspect_sqlite_ddl_connection(&conn, connection_alias).map_err(SqliteDdlSourceError::from)
+}
+
+pub fn introspect_sqlite_ddl_complete(
+    path: &Path,
+    connection_alias: &str,
+) -> SqliteDdlSourceResult<CertifiedSchemaSnapshot> {
+    let conn = load_ddl_connection(path)?;
+    introspect_sqlite_ddl_connection_complete(&conn, connection_alias)
+        .map_err(SqliteDdlSourceError::from)
+}
+
+fn load_ddl_connection(path: &Path) -> SqliteDdlSourceResult<Connection> {
     let conn = Connection::open_in_memory().map_err(|source| SqliteDdlSourceError::Apply {
         path: PathBuf::from(":memory:"),
         source,
@@ -76,19 +103,32 @@ pub fn introspect_sqlite_ddl(
             path: file.clone(),
             source,
         })?;
+        validate_schema_ddl(&sql).map_err(|message| SqliteDdlSourceError::InvalidStatement {
+            path: file.clone(),
+            message,
+        })?;
         conn.execute_batch(&sql)
             .map_err(|source| SqliteDdlSourceError::Apply { path: file, source })?;
     }
     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
-
-    introspect_sqlite_ddl_connection(&conn, connection_alias).map_err(SqliteDdlSourceError::from)
+    Ok(conn)
 }
 
 fn authorize_ddl(context: AuthContext<'_>) -> Authorization {
     match context.action {
-        AuthAction::Attach { .. } | AuthAction::Detach { .. } | AuthAction::Unknown { .. } => {
-            Authorization::Deny
-        }
+        AuthAction::Attach { .. }
+        | AuthAction::Detach { .. }
+        | AuthAction::CreateVtable { .. }
+        | AuthAction::DropVtable { .. }
+        | AuthAction::CreateTempIndex { .. }
+        | AuthAction::CreateTempTable { .. }
+        | AuthAction::CreateTempTrigger { .. }
+        | AuthAction::CreateTempView { .. }
+        | AuthAction::DropTempIndex { .. }
+        | AuthAction::DropTempTable { .. }
+        | AuthAction::DropTempTrigger { .. }
+        | AuthAction::DropTempView { .. }
+        | AuthAction::Unknown { .. } => Authorization::Deny,
         AuthAction::Function { function_name }
             if function_name.eq_ignore_ascii_case("load_extension") =>
         {
@@ -174,6 +214,33 @@ mod ddl_source_tests {
     }
 
     #[test]
+    fn sqlite_ddl_directory_produces_a_certified_complete_snapshot() {
+        let dir = sample_dir("complete");
+        write_migrations(&dir);
+
+        let certified = introspect_sqlite_ddl_complete(&dir, "app").unwrap();
+
+        assert_eq!(certified.snapshot.schema.source_kind, "ddl-sqlite");
+        assert!(certified
+            .snapshot
+            .schema
+            .capabilities
+            .limitations
+            .is_empty());
+        assert_eq!(
+            certified.snapshot.schema.capabilities.dependencies,
+            crate::CapabilitySupport::Supported
+        );
+        assert!(certified
+            .completeness
+            .object_counts
+            .iter()
+            .all(|count| count.discovered == count.emitted));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn sqlite_ddl_snapshot_diffs_cleanly_against_live_sqlite_snapshot() {
         let dir = sample_dir("diff");
         write_migrations(&dir);
@@ -214,9 +281,39 @@ mod ddl_source_tests {
 
         let error = introspect_sqlite_ddl(&dir, "app").unwrap_err();
 
-        assert!(matches!(error, SqliteDdlSourceError::Apply { .. }));
+        assert!(matches!(
+            error,
+            SqliteDdlSourceError::InvalidStatement { .. }
+        ));
         assert!(!attached.exists());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sqlite_ddl_rejects_application_rows_and_virtual_table_modules() {
+        for (name, sql) in [
+            (
+                "insert",
+                "CREATE TABLE users(id INTEGER); INSERT INTO users VALUES (1);",
+            ),
+            (
+                "select",
+                "CREATE TABLE users(id INTEGER); SELECT * FROM users;",
+            ),
+            ("virtual", "CREATE VIRTUAL TABLE docs USING fts5(body);"),
+        ] {
+            let dir = sample_dir(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("001_schema.sql"), sql).unwrap();
+
+            let error = introspect_sqlite_ddl(&dir, "app").unwrap_err();
+
+            assert!(matches!(
+                error,
+                SqliteDdlSourceError::InvalidStatement { .. }
+            ));
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 
     fn write_migrations(dir: &Path) {

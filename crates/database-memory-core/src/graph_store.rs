@@ -2,16 +2,24 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
+use crate::certification::{
+    verify_certified_schema_snapshot, CertificationError, CertifiedSchemaSnapshot,
+};
+use crate::snapshot_validation::SnapshotValidationError;
 use crate::AdapterCapabilities;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 
 pub type GraphStoreResult<T> = Result<T, GraphStoreError>;
+pub const GRAPH_STORE_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug)]
 pub enum GraphStoreError {
     Storage(rusqlite::Error),
     Payload(serde_json::Error),
+    InvalidSnapshot(SnapshotValidationError),
+    InvalidCertification(CertificationError),
+    UnsupportedSchemaVersion(i64),
 }
 
 impl fmt::Display for GraphStoreError {
@@ -19,6 +27,14 @@ impl fmt::Display for GraphStoreError {
         match self {
             Self::Storage(err) => write!(f, "graph store storage error: {err}"),
             Self::Payload(err) => write!(f, "graph store payload error: {err}"),
+            Self::InvalidSnapshot(err) => write!(f, "graph store rejected invalid snapshot: {err}"),
+            Self::InvalidCertification(err) => {
+                write!(f, "graph store rejected uncertified snapshot: {err}")
+            }
+            Self::UnsupportedSchemaVersion(version) => write!(
+                f,
+                "graph store schema version {version} is newer than supported version {GRAPH_STORE_SCHEMA_VERSION}"
+            ),
         }
     }
 }
@@ -37,9 +53,33 @@ impl From<serde_json::Error> for GraphStoreError {
     }
 }
 
+impl From<SnapshotValidationError> for GraphStoreError {
+    fn from(err: SnapshotValidationError) -> Self {
+        Self::InvalidSnapshot(err)
+    }
+}
+
+impl From<CertificationError> for GraphStoreError {
+    fn from(err: CertificationError) -> Self {
+        Self::InvalidCertification(err)
+    }
+}
+
 #[derive(Deserialize)]
 struct SnapshotCapabilitiesPayload {
     capabilities: AdapterCapabilities,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotAuthority {
+    Complete,
+    LegacyNonAuthoritative,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotContractStatus {
+    pub authority: SnapshotAuthority,
+    pub contract_version: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -91,9 +131,16 @@ impl GraphStore {
     }
 
     fn migrate(&self) -> GraphStoreResult<()> {
-        self.conn.execute_batch(
+        let version = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+        if version > GRAPH_STORE_SCHEMA_VERSION {
+            return Err(GraphStoreError::UnsupportedSchemaVersion(version));
+        }
+        self.conn.execute_batch("PRAGMA foreign_keys = ON")?;
+        let migration = self.conn.execute_batch(
             "
-            PRAGMA foreign_keys = ON;
+            BEGIN IMMEDIATE;
 
             CREATE TABLE IF NOT EXISTS graph_snapshots (
                 snapshot_key TEXT PRIMARY KEY,
@@ -148,9 +195,24 @@ impl GraphStore {
                 ON graph_edges (snapshot_key, edge_to, edge_type, edge_key);
             CREATE INDEX IF NOT EXISTS idx_graph_edges_type_key
                 ON graph_edges (snapshot_key, edge_type, edge_key);
+
+            PRAGMA user_version = 2;
+            COMMIT;
             ",
-        )?;
-        Ok(())
+        );
+        match migration {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error.into())
+            }
+        }
+    }
+
+    pub fn schema_version(&self) -> GraphStoreResult<i64> {
+        self.conn
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .map_err(GraphStoreError::from)
     }
 
     pub fn with_transaction<T>(
@@ -174,6 +236,7 @@ impl GraphStore {
     }
 
     pub fn insert_snapshot(&self, snapshot: &GraphSnapshotRecord) -> GraphStoreResult<()> {
+        validate_persisted_snapshot_payload(&snapshot.payload_json)?;
         self.conn.execute(
             "
             INSERT INTO graph_snapshots (
@@ -243,6 +306,45 @@ impl GraphStore {
             })
             .transpose()
             .map_err(GraphStoreError::from)
+    }
+
+    pub fn get_snapshot_contract_status(
+        &self,
+        snapshot_key: &str,
+    ) -> GraphStoreResult<Option<SnapshotContractStatus>> {
+        let Some(snapshot) = self.get_snapshot(snapshot_key)? else {
+            return Ok(None);
+        };
+        match snapshot_contract_version(&snapshot.payload_json)? {
+            None => Ok(Some(SnapshotContractStatus {
+                authority: SnapshotAuthority::LegacyNonAuthoritative,
+                contract_version: None,
+            })),
+            Some(contract_version) => {
+                let certified =
+                    serde_json::from_str::<CertifiedSchemaSnapshot>(&snapshot.payload_json)?;
+                verify_certified_schema_snapshot(&certified)?;
+                Ok(Some(SnapshotContractStatus {
+                    authority: SnapshotAuthority::Complete,
+                    contract_version: Some(contract_version),
+                }))
+            }
+        }
+    }
+
+    pub fn get_certified_snapshot(
+        &self,
+        snapshot_key: &str,
+    ) -> GraphStoreResult<Option<CertifiedSchemaSnapshot>> {
+        let Some(snapshot) = self.get_snapshot(snapshot_key)? else {
+            return Ok(None);
+        };
+        if snapshot_contract_version(&snapshot.payload_json)?.is_none() {
+            return Ok(None);
+        }
+        let certified = serde_json::from_str::<CertifiedSchemaSnapshot>(&snapshot.payload_json)?;
+        verify_certified_schema_snapshot(&certified)?;
+        Ok(Some(certified))
     }
 
     pub fn snapshot_count(&self) -> GraphStoreResult<u64> {
@@ -613,6 +715,25 @@ impl GraphStore {
     }
 }
 
+fn validate_persisted_snapshot_payload(payload_json: &str) -> GraphStoreResult<()> {
+    if snapshot_contract_version(payload_json)?.is_some() {
+        let certified = serde_json::from_str::<CertifiedSchemaSnapshot>(payload_json)?;
+        verify_certified_schema_snapshot(&certified)?;
+    }
+    Ok(())
+}
+
+fn snapshot_contract_version(payload_json: &str) -> GraphStoreResult<Option<u32>> {
+    let value = serde_json::from_str::<serde_json::Value>(payload_json)?;
+    let object = serde_json::from_value::<serde_json::Map<String, serde_json::Value>>(value)?;
+    object
+        .get("contract_version")
+        .cloned()
+        .map(serde_json::from_value::<u32>)
+        .transpose()
+        .map_err(GraphStoreError::from)
+}
+
 fn map_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<GraphNodeRecord> {
     Ok(GraphNodeRecord {
         snapshot_key: row.get(0)?,
@@ -683,11 +804,71 @@ mod graph_store_tests {
     fn graph_store_counts_snapshots() {
         let store = seeded_store();
 
+        assert_eq!(store.schema_version().unwrap(), GRAPH_STORE_SCHEMA_VERSION);
         assert_eq!(store.snapshot_count().unwrap(), 1);
         assert_eq!(
             store.list_snapshots().unwrap()[0].snapshot_key,
             "snapshot-1"
         );
+        assert_eq!(
+            store
+                .get_snapshot_contract_status("snapshot-1")
+                .unwrap()
+                .unwrap(),
+            SnapshotContractStatus {
+                authority: SnapshotAuthority::LegacyNonAuthoritative,
+                contract_version: None,
+            }
+        );
+        assert!(store
+            .get_certified_snapshot("snapshot-1")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn graph_store_rejects_unknown_future_cache_versions() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA user_version = 99").unwrap();
+
+        let error = match GraphStore::from_connection(conn) {
+            Ok(_) => panic!("future graph cache version was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            GraphStoreError::UnsupportedSchemaVersion(99)
+        ));
+    }
+
+    #[test]
+    fn low_level_store_cannot_bypass_v2_certification() {
+        let store = seeded_store();
+        let before = store.get_snapshot("snapshot-1").unwrap().unwrap();
+
+        let error = store
+            .insert_snapshot(&GraphSnapshotRecord {
+                snapshot_key: "snapshot-1".to_owned(),
+                source: Some("tampered".to_owned()),
+                captured_at_unix_ms: 99,
+                payload_json: r#"{"contract_version":2}"#.to_owned(),
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, GraphStoreError::Payload(_)));
+        assert_eq!(store.get_snapshot("snapshot-1").unwrap().unwrap(), before);
+
+        let null_version_error = store
+            .insert_snapshot(&GraphSnapshotRecord {
+                snapshot_key: "snapshot-1".to_owned(),
+                source: Some("tampered".to_owned()),
+                captured_at_unix_ms: 100,
+                payload_json: r#"{"contract_version":null}"#.to_owned(),
+            })
+            .unwrap_err();
+        assert!(matches!(null_version_error, GraphStoreError::Payload(_)));
+        assert_eq!(store.get_snapshot("snapshot-1").unwrap().unwrap(), before);
     }
 
     #[test]
