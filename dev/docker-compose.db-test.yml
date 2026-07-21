@@ -195,6 +195,33 @@ services:
     ports:
       - "11433:1433"
 
+  sqlserver2017:
+    image: mcr.microsoft.com/mssql/server:2017-latest
+    container_name: dbmcp-sqlserver2017
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Password123!"
+    ports:
+      - "11437:1433"
+
+  sqlserver2019:
+    image: mcr.microsoft.com/mssql/server:2019-latest
+    container_name: dbmcp-sqlserver2019
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Password123!"
+    ports:
+      - "11439:1433"
+
+  sqlserver2025:
+    image: mcr.microsoft.com/mssql/server:2025-latest
+    container_name: dbmcp-sqlserver2025
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Password123!"
+    ports:
+      - "11435:1433"
+
   oracle:
     image: gvenzl/oracle-free:23-slim-faststart
     container_name: dbmcp-oracle

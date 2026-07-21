@@ -604,7 +604,10 @@ impl ServerFacts {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SqlServerCatalogVersion {
+    V2017,
+    V2019,
     V2022,
+    V2025,
 }
 
 impl SqlServerCatalogVersion {
@@ -616,14 +619,56 @@ impl SqlServerCatalogVersion {
             )));
         }
         match facts.major {
+            14 => Ok(Self::V2017),
+            15 => Ok(Self::V2019),
             16 => Ok(Self::V2022),
+            17 => Ok(Self::V2025),
             major => Err(CatalogError::UnsupportedVersion(major)),
         }
     }
 
     fn strategy_name(self) -> &'static str {
         match self {
+            Self::V2017 => "sqlserver-2017",
+            Self::V2019 => "sqlserver-2019",
             Self::V2022 => "sqlserver-2022",
+            Self::V2025 => "sqlserver-2025",
+        }
+    }
+
+    fn ledger_expression(self) -> &'static str {
+        match self {
+            Self::V2017 | Self::V2019 => "N'NONE'",
+            Self::V2022 | Self::V2025 => "t.ledger_type_desc",
+        }
+    }
+
+    fn xml_compression_expression(self) -> &'static str {
+        match self {
+            Self::V2017 | Self::V2019 => "N'OFF'",
+            Self::V2022 | Self::V2025 => "p.xml_compression_desc",
+        }
+    }
+
+    fn routine_inline_expressions(self) -> (&'static str, &'static str) {
+        match self {
+            Self::V2017 => ("CAST(0 AS bit)", "CAST(0 AS bit)"),
+            Self::V2019 | Self::V2022 | Self::V2025 => (
+                "COALESCE(m.is_inlineable, CAST(0 AS bit))",
+                "CASE WHEN COALESCE(m.inline_type, 0) = 1 THEN CAST(1 AS bit) ELSE CAST(0 AS bit) END",
+            ),
+        }
+    }
+
+    fn edge_constraint_union(self) -> &'static str {
+        match self {
+            Self::V2017 => "",
+            Self::V2019 | Self::V2022 | Self::V2025 => {
+                "UNION ALL
+                 SELECT s.name, ec.name, N'EC', N'EDGE_CONSTRAINT'
+                 FROM sys.edge_constraints ec
+                 JOIN sys.schemas s ON s.schema_id = ec.schema_id"
+            }
         }
     }
 }
@@ -924,6 +969,8 @@ struct RawUserType {
     user_defined: bool,
     assembly: bool,
     table_type: bool,
+    table_object_id: Option<i32>,
+    memory_optimized: bool,
     default_object_id: i32,
     rule_object_id: i32,
 }
@@ -1078,7 +1125,7 @@ impl RawSqlServerCatalog {
         let constraints = read_constraints(client, selected_schemas).await?;
         let indexes = read_indexes(client, selected_schemas).await?;
         let views = read_views(client, selected_schemas).await?;
-        let routines = read_routines(client, selected_schemas).await?;
+        let routines = read_routines(client, strategy, selected_schemas).await?;
         let parameters = read_parameters(client, &routines).await?;
         let triggers = read_triggers(client, selected_schemas).await?;
         let user_types = read_user_types(client, selected_schemas).await?;
@@ -1089,7 +1136,7 @@ impl RawSqlServerCatalog {
         let partition_schemes = read_partition_schemes(client).await?;
         let partitions = read_partitions(client, strategy, &tables, &views).await?;
         let security_policies = read_security_policies(client, selected_schemas).await?;
-        let unsupported = read_unsupported_objects(client, selected_schemas).await?;
+        let unsupported = read_unsupported_objects(client, strategy, selected_schemas).await?;
         validate_supported_metadata(
             &unsupported,
             &views,
@@ -1161,9 +1208,7 @@ async fn read_tables(
     strategy: SqlServerCatalogVersion,
     selected_schemas: &BTreeSet<String>,
 ) -> Result<Vec<RawTable>, CatalogError> {
-    let ledger_column = match strategy {
-        SqlServerCatalogVersion::V2022 => "t.ledger_type_desc",
-    };
+    let ledger_column = strategy.ledger_expression();
     let sql = format!(
         "
         SELECT t.object_id,
@@ -1247,7 +1292,7 @@ async fn read_columns(
         SELECT c.object_id,
                RTRIM(o.type),
                s.name,
-               o.name,
+               COALESCE(tt.name, o.name),
                c.column_id,
                c.name,
                c.user_type_id,
@@ -1287,7 +1332,8 @@ async fn read_columns(
                c.default_object_id
         FROM sys.columns c
         JOIN sys.objects o ON o.object_id = c.object_id
-        JOIN sys.schemas s ON s.schema_id = o.schema_id
+        LEFT JOIN sys.table_types tt ON tt.type_table_object_id = o.object_id
+        JOIN sys.schemas s ON s.schema_id = COALESCE(tt.schema_id, o.schema_id)
         JOIN sys.types ty ON ty.user_type_id = c.user_type_id
         JOIN sys.schemas ts ON ts.schema_id = ty.schema_id
         LEFT JOIN sys.identity_columns ic
@@ -1297,8 +1343,8 @@ async fn read_columns(
         LEFT JOIN sys.default_constraints dc ON dc.object_id = c.default_object_id
         LEFT JOIN sys.masked_columns mc
           ON mc.object_id = c.object_id AND mc.column_id = c.column_id
-        WHERE o.is_ms_shipped = 0
-          AND o.type IN ('U', 'V')
+        WHERE (o.is_ms_shipped = 0 OR o.type = 'TT')
+          AND o.type IN ('U', 'V', 'TT')
         ORDER BY c.object_id, c.column_id
         "
     );
@@ -1381,7 +1427,7 @@ async fn read_constraints(
         "
         SELECT kc.object_id,
                s.name,
-               t.name,
+               COALESCE(tt.name, t.name),
                t.object_id,
                kc.name,
                RTRIM(kc.type),
@@ -1389,15 +1435,17 @@ async fn read_constraints(
                c.column_id,
                c.name
         FROM sys.key_constraints kc
-        JOIN sys.tables t ON t.object_id = kc.parent_object_id
-        JOIN sys.schemas s ON s.schema_id = t.schema_id
+        JOIN sys.objects t ON t.object_id = kc.parent_object_id
+        LEFT JOIN sys.table_types tt ON tt.type_table_object_id = t.object_id
+        JOIN sys.schemas s ON s.schema_id = COALESCE(tt.schema_id, t.schema_id)
         JOIN sys.index_columns ic
           ON ic.object_id = kc.parent_object_id
          AND ic.index_id = kc.unique_index_id
          AND ic.key_ordinal > 0
         JOIN sys.columns c
           ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-        WHERE t.is_ms_shipped = 0
+        WHERE (t.is_ms_shipped = 0 OR t.type = 'TT')
+          AND t.type IN ('U', 'TT')
           AND kc.type IN ('PK', 'UQ')
         ORDER BY kc.object_id, ic.key_ordinal
         ",
@@ -1571,7 +1619,7 @@ async fn read_constraints(
         "
         SELECT cc.object_id,
                s.name,
-               t.name,
+               COALESCE(tt.name, t.name),
                t.object_id,
                cc.name,
                cc.parent_column_id,
@@ -1582,11 +1630,13 @@ async fn read_constraints(
                CASE WHEN DATALENGTH(cc.definition) <= {MAX_DEFINITION_BYTES} THEN cc.definition END,
                CAST(COALESCE(DATALENGTH(cc.definition), 0) AS int)
         FROM sys.check_constraints cc
-        JOIN sys.tables t ON t.object_id = cc.parent_object_id
-        JOIN sys.schemas s ON s.schema_id = t.schema_id
+        JOIN sys.objects t ON t.object_id = cc.parent_object_id
+        LEFT JOIN sys.table_types tt ON tt.type_table_object_id = t.object_id
+        JOIN sys.schemas s ON s.schema_id = COALESCE(tt.schema_id, t.schema_id)
         LEFT JOIN sys.columns c
           ON c.object_id = cc.parent_object_id AND c.column_id = cc.parent_column_id
-        WHERE t.is_ms_shipped = 0
+        WHERE (t.is_ms_shipped = 0 OR t.type = 'TT')
+          AND t.type IN ('U', 'TT')
         ORDER BY cc.object_id
         "
     );
@@ -1643,7 +1693,7 @@ async fn read_indexes(
         "
         SELECT i.object_id,
                s.name,
-               o.name,
+               COALESCE(tt.name, o.name),
                RTRIM(o.type),
                i.index_id,
                i.name,
@@ -1665,9 +1715,10 @@ async fn read_indexes(
                i.data_space_id
         FROM sys.indexes i
         JOIN sys.objects o ON o.object_id = i.object_id
-        JOIN sys.schemas s ON s.schema_id = o.schema_id
-        WHERE o.is_ms_shipped = 0
-          AND o.type IN ('U', 'V')
+        LEFT JOIN sys.table_types tt ON tt.type_table_object_id = o.object_id
+        JOIN sys.schemas s ON s.schema_id = COALESCE(tt.schema_id, o.schema_id)
+        WHERE (o.is_ms_shipped = 0 OR o.type = 'TT')
+          AND o.type IN ('U', 'V', 'TT')
           AND i.index_id > 0
           AND i.name IS NOT NULL
         ORDER BY i.object_id, i.index_id
@@ -1728,8 +1779,8 @@ async fn read_indexes(
         JOIN sys.columns c
           ON c.object_id = ic.object_id AND c.column_id = ic.column_id
         JOIN sys.objects o ON o.object_id = ic.object_id
-        WHERE o.is_ms_shipped = 0
-          AND o.type IN ('U', 'V')
+        WHERE (o.is_ms_shipped = 0 OR o.type = 'TT')
+          AND o.type IN ('U', 'V', 'TT')
         ORDER BY ic.object_id, ic.index_id, ic.index_column_id
         ",
     )
@@ -1831,8 +1882,10 @@ async fn read_views(
 
 async fn read_routines(
     client: &mut TdsClient,
+    strategy: SqlServerCatalogVersion,
     selected_schemas: &BTreeSet<String>,
 ) -> Result<Vec<RawRoutine>, CatalogError> {
+    let (inlineable, inline_type) = strategy.routine_inline_expressions();
     let sql = format!(
         "
         SELECT o.object_id,
@@ -1848,8 +1901,8 @@ async fn read_routines(
                COALESCE(m.uses_quoted_identifier, CAST(0 AS bit)),
                m.execute_as_principal_id,
                COALESCE(m.null_on_null_input, CAST(0 AS bit)),
-               COALESCE(m.is_inlineable, CAST(0 AS bit)),
-               CASE WHEN COALESCE(m.inline_type, 0) = 1 THEN CAST(1 AS bit) ELSE CAST(0 AS bit) END,
+               {inlineable},
+               {inline_type},
                COALESCE(p.is_auto_executed, CAST(0 AS bit)),
                COALESCE(p.is_execution_replicated, CAST(0 AS bit)),
                CASE WHEN DATALENGTH(m.definition) <= {MAX_DEFINITION_BYTES} THEN m.definition END,
@@ -2096,10 +2149,13 @@ async fn read_user_types(
                ty.is_user_defined,
                ty.is_assembly_type,
                ty.is_table_type,
+               tt.type_table_object_id,
+               COALESCE(tt.is_memory_optimized, CAST(0 AS bit)),
                ty.default_object_id,
                ty.rule_object_id
         FROM sys.types ty
         JOIN sys.schemas s ON s.schema_id = ty.schema_id
+        LEFT JOIN sys.table_types tt ON tt.user_type_id = ty.user_type_id
         LEFT JOIN sys.types bt
           ON bt.user_type_id = bt.system_type_id
          AND bt.system_type_id = ty.system_type_id
@@ -2124,8 +2180,10 @@ async fn read_user_types(
             user_defined: required_value(&row, 10, "user-defined flag")?,
             assembly: required_value(&row, 11, "assembly type flag")?,
             table_type: required_value(&row, 12, "table type flag")?,
-            default_object_id: required_value(&row, 13, "type default object id")?,
-            rule_object_id: required_value(&row, 14, "type rule object id")?,
+            table_object_id: optional_value(&row, 13)?,
+            memory_optimized: required_value(&row, 14, "memory optimized table type flag")?,
+            default_object_id: required_value(&row, 15, "type default object id")?,
+            rule_object_id: required_value(&row, 16, "type rule object id")?,
         })
     })
     .collect::<Result<Vec<_>, CatalogError>>()
@@ -2398,9 +2456,7 @@ async fn read_partitions(
         .map(|table| table.id)
         .chain(views.iter().map(|view| view.id))
         .collect::<BTreeSet<_>>();
-    let xml_column = match strategy {
-        SqlServerCatalogVersion::V2022 => "p.xml_compression_desc",
-    };
+    let xml_column = strategy.xml_compression_expression();
     let sql = format!(
         "
         SELECT p.object_id,
@@ -2509,10 +2565,11 @@ async fn read_security_policies(
 
 async fn read_unsupported_objects(
     client: &mut TdsClient,
+    strategy: SqlServerCatalogVersion,
     selected_schemas: &BTreeSet<String>,
 ) -> Result<Vec<RawUnsupportedObject>, CatalogError> {
-    rows(
-        client,
+    let edge_constraints = strategy.edge_constraint_union();
+    let sql = format!(
         "
         SELECT s.name, o.name, RTRIM(o.type), o.type_desc
         FROM sys.objects o
@@ -2523,10 +2580,7 @@ async fn read_unsupported_objects(
         SELECT s.name, et.name, N'ET', N'EXTERNAL_TABLE'
         FROM sys.external_tables et
         JOIN sys.schemas s ON s.schema_id = et.schema_id
-        UNION ALL
-        SELECT s.name, ec.name, N'EC', N'EDGE_CONSTRAINT'
-        FROM sys.edge_constraints ec
-        JOIN sys.schemas s ON s.schema_id = ec.schema_id
+        {edge_constraints}
         UNION ALL
         SELECT s.name, p.name, N'NP', N'NUMBERED_PROCEDURE'
         FROM sys.numbered_procedures np
@@ -2535,29 +2589,30 @@ async fn read_unsupported_objects(
         WHERE np.procedure_number > 1
         ORDER BY 1, 2, 3
         ",
-    )
-    .await?
-    .into_iter()
-    .map(|row| {
-        Ok(RawUnsupportedObject {
-            schema: optional_string(&row, 0)?,
-            name: required_string(&row, 1, "unsupported object name")?,
-            type_code: required_string(&row, 2, "unsupported object type")?,
-            type_desc: required_string(&row, 3, "unsupported object type description")?,
-        })
-    })
-    .collect::<Result<Vec<_>, CatalogError>>()
-    .map(|objects| {
-        objects
-            .into_iter()
-            .filter(|object| {
-                object
-                    .schema
-                    .as_ref()
-                    .is_none_or(|schema| selected_schemas.contains(schema))
+    );
+    rows(client, &sql)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(RawUnsupportedObject {
+                schema: optional_string(&row, 0)?,
+                name: required_string(&row, 1, "unsupported object name")?,
+                type_code: required_string(&row, 2, "unsupported object type")?,
+                type_desc: required_string(&row, 3, "unsupported object type description")?,
             })
-            .collect()
-    })
+        })
+        .collect::<Result<Vec<_>, CatalogError>>()
+        .map(|objects| {
+            objects
+                .into_iter()
+                .filter(|object| {
+                    object
+                        .schema
+                        .as_ref()
+                        .is_none_or(|schema| selected_schemas.contains(schema))
+                })
+                .collect()
+        })
 }
 
 fn validate_supported_metadata(
@@ -2607,19 +2662,19 @@ fn validate_supported_metadata(
             require_visible_definition("trigger", &trigger.name, trigger.definition.as_deref())?;
         reject_dynamic_sql("trigger", &trigger.name, definition)?;
     }
-    if let Some(data_type) = user_types
-        .iter()
-        .find(|data_type| data_type.assembly || data_type.table_type)
-    {
+    if let Some(data_type) = user_types.iter().find(|data_type| data_type.assembly) {
         return Err(CatalogError::UnsupportedMetadata(format!(
-            "user-defined type '{}.{}' requires {} metadata mapping",
-            data_type.schema,
-            data_type.name,
-            if data_type.table_type {
-                "table-type"
-            } else {
-                "CLR"
-            }
+            "CLR user-defined type '{}.{}' requires assembly metadata mapping",
+            data_type.schema, data_type.name
+        )));
+    }
+    if let Some(data_type) = user_types.iter().find(|data_type| {
+        data_type.table_type != data_type.table_object_id.is_some()
+            || (!data_type.table_type && data_type.memory_optimized)
+    }) {
+        return Err(CatalogError::Mapping(format!(
+            "user-defined type '{}.{}' has inconsistent table-type catalog identity",
+            data_type.schema, data_type.name
         )));
     }
     if let Some(data_type) = user_types
@@ -2914,7 +2969,10 @@ impl SqlServerSnapshotMapper {
             add_owned_by(&mut metadata, &key, schema.principal_id, &principal_keys)?;
         }
 
+        let mut object_keys = BTreeMap::<i32, ObjectKey>::new();
+        let mut name_keys = BTreeMap::<(String, String), ObjectKey>::new();
         let mut type_keys = BTreeMap::<i32, ObjectKey>::new();
+        let mut table_type_keys = BTreeMap::<i32, ObjectKey>::new();
         for data_type in &raw.user_types {
             let schema_key =
                 required_key(&schema_keys, &data_type.schema, "user-defined type schema")?;
@@ -2931,6 +2989,20 @@ impl SqlServerSnapshotMapper {
                     "duplicate user-defined type id {}",
                     data_type.id
                 )));
+            }
+            if let Some(table_object_id) = data_type.table_object_id {
+                insert_unique_id(
+                    &mut table_type_keys,
+                    table_object_id,
+                    &key,
+                    "table type object",
+                )?;
+                if object_keys.insert(table_object_id, key.clone()).is_some() {
+                    return Err(CatalogError::Mapping(format!(
+                        "duplicate SQL Server object id {table_object_id} for table type '{}.{}'",
+                        data_type.schema, data_type.name
+                    )));
+                }
             }
             let mut properties = BTreeMap::new();
             insert_i64(
@@ -2949,8 +3021,19 @@ impl SqlServerSnapshotMapper {
             insert_optional_string(&mut properties, "collation", data_type.collation.as_deref());
             insert_bool(&mut properties, "nullable", data_type.nullable);
             insert_bool(&mut properties, "user_defined", data_type.user_defined);
+            insert_bool(&mut properties, "table_type", data_type.table_type);
+            insert_bool(
+                &mut properties,
+                "memory_optimized",
+                data_type.memory_optimized,
+            );
+            insert_optional_i64(
+                &mut properties,
+                "table_object_id",
+                data_type.table_object_id.map(i64::from),
+            );
             metadata.objects.push(MetadataObject {
-                key,
+                key: key.clone(),
                 parent_key: Some(schema_key.clone()),
                 name: data_type.name.clone(),
                 extension_kind: None,
@@ -2959,8 +3042,6 @@ impl SqlServerSnapshotMapper {
             });
         }
 
-        let mut object_keys = BTreeMap::<i32, ObjectKey>::new();
-        let mut name_keys = BTreeMap::<(String, String), ObjectKey>::new();
         let mut sequence_keys = BTreeMap::<i32, ObjectKey>::new();
         for sequence in &raw.sequences {
             let schema_key = required_key(&schema_keys, &sequence.schema, "sequence schema")?;
@@ -3299,6 +3380,40 @@ impl SqlServerSnapshotMapper {
                     properties: column_properties(column),
                 });
                 key
+            } else if parent_key.object_kind == ObjectKind::UserDefinedType
+                && table_type_keys.contains_key(&column.object_id)
+            {
+                let key = sqlserver_key(
+                    &self.connection_alias,
+                    &database_name,
+                    &column.schema,
+                    ObjectKind::Extension,
+                    &parent_key.object_name,
+                    Some(format!("table-type-column:{}:{}", column.id, column.name)),
+                );
+                let mut properties = column_properties(column);
+                insert_i64(
+                    &mut properties,
+                    "ordinal_position",
+                    i64::from(positive_u32(column.id, "table type column ordinal")?),
+                );
+                insert_string(
+                    &mut properties,
+                    "data_type",
+                    &qualified_type_name(&column.type_schema, &column.type_name),
+                );
+                metadata.objects.push(MetadataObject {
+                    key: key.clone(),
+                    parent_key: Some(parent_key.clone()),
+                    name: column.name.clone(),
+                    extension_kind: Some("sqlserver_table_type_column".to_owned()),
+                    definition: column
+                        .computed_definition
+                        .clone()
+                        .or_else(|| column.default_definition.clone()),
+                    properties,
+                });
+                key
             } else {
                 return Err(CatalogError::Mapping(format!(
                     "column parent '{}' has unsupported kind {}",
@@ -3327,7 +3442,11 @@ impl SqlServerSnapshotMapper {
             if let Some(type_key) = type_keys.get(&column.type_id) {
                 add_relationship(
                     &mut metadata,
-                    MetadataRelationshipKind::UsesType,
+                    if key.object_kind == ObjectKind::Extension {
+                        MetadataRelationshipKind::DependsOn
+                    } else {
+                        MetadataRelationshipKind::UsesType
+                    },
                     &key,
                     type_key,
                     None,
@@ -3339,12 +3458,12 @@ impl SqlServerSnapshotMapper {
         let mut constraints = Vec::<ConstraintObject>::new();
         let mut constraint_keys = BTreeMap::<i32, ObjectKey>::new();
         for constraint in &raw.constraints {
-            let table_key = table_keys
+            let parent_key = object_keys
                 .get(&constraint.table_id)
                 .cloned()
                 .ok_or_else(|| {
                     CatalogError::Mapping(format!(
-                        "constraint '{}.{}.{}' references missing table",
+                        "constraint '{}.{}.{}' references an unmapped parent",
                         constraint.schema, constraint.table, constraint.name
                     ))
                 })?;
@@ -3370,6 +3489,12 @@ impl SqlServerSnapshotMapper {
             let (referenced_table_key, referenced_columns) = if constraint.kind
                 == ConstraintKind::ForeignKey
             {
+                if parent_key.object_kind != ObjectKind::Table {
+                    return Err(CatalogError::UnsupportedMetadata(format!(
+                        "table type constraint '{}' unexpectedly declares a foreign key",
+                        constraint.name
+                    )));
+                }
                 let target_id = constraint.referenced_table_id.ok_or_else(|| {
                     CatalogError::Mapping(format!(
                         "foreign key '{}' has no referenced table id",
@@ -3411,28 +3536,84 @@ impl SqlServerSnapshotMapper {
             } else {
                 (None, Vec::new())
             };
-            let kind = constraint_object_kind(constraint.kind);
-            let key = sqlserver_key(
-                &self.connection_alias,
-                &database_name,
-                &constraint.schema,
-                kind,
-                &constraint.table,
-                Some(constraint.name.clone()),
-            );
+            let table_constraint = parent_key.object_kind == ObjectKind::Table;
+            let key = if table_constraint {
+                sqlserver_key(
+                    &self.connection_alias,
+                    &database_name,
+                    &constraint.schema,
+                    constraint_object_kind(constraint.kind),
+                    &constraint.table,
+                    Some(constraint.name.clone()),
+                )
+            } else if parent_key.object_kind == ObjectKind::UserDefinedType
+                && table_type_keys.contains_key(&constraint.table_id)
+            {
+                sqlserver_key(
+                    &self.connection_alias,
+                    &database_name,
+                    &constraint.schema,
+                    ObjectKind::Extension,
+                    &parent_key.object_name,
+                    Some(format!(
+                        "table-type-constraint:{}:{}",
+                        constraint.id, constraint.name
+                    )),
+                )
+            } else {
+                return Err(CatalogError::Mapping(format!(
+                    "constraint '{}' has unsupported parent kind {}",
+                    constraint.name, parent_key.object_kind
+                )));
+            };
             insert_unique_id(&mut constraint_keys, constraint.id, &key, "constraint")?;
             object_keys.insert(constraint.id, key.clone());
-            constraints.push(ConstraintObject {
-                key: key.clone(),
-                table_key,
-                name: constraint.name.clone(),
-                kind: constraint.kind,
-                columns: resolved_columns,
-                referenced_table_key,
-                referenced_columns,
-                expression: constraint.expression.clone(),
-            });
-            add_annotation(&mut metadata, &key, None, constraint_properties(constraint));
+            if table_constraint {
+                constraints.push(ConstraintObject {
+                    key: key.clone(),
+                    table_key: parent_key,
+                    name: constraint.name.clone(),
+                    kind: constraint.kind,
+                    columns: resolved_columns,
+                    referenced_table_key,
+                    referenced_columns,
+                    expression: constraint.expression.clone(),
+                });
+                add_annotation(&mut metadata, &key, None, constraint_properties(constraint));
+            } else {
+                let mut properties = constraint_properties(constraint);
+                insert_string(
+                    &mut properties,
+                    "constraint_kind",
+                    &constraint_object_kind(constraint.kind).to_string(),
+                );
+                properties.insert(
+                    "columns".to_owned(),
+                    MetadataValue::StringList(
+                        resolved_columns.iter().map(ObjectKey::to_string).collect(),
+                    ),
+                );
+                metadata.objects.push(MetadataObject {
+                    key: key.clone(),
+                    parent_key: Some(parent_key),
+                    name: constraint.name.clone(),
+                    extension_kind: Some("sqlserver_table_type_constraint".to_owned()),
+                    definition: constraint.expression.clone(),
+                    properties,
+                });
+                for (ordinal, column_key) in resolved_columns.iter().enumerate() {
+                    add_relationship(
+                        &mut metadata,
+                        MetadataRelationshipKind::Extension(
+                            "table_type_constraint_column".to_owned(),
+                        ),
+                        &key,
+                        column_key,
+                        Some((ordinal + 1) as u32),
+                        BTreeMap::new(),
+                    );
+                }
+            }
         }
 
         let mut indexes = Vec::<IndexObject>::new();
@@ -3537,6 +3718,69 @@ impl SqlServerSnapshotMapper {
                     properties,
                 });
                 add_included_column_relationships(&mut metadata, &key, index, &column_keys)?;
+            } else if parent_key.object_kind == ObjectKind::UserDefinedType
+                && table_type_keys.contains_key(&index.object_id)
+            {
+                let key = sqlserver_key(
+                    &self.connection_alias,
+                    &database_name,
+                    &index.schema,
+                    ObjectKind::Extension,
+                    &parent_key.object_name,
+                    Some(format!("table-type-index:{}:{}", index.id, index.name)),
+                );
+                if index_keys
+                    .insert((index.object_id, index.id), key.clone())
+                    .is_some()
+                {
+                    return Err(CatalogError::Mapping(format!(
+                        "duplicate table type index identity {}:{}",
+                        index.object_id, index.id
+                    )));
+                }
+                let mut properties = index_properties(index);
+                properties.insert(
+                    "key_columns".to_owned(),
+                    MetadataValue::StringList(
+                        resolved_columns.iter().map(ObjectKey::to_string).collect(),
+                    ),
+                );
+                metadata.objects.push(MetadataObject {
+                    key: key.clone(),
+                    parent_key: Some(parent_key),
+                    name: index.name.clone(),
+                    extension_kind: Some("sqlserver_table_type_index".to_owned()),
+                    definition: index.filter.clone(),
+                    properties,
+                });
+                for column in &index.columns {
+                    let column_key = column_keys
+                        .get(&(index.object_id, column.column_id))
+                        .ok_or_else(|| {
+                            CatalogError::Mapping(format!(
+                                "table type index '{}.{}' lost column '{}'",
+                                index.relation, index.name, column.name
+                            ))
+                        })?;
+                    let mut relationship_properties = BTreeMap::new();
+                    insert_bool(
+                        &mut relationship_properties,
+                        "descending",
+                        column.descending,
+                    );
+                    insert_bool(&mut relationship_properties, "included", column.included);
+                    add_relationship(
+                        &mut metadata,
+                        MetadataRelationshipKind::Extension("table_type_index_column".to_owned()),
+                        &key,
+                        column_key,
+                        Some(positive_u32(
+                            column.index_column_id,
+                            "table type index column ordinal",
+                        )?),
+                        relationship_properties,
+                    );
+                }
             } else {
                 return Err(CatalogError::Mapping(format!(
                     "index '{}' has unsupported parent kind {}",
@@ -3763,13 +4007,13 @@ impl SqlServerSnapshotMapper {
             .enumerate()
             .map(|(position, view)| (view.id, position))
             .collect::<BTreeMap<_, _>>();
-        for (view_id, dependencies) in dependency_result.view_dependencies {
-            let position = view_positions.get(&view_id).copied().ok_or_else(|| {
+        for (view_id, dependencies) in &dependency_result.view_dependencies {
+            let position = view_positions.get(view_id).copied().ok_or_else(|| {
                 CatalogError::Mapping(format!(
                     "dependency ledger references missing ordinary view {view_id}"
                 ))
             })?;
-            views[position].depends_on = dependencies;
+            views[position].depends_on = dependencies.clone();
         }
         let routine_positions = raw
             .routines
@@ -3777,14 +4021,21 @@ impl SqlServerSnapshotMapper {
             .enumerate()
             .map(|(position, routine)| (routine.id, position))
             .collect::<BTreeMap<_, _>>();
-        for (routine_id, dependencies) in dependency_result.routine_dependencies {
-            let position = routine_positions.get(&routine_id).copied().ok_or_else(|| {
+        for (routine_id, dependencies) in &dependency_result.routine_dependencies {
+            let position = routine_positions.get(routine_id).copied().ok_or_else(|| {
                 CatalogError::Mapping(format!(
                     "dependency ledger references missing routine {routine_id}"
                 ))
             })?;
-            routines[position].depends_on = dependencies;
+            routines[position].depends_on = dependencies.clone();
         }
+
+        let projection_ledger = SqlServerProjectionLedger {
+            external_reference_objects: external_reference_keys.len() as u64,
+            view_dependencies: dependency_result.view_dependency_count(),
+            routine_dependencies: dependency_result.routine_dependency_count(),
+            dependency_metadata_relationships: dependency_result.metadata_relationship_count,
+        };
 
         add_principal_memberships(&mut metadata, &raw.principals, &principal_keys)?;
         validate_relationship_uniqueness(&metadata.relationships)?;
@@ -3806,7 +4057,7 @@ impl SqlServerSnapshotMapper {
             },
             metadata,
         };
-        let discovered_counts = discovery_counts_from_catalog(&raw, &snapshot)?;
+        let discovered_counts = discovery_counts_from_catalog(&raw, &snapshot, projection_ledger)?;
         Ok(CatalogDiscovery {
             snapshot,
             adapter: AdapterIdentity {
@@ -4807,6 +5058,31 @@ fn map_synonym_targets(
 struct DependencyMappingResult {
     view_dependencies: BTreeMap<i32, Vec<ObjectKey>>,
     routine_dependencies: BTreeMap<i32, Vec<ObjectKey>>,
+    metadata_relationship_count: u64,
+}
+
+impl DependencyMappingResult {
+    fn view_dependency_count(&self) -> u64 {
+        self.view_dependencies
+            .values()
+            .map(|dependencies| dependencies.len() as u64)
+            .sum()
+    }
+
+    fn routine_dependency_count(&self) -> u64 {
+        self.routine_dependencies
+            .values()
+            .map(|dependencies| dependencies.len() as u64)
+            .sum()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SqlServerProjectionLedger {
+    external_reference_objects: u64,
+    view_dependencies: u64,
+    routine_dependencies: u64,
+    dependency_metadata_relationships: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4874,8 +5150,9 @@ fn map_dependencies(
                     None,
                     dependency_properties(dependency),
                 );
+                result.metadata_relationship_count += 1;
             }
-            ObjectKind::View => {
+            ObjectKind::View if is_legacy_schema_object_kind(target.object_kind) => {
                 push_unique_dependency(
                     result
                         .view_dependencies
@@ -4884,7 +5161,7 @@ fn map_dependencies(
                     target,
                 );
             }
-            ObjectKind::Routine => {
+            ObjectKind::Routine if is_legacy_schema_object_kind(target.object_kind) => {
                 push_unique_dependency(
                     result
                         .routine_dependencies
@@ -4904,6 +5181,7 @@ fn map_dependencies(
                     None,
                     dependency_properties(dependency),
                 );
+                result.metadata_relationship_count += 1;
             }
             ObjectKind::Trigger if target.object_kind == ObjectKind::Routine => {
                 add_relationship(
@@ -4914,6 +5192,7 @@ fn map_dependencies(
                     None,
                     dependency_properties(dependency),
                 );
+                result.metadata_relationship_count += 1;
             }
             _ => {
                 add_relationship(
@@ -4924,6 +5203,7 @@ fn map_dependencies(
                     None,
                     dependency_properties(dependency),
                 );
+                result.metadata_relationship_count += 1;
             }
         }
     }
@@ -5110,6 +5390,24 @@ fn push_unique_dependency(dependencies: &mut Vec<ObjectKey>, key: ObjectKey) {
     }
 }
 
+fn is_legacy_schema_object_kind(kind: ObjectKind) -> bool {
+    matches!(
+        kind,
+        ObjectKind::Database
+            | ObjectKind::Schema
+            | ObjectKind::Table
+            | ObjectKind::Column
+            | ObjectKind::PrimaryKey
+            | ObjectKind::ForeignKey
+            | ObjectKind::UniqueConstraint
+            | ObjectKind::CheckConstraint
+            | ObjectKind::Index
+            | ObjectKind::View
+            | ObjectKind::Trigger
+            | ObjectKind::Routine
+    )
+}
+
 fn validate_relationship_uniqueness(
     relationships: &[MetadataRelationship],
 ) -> Result<(), CatalogError> {
@@ -5136,9 +5434,20 @@ fn validate_relationship_uniqueness(
 fn discovery_counts_from_catalog(
     raw: &RawSqlServerCatalog,
     snapshot: &CanonicalSchemaSnapshot,
+    projection: SqlServerProjectionLedger,
 ) -> Result<DiscoveryCounts, CatalogError> {
     let emitted_objects = emitted_object_counts(snapshot);
     let emitted_relationships = emitted_relationship_counts(snapshot);
+    let table_ids = raw
+        .tables
+        .iter()
+        .map(|table| table.id)
+        .collect::<BTreeSet<_>>();
+    let table_type_ids = raw
+        .user_types
+        .iter()
+        .filter_map(|data_type| data_type.table_object_id)
+        .collect::<BTreeSet<_>>();
     let mut expected_objects = ObjectCategory::ALL
         .into_iter()
         .map(|category| (category, 0_u64))
@@ -5165,31 +5474,48 @@ fn discovery_counts_from_catalog(
         ObjectCategory::PrimaryKey,
         raw.constraints
             .iter()
-            .filter(|constraint| constraint.kind == ConstraintKind::PrimaryKey)
+            .filter(|constraint| {
+                table_ids.contains(&constraint.table_id)
+                    && constraint.kind == ConstraintKind::PrimaryKey
+            })
             .count() as u64,
     );
     expected_objects.insert(
         ObjectCategory::ForeignKey,
         raw.constraints
             .iter()
-            .filter(|constraint| constraint.kind == ConstraintKind::ForeignKey)
+            .filter(|constraint| {
+                table_ids.contains(&constraint.table_id)
+                    && constraint.kind == ConstraintKind::ForeignKey
+            })
             .count() as u64,
     );
     expected_objects.insert(
         ObjectCategory::UniqueConstraint,
         raw.constraints
             .iter()
-            .filter(|constraint| constraint.kind == ConstraintKind::Unique)
+            .filter(|constraint| {
+                table_ids.contains(&constraint.table_id)
+                    && constraint.kind == ConstraintKind::Unique
+            })
             .count() as u64,
     );
     expected_objects.insert(
         ObjectCategory::CheckConstraint,
         raw.constraints
             .iter()
-            .filter(|constraint| constraint.kind == ConstraintKind::Check)
+            .filter(|constraint| {
+                table_ids.contains(&constraint.table_id) && constraint.kind == ConstraintKind::Check
+            })
             .count() as u64,
     );
-    expected_objects.insert(ObjectCategory::Index, raw.indexes.len() as u64);
+    expected_objects.insert(
+        ObjectCategory::Index,
+        raw.indexes
+            .iter()
+            .filter(|index| index.relation_type != "TT")
+            .count() as u64,
+    );
     expected_objects.insert(
         ObjectCategory::View,
         raw.views.iter().filter(|view| !view.indexed).count() as u64,
@@ -5210,12 +5536,7 @@ fn discovery_counts_from_catalog(
     expected_objects.insert(ObjectCategory::Policy, raw.security_policies.len() as u64);
     expected_objects.insert(
         ObjectCategory::Extension,
-        snapshot
-            .metadata
-            .objects
-            .iter()
-            .filter(|object| object.key.object_kind == ObjectKind::Extension)
-            .count() as u64,
+        expected_extension_object_count(raw, &table_type_ids, projection),
     );
     if expected_objects != emitted_objects {
         return Err(CatalogError::Mapping(format!(
@@ -5223,7 +5544,10 @@ fn discovery_counts_from_catalog(
         )));
     }
 
-    let mut expected_relationships = emitted_relationships.clone();
+    let mut expected_relationships = RelationshipCategory::ALL
+        .into_iter()
+        .map(|category| (category, 0_u64))
+        .collect::<BTreeMap<_, _>>();
     expected_relationships.insert(
         RelationshipCategory::DatabaseHasSchema,
         raw.schemas.len() as u64,
@@ -5241,13 +5565,19 @@ fn discovery_counts_from_catalog(
     );
     expected_relationships.insert(
         RelationshipCategory::TableHasConstraint,
-        raw.constraints.len() as u64,
+        raw.constraints
+            .iter()
+            .filter(|constraint| table_ids.contains(&constraint.table_id))
+            .count() as u64,
     );
     expected_relationships.insert(
         RelationshipCategory::ConstraintColumn,
         raw.constraints
             .iter()
-            .filter(|constraint| constraint.kind != ConstraintKind::ForeignKey)
+            .filter(|constraint| {
+                table_ids.contains(&constraint.table_id)
+                    && constraint.kind != ConstraintKind::ForeignKey
+            })
             .map(|constraint| constraint.columns.len() as u64)
             .sum(),
     );
@@ -5255,7 +5585,10 @@ fn discovery_counts_from_catalog(
         RelationshipCategory::ForeignKeyColumnPair,
         raw.constraints
             .iter()
-            .filter(|constraint| constraint.kind == ConstraintKind::ForeignKey)
+            .filter(|constraint| {
+                table_ids.contains(&constraint.table_id)
+                    && constraint.kind == ConstraintKind::ForeignKey
+            })
             .map(|constraint| constraint.columns.len() as u64)
             .sum(),
     );
@@ -5267,8 +5600,20 @@ fn discovery_counts_from_catalog(
             .count() as u64,
     );
     expected_relationships.insert(
+        RelationshipCategory::IndexColumn,
+        raw.indexes
+            .iter()
+            .filter(|index| index.relation_type == "U")
+            .map(projected_index_column_count)
+            .sum(),
+    );
+    expected_relationships.insert(
         RelationshipCategory::SchemaHasView,
         raw.views.iter().filter(|view| !view.indexed).count() as u64,
+    );
+    expected_relationships.insert(
+        RelationshipCategory::ViewDependency,
+        projection.view_dependencies,
     );
     expected_relationships.insert(
         RelationshipCategory::TriggerTarget,
@@ -5280,12 +5625,29 @@ fn discovery_counts_from_catalog(
                         .parent_type
                         .as_deref()
                         .is_some_and(|kind| kind == "U" || kind == "V")
+                    && !raw
+                        .views
+                        .iter()
+                        .any(|view| view.indexed && view.id == trigger.parent_id)
             })
             .count() as u64,
     );
+    expected_relationships.insert(RelationshipCategory::TriggerRoutine, 0);
     expected_relationships.insert(
         RelationshipCategory::SchemaHasRoutine,
         raw.routines.len() as u64,
+    );
+    expected_relationships.insert(
+        RelationshipCategory::RoutineDependency,
+        projection.routine_dependencies,
+    );
+    expected_relationships.insert(
+        RelationshipCategory::MetadataParent,
+        expected_metadata_parent_count(raw, &table_type_ids, projection),
+    );
+    expected_relationships.insert(
+        RelationshipCategory::MetadataRelationship,
+        expected_metadata_relationship_count(raw, &table_type_ids, projection),
     );
     if expected_relationships != emitted_relationships {
         return Err(CatalogError::Mapping(format!(
@@ -5319,6 +5681,204 @@ fn discovery_counts_from_catalog(
             })
             .collect(),
     })
+}
+
+fn expected_extension_object_count(
+    raw: &RawSqlServerCatalog,
+    table_type_ids: &BTreeSet<i32>,
+    projection: SqlServerProjectionLedger,
+) -> u64 {
+    let table_type_columns = raw
+        .columns
+        .iter()
+        .filter(|column| table_type_ids.contains(&column.object_id))
+        .count() as u64;
+    let table_type_constraints = raw
+        .constraints
+        .iter()
+        .filter(|constraint| table_type_ids.contains(&constraint.table_id))
+        .count() as u64;
+    let table_type_indexes = raw
+        .indexes
+        .iter()
+        .filter(|index| table_type_ids.contains(&index.object_id))
+        .count() as u64;
+    let security_predicates = raw
+        .security_policies
+        .iter()
+        .map(|policy| policy.predicates.len() as u64)
+        .sum::<u64>();
+    let partition_boundaries = raw
+        .partition_functions
+        .iter()
+        .map(|function| function.values.len() as u64)
+        .sum::<u64>();
+
+    table_type_columns
+        + table_type_constraints
+        + table_type_indexes
+        + security_predicates
+        + raw.partition_functions.len() as u64
+        + partition_boundaries
+        + raw.partition_schemes.len() as u64
+        + raw.partitions.len() as u64
+        + projection.external_reference_objects
+}
+
+fn expected_metadata_parent_count(
+    raw: &RawSqlServerCatalog,
+    table_type_ids: &BTreeSet<i32>,
+    projection: SqlServerProjectionLedger,
+) -> u64 {
+    let indexed_view_ids = raw
+        .views
+        .iter()
+        .filter(|view| view.indexed)
+        .map(|view| view.id)
+        .collect::<BTreeSet<_>>();
+    let metadata_triggers = raw
+        .triggers
+        .iter()
+        .filter(|trigger| {
+            trigger.parent_class == 0
+                || (trigger.parent_class == 1 && indexed_view_ids.contains(&trigger.parent_id))
+        })
+        .count() as u64;
+
+    raw.principals.len() as u64
+        + raw.user_types.len() as u64
+        + raw.sequences.len() as u64
+        + indexed_view_ids.len() as u64
+        + metadata_triggers
+        + raw
+            .columns
+            .iter()
+            .filter(|column| column.object_type == "V")
+            .count() as u64
+        + raw
+            .indexes
+            .iter()
+            .filter(|index| index.relation_type == "V")
+            .count() as u64
+        + raw.parameters.len() as u64
+        + raw.synonyms.len() as u64
+        + raw.security_policies.len() as u64
+        + expected_extension_object_count(raw, table_type_ids, projection)
+}
+
+fn expected_metadata_relationship_count(
+    raw: &RawSqlServerCatalog,
+    table_type_ids: &BTreeSet<i32>,
+    projection: SqlServerProjectionLedger,
+) -> u64 {
+    let user_type_ids = raw
+        .user_types
+        .iter()
+        .map(|data_type| data_type.id)
+        .collect::<BTreeSet<_>>();
+    let ownerships = raw.schemas.len()
+        + raw.sequences.len()
+        + raw.tables.len()
+        + raw.views.len()
+        + raw.routines.len()
+        + raw.synonyms.len()
+        + raw.security_policies.len()
+        + raw
+            .principals
+            .iter()
+            .filter(|principal| principal.owning_principal_id.is_some())
+            .count();
+    let sequence_types = raw
+        .sequences
+        .iter()
+        .filter(|sequence| user_type_ids.contains(&sequence.type_id))
+        .count() as u64;
+    let column_types = raw
+        .columns
+        .iter()
+        .filter(|column| user_type_ids.contains(&column.type_id))
+        .count() as u64;
+    let table_type_constraint_columns = raw
+        .constraints
+        .iter()
+        .filter(|constraint| table_type_ids.contains(&constraint.table_id))
+        .map(|constraint| constraint.columns.len() as u64)
+        .sum::<u64>();
+    let table_type_index_columns = raw
+        .indexes
+        .iter()
+        .filter(|index| table_type_ids.contains(&index.object_id))
+        .map(|index| index.columns.len() as u64)
+        .sum::<u64>();
+    let parameter_types = raw
+        .parameters
+        .iter()
+        .filter(|parameter| user_type_ids.contains(&parameter.type_id))
+        .count() as u64;
+    let security_predicates = raw
+        .security_policies
+        .iter()
+        .map(|policy| policy.predicates.len() as u64)
+        .sum::<u64>();
+    let included_columns = raw
+        .indexes
+        .iter()
+        .filter(|index| index.relation_type == "U" || index.relation_type == "V")
+        .flat_map(|index| &index.columns)
+        .filter(|column| column.included)
+        .count() as u64;
+    let partition_scheme_ids = raw
+        .partition_schemes
+        .iter()
+        .map(|scheme| scheme.id)
+        .collect::<BTreeSet<_>>();
+    let index_data_spaces = raw
+        .indexes
+        .iter()
+        .map(|index| ((index.object_id, index.id), index.data_space_id))
+        .collect::<BTreeMap<_, _>>();
+    let partition_scheme_uses = raw
+        .partitions
+        .iter()
+        .filter(|partition| {
+            index_data_spaces
+                .get(&(partition.object_id, partition.index_id))
+                .is_some_and(|id| partition_scheme_ids.contains(id))
+        })
+        .count() as u64;
+    let temporal_histories = raw
+        .tables
+        .iter()
+        .filter(|table| table.history_schema.is_some() && table.history_table.is_some())
+        .count() as u64;
+
+    ownerships as u64
+        + sequence_types
+        + column_types
+        + table_type_constraint_columns
+        + table_type_index_columns
+        + raw.parameters.len() as u64
+        + parameter_types
+        + security_predicates
+        + included_columns
+        + raw.partition_schemes.len() as u64
+        + partition_scheme_uses
+        + temporal_histories
+        + raw.synonyms.len() as u64
+        + projection.dependency_metadata_relationships
+}
+
+fn projected_index_column_count(index: &RawIndex) -> u64 {
+    let key_columns = index
+        .columns
+        .iter()
+        .filter(|column| column.key_ordinal > 0)
+        .count();
+    if key_columns == 0 {
+        index.columns.len() as u64
+    } else {
+        key_columns as u64
+    }
 }
 
 fn sqlserver_capabilities() -> AdapterCapabilities {
@@ -5392,16 +5952,22 @@ mod tests {
 
     #[test]
     fn version_strategy_accepts_only_the_live_certified_engine() {
-        let supported = server_facts(16, 3);
-        assert_eq!(
-            SqlServerCatalogVersion::detect(&supported).unwrap(),
-            SqlServerCatalogVersion::V2022
-        );
+        for (major, expected) in [
+            (14, SqlServerCatalogVersion::V2017),
+            (15, SqlServerCatalogVersion::V2019),
+            (16, SqlServerCatalogVersion::V2022),
+            (17, SqlServerCatalogVersion::V2025),
+        ] {
+            assert_eq!(
+                SqlServerCatalogVersion::detect(&server_facts(major, 3)).unwrap(),
+                expected
+            );
+        }
 
-        let unsupported_version = SqlServerCatalogVersion::detect(&server_facts(15, 3));
+        let unsupported_version = SqlServerCatalogVersion::detect(&server_facts(13, 3));
         assert!(matches!(
             unsupported_version,
-            Err(CatalogError::UnsupportedVersion(15))
+            Err(CatalogError::UnsupportedVersion(13))
         ));
 
         let unsupported_engine = SqlServerCatalogVersion::detect(&server_facts(16, 5));
@@ -5502,147 +6068,154 @@ mod tests {
     }
 
     #[test]
-    fn rich_sqlserver_2022_catalog_is_certified() {
+    fn rich_sqlserver_catalog_is_certified_across_the_live_matrix() {
         let _guard = live_test_guard();
-        let Ok(connection_string) = std::env::var("DATABASE_MEMORY_TEST_SQLSERVER2022_URL") else {
-            eprintln!(
-                "skipping SQL Server 2022 rich catalog test; configure DATABASE_MEMORY_TEST_SQLSERVER2022_URL"
-            );
+        let configured = configured_sqlserver_matrix();
+        if configured.is_empty() {
+            eprintln!("skipping SQL Server rich matrix; configure SQL Server matrix URLs");
             return;
-        };
-        let schema = format!("dm_{}", unique_suffix());
-        let fixture = SqlServerFixture::new(&schema);
-        fixture.create(&connection_string);
-
-        let outcome = analyze_sqlserver(
-            &connection_string,
-            "sqlserver-2022-rich",
-            vec!["master".to_owned()],
-            vec![schema.clone()],
-            60_000,
-        );
-        let failure = outcome.failure().cloned();
-        let certified = outcome.certified_snapshot().cloned();
-        fixture.drop(&connection_string);
-
-        assert_eq!(outcome.status(), AnalysisStatus::Complete, "{failure:?}");
-        let snapshot = &certified.unwrap().snapshot;
-        assert_eq!(
-            snapshot
-                .schema
-                .schemas
-                .iter()
-                .map(|item| item.name.as_str())
-                .collect::<Vec<_>>(),
-            vec![schema.as_str()]
-        );
-        for table in [
-            "users",
-            "secured_accounts",
-            "orders",
-            "audit_log",
-            "partitioned_events",
-            "temporal_records",
-            "temporal_records_history",
-        ] {
-            assert!(snapshot
-                .schema
-                .tables
-                .iter()
-                .any(|item| { item.key.schema == schema && item.name == table }));
         }
-        for kind in [
-            ConstraintKind::PrimaryKey,
-            ConstraintKind::ForeignKey,
-            ConstraintKind::Unique,
-            ConstraintKind::Check,
-        ] {
-            assert!(
+        for (strategy, connection_string) in configured {
+            let schema = format!("dm_{}", unique_suffix());
+            let fixture = SqlServerFixture::new(&schema);
+            fixture.create(&connection_string);
+
+            let outcome = analyze_sqlserver(
+                &connection_string,
+                &format!("{strategy}-rich"),
+                vec!["master".to_owned()],
+                vec![schema.clone()],
+                60_000,
+            );
+            let failure = outcome.failure().cloned();
+            let certified = outcome.certified_snapshot().cloned();
+            fixture.drop(&connection_string);
+
+            assert_eq!(outcome.status(), AnalysisStatus::Complete, "{failure:?}");
+            let certified = certified.unwrap();
+            assert!(certified
+                .completeness
+                .capability_checks
+                .iter()
+                .any(|check| {
+                    check.name == "catalog_version_strategy" && check.evidence == strategy
+                }));
+            let snapshot = &certified.snapshot;
+            assert_eq!(
                 snapshot
                     .schema
-                    .constraints
+                    .schemas
                     .iter()
-                    .any(|constraint| constraint.kind == kind),
-                "missing {kind:?}"
+                    .map(|item| item.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec![schema.as_str()]
             );
-        }
-        assert!(snapshot.schema.columns.iter().any(|column| {
-            column.table_key.schema == schema && column.name == "email_key" && column.is_generated
-        }));
-        assert!(snapshot
-            .schema
-            .indexes
-            .iter()
-            .any(|index| index.name == "ix_orders_open"));
-        assert!(snapshot
-            .schema
-            .views
-            .iter()
-            .any(|view| view.name == "order_summary" && view.depends_on.len() >= 2));
-        assert!(snapshot
-            .schema
-            .routines
-            .iter()
-            .any(|routine| routine.name == "active_users" && !routine.depends_on.is_empty()));
-        assert!(snapshot
-            .schema
-            .triggers
-            .iter()
-            .any(|trigger| trigger.name == "tr_orders_audit"));
-        for (kind, name) in [
-            (ObjectKind::UserDefinedType, "account_code"),
-            (ObjectKind::Sequence, "order_numbers"),
-            (ObjectKind::Synonym, "users_alias"),
-        ] {
+            for table in [
+                "users",
+                "secured_accounts",
+                "orders",
+                "audit_log",
+                "partitioned_events",
+                "temporal_records",
+                "temporal_records_history",
+            ] {
+                assert!(snapshot
+                    .schema
+                    .tables
+                    .iter()
+                    .any(|item| { item.key.schema == schema && item.name == table }));
+            }
+            for kind in [
+                ConstraintKind::PrimaryKey,
+                ConstraintKind::ForeignKey,
+                ConstraintKind::Unique,
+                ConstraintKind::Check,
+            ] {
+                assert!(
+                    snapshot
+                        .schema
+                        .constraints
+                        .iter()
+                        .any(|constraint| constraint.kind == kind),
+                    "missing {kind:?}"
+                );
+            }
+            assert!(snapshot.schema.columns.iter().any(|column| {
+                column.table_key.schema == schema
+                    && column.name == "email_key"
+                    && column.is_generated
+            }));
+            assert!(snapshot
+                .schema
+                .indexes
+                .iter()
+                .any(|index| index.name == "ix_orders_open"));
+            assert!(snapshot
+                .schema
+                .views
+                .iter()
+                .any(|view| view.name == "order_summary" && view.depends_on.len() >= 2));
+            assert!(snapshot
+                .schema
+                .routines
+                .iter()
+                .any(|routine| routine.name == "active_users" && !routine.depends_on.is_empty()));
+            assert!(snapshot
+                .schema
+                .triggers
+                .iter()
+                .any(|trigger| trigger.name == "tr_orders_audit"));
+            for (kind, name) in [
+                (ObjectKind::UserDefinedType, "account_code"),
+                (ObjectKind::Sequence, "order_numbers"),
+                (ObjectKind::Synonym, "users_alias"),
+            ] {
+                assert!(snapshot
+                    .metadata
+                    .objects
+                    .iter()
+                    .any(|object| object.key.object_kind == kind && object.name == name));
+            }
+            assert!(snapshot.metadata.relationships.iter().any(|relationship| {
+                relationship.kind == MetadataRelationshipKind::IncludesColumn
+            }));
             assert!(snapshot
                 .metadata
-                .objects
+                .relationships
                 .iter()
-                .any(|object| object.key.object_kind == kind && object.name == name));
-        }
-        assert!(snapshot
-            .metadata
-            .relationships
-            .iter()
-            .any(|relationship| { relationship.kind == MetadataRelationshipKind::IncludesColumn }));
-        assert!(snapshot
-            .metadata
-            .relationships
-            .iter()
-            .any(|relationship| { relationship.kind == MetadataRelationshipKind::SynonymFor }));
-        assert!(snapshot
-            .metadata
-            .relationships
-            .iter()
-            .any(|relationship| { relationship.kind == MetadataRelationshipKind::UsesSequence }));
-        assert!(snapshot.metadata.objects.iter().any(|object| {
-            object.key.object_kind == ObjectKind::MaterializedView
-                && object.name == "user_tenant_counts"
-        }));
-        assert!(snapshot.metadata.objects.iter().any(|object| {
-            object.key.object_kind == ObjectKind::Policy && object.name == "tenant_policy"
-        }));
-        assert!(snapshot.metadata.objects.iter().any(|object| {
-            object.key.object_kind == ObjectKind::Trigger
-                && object.name == fixture.database_trigger()
-        }));
-        assert!(snapshot.metadata.objects.iter().any(|object| {
-            object.extension_kind.as_deref() == Some("sqlserver_partition_function")
-                && object.name == fixture.partition_function()
-        }));
-        for relationship in [
-            MetadataRelationshipKind::Materializes,
-            MetadataRelationshipKind::Extension("temporal_history_table".to_owned()),
-            MetadataRelationshipKind::Extension("security_predicate_applies_to".to_owned()),
-        ] {
-            assert!(
-                snapshot
-                    .metadata
-                    .relationships
-                    .iter()
-                    .any(|item| item.kind == relationship),
-                "missing relationship {relationship:?}"
-            );
+                .any(|relationship| { relationship.kind == MetadataRelationshipKind::SynonymFor }));
+            assert!(snapshot.metadata.relationships.iter().any(|relationship| {
+                relationship.kind == MetadataRelationshipKind::UsesSequence
+            }));
+            assert!(snapshot.metadata.objects.iter().any(|object| {
+                object.key.object_kind == ObjectKind::MaterializedView
+                    && object.name == "user_tenant_counts"
+            }));
+            assert!(snapshot.metadata.objects.iter().any(|object| {
+                object.key.object_kind == ObjectKind::Policy && object.name == "tenant_policy"
+            }));
+            assert!(snapshot.metadata.objects.iter().any(|object| {
+                object.key.object_kind == ObjectKind::Trigger
+                    && object.name == fixture.database_trigger()
+            }));
+            assert!(snapshot.metadata.objects.iter().any(|object| {
+                object.extension_kind.as_deref() == Some("sqlserver_partition_function")
+                    && object.name == fixture.partition_function()
+            }));
+            for relationship in [
+                MetadataRelationshipKind::Materializes,
+                MetadataRelationshipKind::Extension("temporal_history_table".to_owned()),
+                MetadataRelationshipKind::Extension("security_predicate_applies_to".to_owned()),
+            ] {
+                assert!(
+                    snapshot
+                        .metadata
+                        .relationships
+                        .iter()
+                        .any(|item| item.kind == relationship),
+                    "missing relationship {relationship:?}"
+                );
+            }
         }
     }
 
@@ -5700,40 +6273,14 @@ mod tests {
         );
         execute_admin_batches(
             &connection_string,
-            &[format!(
-                "DROP PROCEDURE IF EXISTS [{schema}].[encrypted_reader]"
-            )],
-        )
-        .unwrap();
-
-        execute_admin_batches(
-            &connection_string,
-            &[format!(
-                "CREATE TYPE [{schema}].[payload_table] AS TABLE ([id] int NOT NULL PRIMARY KEY, [value] nvarchar(100) NULL)"
-            )],
-        )
-        .unwrap();
-        let table_type = analyze_sqlserver(
-            &connection_string,
-            "sqlserver-table-type",
-            Vec::new(),
-            vec![schema.clone()],
-            30_000,
-        );
-        execute_admin_batches(
-            &connection_string,
             &[
-                format!("DROP TYPE IF EXISTS [{schema}].[payload_table]"),
+                format!("DROP PROCEDURE IF EXISTS [{schema}].[encrypted_reader]"),
                 format!("DROP SCHEMA IF EXISTS [{schema}]"),
             ],
         )
         .unwrap();
 
-        for (label, outcome) in [
-            ("dynamic", dynamic),
-            ("encrypted", encrypted),
-            ("table_type", table_type),
-        ] {
+        for (label, outcome) in [("dynamic", dynamic), ("encrypted", encrypted)] {
             assert_eq!(
                 outcome.status(),
                 AnalysisStatus::Failed,
@@ -5747,6 +6294,128 @@ mod tests {
             );
             assert!(outcome.certified_snapshot().is_none(), "{label}");
         }
+    }
+
+    #[test]
+    fn table_types_are_fully_mapped_across_the_live_matrix() {
+        let _guard = live_test_guard();
+        let configured = configured_sqlserver_matrix();
+        if configured.is_empty() {
+            eprintln!("skipping SQL Server table-type matrix; configure SQL Server matrix URLs");
+            return;
+        }
+        for (strategy, connection_string) in configured {
+            assert_table_type_catalog(strategy, &connection_string);
+        }
+    }
+
+    fn assert_table_type_catalog(strategy: &str, connection_string: &str) {
+        let schema = format!("dm_{}", unique_suffix());
+        let creation = execute_admin_batches(
+            connection_string,
+            &[
+                format!("CREATE SCHEMA [{schema}] AUTHORIZATION [dbo]"),
+                format!("CREATE TYPE [{schema}].[code] FROM nvarchar(20) NOT NULL"),
+                format!(
+                    "CREATE TYPE [{schema}].[payload] AS TABLE (\
+                     [id] int IDENTITY(1,1) NOT NULL PRIMARY KEY, \
+                     [code] [{schema}].[code] NOT NULL UNIQUE, \
+                     [amount] decimal(10,2) NULL CHECK ([amount] >= 0), \
+                     [doubled] AS ([amount] * 2), \
+                     [created_at] datetime2 NOT NULL DEFAULT SYSUTCDATETIME(), \
+                     INDEX [ix_payload_amount] NONCLUSTERED ([amount] DESC))"
+                ),
+                format!(
+                    "CREATE PROCEDURE [{schema}].[consume_payload] \
+                     @items [{schema}].[payload] READONLY AS \
+                     SELECT [id] FROM @items"
+                ),
+            ],
+        );
+        if let Err(error) = creation {
+            let cleanup = drop_table_type_fixture(connection_string, &schema);
+            panic!("{strategy}: failed to create table-type fixture: {error}; cleanup={cleanup:?}");
+        }
+
+        let outcome = analyze_sqlserver(
+            connection_string,
+            &format!("{strategy}-table-type"),
+            Vec::new(),
+            vec![schema.clone()],
+            30_000,
+        );
+        let failure = outcome.failure().cloned();
+        let certified = outcome.certified_snapshot().cloned();
+        drop_table_type_fixture(connection_string, &schema).unwrap();
+
+        assert_eq!(
+            outcome.status(),
+            AnalysisStatus::Complete,
+            "{strategy}: {failure:?}"
+        );
+        let certified = certified.unwrap();
+        let extension_reconciliation = certified
+            .completeness
+            .object_counts
+            .iter()
+            .find(|count| count.category == ObjectCategory::Extension)
+            .unwrap();
+        assert_eq!(extension_reconciliation.discovered, 11, "{strategy}");
+        assert_eq!(
+            extension_reconciliation.discovered, extension_reconciliation.emitted,
+            "{strategy}"
+        );
+        let snapshot = &certified.snapshot;
+        let payload = snapshot
+            .metadata
+            .objects
+            .iter()
+            .find(|object| {
+                object.key.object_kind == ObjectKind::UserDefinedType
+                    && object.key.schema == schema
+                    && object.name == "payload"
+            })
+            .unwrap();
+        assert_eq!(
+            payload.properties.get("table_type"),
+            Some(&MetadataValue::Boolean(true))
+        );
+        assert!(!snapshot
+            .schema
+            .tables
+            .iter()
+            .any(|table| table.key.schema == schema));
+
+        let extension_count = |kind: &str| {
+            snapshot
+                .metadata
+                .objects
+                .iter()
+                .filter(|object| object.extension_kind.as_deref() == Some(kind))
+                .count()
+        };
+        assert_eq!(extension_count("sqlserver_table_type_column"), 5);
+        assert_eq!(extension_count("sqlserver_table_type_constraint"), 3);
+        assert_eq!(extension_count("sqlserver_table_type_index"), 3);
+        for relationship_kind in ["table_type_constraint_column", "table_type_index_column"] {
+            assert!(snapshot.metadata.relationships.iter().any(|relationship| {
+                relationship.kind
+                    == MetadataRelationshipKind::Extension(relationship_kind.to_owned())
+            }));
+        }
+        let parameter = snapshot
+            .metadata
+            .objects
+            .iter()
+            .find(|object| {
+                object.key.object_kind == ObjectKind::RoutineParameter && object.name == "@items"
+            })
+            .unwrap();
+        assert!(snapshot.metadata.relationships.iter().any(|relationship| {
+            relationship.kind == MetadataRelationshipKind::UsesType
+                && relationship.from_key == parameter.key
+                && relationship.to_key == payload.key
+        }));
     }
 
     #[test]
@@ -5877,6 +6546,22 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn configured_sqlserver_matrix() -> Vec<(&'static str, String)> {
+        [
+            ("DATABASE_MEMORY_TEST_SQLSERVER2017_URL", "sqlserver-2017"),
+            ("DATABASE_MEMORY_TEST_SQLSERVER2019_URL", "sqlserver-2019"),
+            ("DATABASE_MEMORY_TEST_SQLSERVER2022_URL", "sqlserver-2022"),
+            ("DATABASE_MEMORY_TEST_SQLSERVER2025_URL", "sqlserver-2025"),
+        ]
+        .into_iter()
+        .filter_map(|(environment, strategy)| {
+            std::env::var(environment)
+                .ok()
+                .map(|connection_string| (strategy, connection_string))
+        })
+        .collect()
     }
 
     fn unique_suffix() -> String {
@@ -6080,6 +6765,18 @@ mod tests {
         fn database_trigger(&self) -> String {
             format!("tr_database_{}", self.schema)
         }
+    }
+
+    fn drop_table_type_fixture(connection_string: &str, schema: &str) -> Result<(), String> {
+        execute_admin_batches(
+            connection_string,
+            &[
+                format!("DROP PROCEDURE IF EXISTS [{schema}].[consume_payload]"),
+                format!("DROP TYPE IF EXISTS [{schema}].[payload]"),
+                format!("DROP TYPE IF EXISTS [{schema}].[code]"),
+                format!("DROP SCHEMA IF EXISTS [{schema}]"),
+            ],
+        )
     }
 
     fn execute_admin_batches(connection_string: &str, batches: &[String]) -> Result<(), String> {

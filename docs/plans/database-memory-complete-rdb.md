@@ -297,11 +297,29 @@ Deliverables:
   and `sys.sql_expression_dependencies` edges.
 - `VIEW DEFINITION` and scope proof.
 
+Completed:
+
+- Native version strategies and live certification for SQL Server 2017, 2019,
+  2022, and 2025.
+- Fail-closed metadata visibility, transport, dynamic SQL, encrypted module,
+  catalog stability, and selected-schema scope gates.
+- Table types as canonical user-defined types, including their columns,
+  constraints, indexes, and table-valued routine parameter relationships.
+- Independent raw-catalog reconciliation for emitted objects and
+  relationships, including extension objects and external references.
+
+Remaining before Phase 6 completion:
+
+- Extended properties/comments and XML schema collection relationships.
+- Live certification for selected Azure SQL Database and Azure SQL Managed
+  Instance variants; unsupported engine editions continue to fail closed.
+- Live timeout/cancellation and cross-schema boundary verification.
+
 Verification:
 
 ```powershell
-docker compose -f dev/docker-compose.db-test.yml up -d sqlserver
-cargo test --workspace sqlserver_adapter_live_introspection_is_env_gated -- --nocapture
+docker compose -f dev/docker-compose.db-test.yml up -d sqlserver2017 sqlserver2019 sqlserver sqlserver2025
+cargo test -p database-memory-core sqlserver --no-fail-fast -- --nocapture
 ```
 
 Rollback:
