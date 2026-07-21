@@ -578,6 +578,7 @@ mod tests {
                 include_str!("adapters/sqlserver_catalog.rs"),
             ),
             ("oracle", include_str!("adapters/oracle.rs")),
+            ("oracle-catalog", include_str!("adapters/oracle_catalog.rs")),
         ];
 
         for (name, source) in sources {
