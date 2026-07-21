@@ -86,11 +86,44 @@ views, triggers, identity columns, partitions, materialized views, types, and
 synonyms have separate dictionary views. Scope and privileges must therefore be
 part of the completeness proof.
 
+`ALL_*` is not a completeness boundary for an arbitrary schema: it contains
+only objects accessible through the current session's direct grants and enabled
+roles. The native adapter therefore uses `USER_*` for the session user's full
+owned schema and requires successful `DBA_*` catalog probes for any explicit
+multi-schema scope. A root-container `CDB_*` scan is a separate future scope;
+the initial certified contract is one connected PDB or non-CDB only.
+
+`ALL_OBJECTS`/`USER_OBJECTS` is the independent inventory ledger. Specialized
+views map the logical graph, while every in-scope inventory row must either map
+to a canonical object or to an explicit Oracle extension object. Dictionary
+objects marked as Oracle-maintained and recycle-bin artifacts are outside the
+application-schema policy; generated logical constraints and indexes remain in
+scope. Catalog reads are repeated and must be byte-for-byte stable before a
+snapshot can be certified.
+
+Oracle exposes static dependencies through `*_DEPENDENCIES`, but remote database
+links and dynamic SQL cannot be assumed to be represented there. Remote links
+fail closed. PL/SQL dependency certification requires catalog-tracked static
+dependencies plus a proof that no untracked dynamic statement exists; objects
+without that proof are not downgraded to partial success.
+
 Sources:
 
-- https://docs.oracle.com/en/database/oracle/oracle-database/26/refrn/toc.htm
+- https://docs.oracle.com/en/database/oracle/oracle-database/26/refrn/about-static-data-dictionary-views.html
 - https://docs.oracle.com/en/database/oracle/oracle-database/26/refrn/ALL_OBJECTS.html
+- https://docs.oracle.com/en/database/oracle/oracle-database/26/refrn/ALL_TAB_COLS.html
+- https://docs.oracle.com/en/database/oracle/oracle-database/26/refrn/ALL_CONSTRAINTS.html
+- https://docs.oracle.com/en/database/oracle/oracle-database/26/refrn/ALL_DEPENDENCIES.html
+- https://docs.oracle.com/en/database/oracle/oracle-database/26/refrn/ALL_VIEWS.html
+- https://docs.oracle.com/en/database/oracle/oracle-database/26/refrn/ALL_MVIEWS.html
+- https://docs.oracle.com/en/database/oracle/oracle-database/26/refrn/ALL_TRIGGERS.html
 - https://docs.oracle.com/en/database/oracle/oracle-database/26/refrn/ALL_PROCEDURES.html
+- https://docs.oracle.com/en/database/oracle/oracle-database/26/refrn/ALL_ARGUMENTS.html
+- https://docs.oracle.com/en/database/oracle/oracle-database/26/refrn/ALL_SEQUENCES.html
+- https://docs.oracle.com/en/database/oracle/oracle-database/26/refrn/ALL_SYNONYMS.html
+- https://docs.oracle.com/en/database/oracle/oracle-database/26/refrn/ALL_TYPES.html
+- https://docs.oracle.com/en/database/oracle/oracle-database/26/refrn/ALL_TAB_PARTITIONS.html
+- https://docs.oracle.com/en/database/oracle/oracle-database/26/refrn/cdb_-views.html
 
 ### Generic RDB Coverage
 

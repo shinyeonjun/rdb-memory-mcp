@@ -338,18 +338,73 @@ Goal:
 
 - Certify supported Oracle major versions and selected schema scopes.
 
+Certification boundary:
+
+- Accept only server versions represented by a live-tested catalog strategy;
+  unsupported versions fail before any snapshot is emitted.
+- Treat one connected PDB or non-CDB as the catalog boundary. Root-container
+  `CDB_*` discovery is not silently folded into this phase.
+- With no schema selection, certify the session user's complete owned schema
+  from `USER_*` views. Explicit selected-schema scopes require complete `DBA_*`
+  visibility and reject a missing, Oracle-maintained, or partially visible
+  owner.
+- Use `*_OBJECTS` as the independent inventory ledger. Every selected logical
+  object must map to the canonical graph or an explicit Oracle extension; no
+  iterator filtering may silently discard an unresolved parent or reference.
+- Exclude only documented implementation artifacts such as Oracle-maintained
+  objects and recycle-bin entries. System-generated names for real constraints,
+  indexes, identity sequences, and other logical objects remain represented.
+- Reject remote database-link targets, unresolved cross-scope references,
+  invalid catalog objects, truncated definitions, and dependencies that cannot
+  be proven complete.
+
 Deliverables:
 
 - Views/materialized views, virtual/identity columns, checks, sequences,
   synonyms, packages/routines/parameters/overloads, triggers, types, partitions,
   function indexes, and dependency edges.
 - Explicit USER/ALL/DBA scope and privilege proof.
+- Bounded Oracle call timeout, metadata-only connection policy, redacted
+  failures, stable double-read, and exact raw-catalog count reconciliation.
+- Compatibility facade that returns a legacy `SchemaSnapshot` only after the v2
+  complete contract is certified.
+
+Implementation increments:
+
+1. Replace the Level 1 facade with a closed `AnalysisOutcome` adapter, version
+   strategy, bounded call timeout, USER/DBA scope policy, raw inventory ledger,
+   stable read, and independent counts.
+2. Map tables, columns (including hidden/virtual/identity semantics), every
+   constraint state, indexes and function expressions, views/view columns, and
+   materialized views.
+3. Map sequences, synonyms, object/collection types and attributes, table
+   partitions/subpartitions, packages, overloaded routines and parameters, and
+   all trigger target kinds.
+4. Reconcile `*_DEPENDENCIES`, synonym/type/sequence/materialization/partition
+   relationships, remote references, invalid objects, and dynamic PL/SQL proof.
+5. Live-certify each accepted Oracle strategy with owner-only, privileged
+   multi-schema, denied-visibility, cross-schema, timeout, mutation, and residue
+   tests. Add a strategy only when its live matrix passes.
+
+Success criteria:
+
+- A rich Oracle fixture emits every independently inventoried object and every
+  supported relationship with matching discovered/emitted counts.
+- Any unsupported version, insufficient privilege, catalog mutation, timeout,
+  remote link, unresolved reference, invalid object, or opaque dependency path
+  returns one redacted `failed` outcome and no snapshot.
+- The adapter never queries application table rows and leaves no test users,
+  schema objects, jobs, links, or other residue after live tests.
 
 Verification:
 
 ```powershell
 docker compose -f dev/docker-compose.db-test.yml up -d oracle
-cargo test --workspace oracle_adapter_live_introspection_is_env_gated -- --nocapture
+$env:DATABASE_MEMORY_TEST_ORACLE_URL='system/oracle@127.0.0.1:11521/FREEPDB1'
+cargo test -p database-memory-core oracle --no-fail-fast -- --nocapture
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
 Rollback:
