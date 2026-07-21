@@ -307,13 +307,19 @@ Completed:
   constraints, indexes, and table-valued routine parameter relationships.
 - Independent raw-catalog reconciliation for emitted objects and
   relationships, including extension objects and external references.
+- XML schema collections/namespaces, typed XML column and routine parameter
+  relationships, and schema-scoped extended properties with `sql_variant`
+  type, display value, and raw value preservation.
+- Cross-schema foreign-key scope rejection/acceptance and live bounded-timeout
+  proof across the four-version matrix.
 
 Remaining before Phase 6 completion:
 
-- Extended properties/comments and XML schema collection relationships.
 - Live certification for selected Azure SQL Database and Azure SQL Managed
   Instance variants; unsupported engine editions continue to fail closed.
-- Live timeout/cancellation and cross-schema boundary verification.
+- A shared cancellation signal in the cross-product introspection port; the
+  SQL Server timeout path is already live-certified and never emits partial
+  snapshots.
 
 Verification:
 

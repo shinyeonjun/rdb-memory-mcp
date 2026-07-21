@@ -162,19 +162,21 @@ async fn discover_catalog_async(
     let second = RawSqlServerCatalog::read(&mut client, strategy, &selected_schemas)
         .await
         .map_err(|error| catalog_failure(request, connection_string, error))?;
-    if first != second {
-        return Err(catalog_failure(
-            request,
-            connection_string,
-            CatalogError::CatalogChanged(
-                "SQL Server catalog changed while metadata was being collected".to_owned(),
-            ),
-        ));
-    }
+    let stable = require_stable_catalog(first, &second)
+        .map_err(|error| catalog_failure(request, connection_string, error))?;
 
     SqlServerSnapshotMapper::new(&request.connection_alias, facts, strategy)
-        .map(first)
+        .map(stable)
         .map_err(|error| catalog_failure(request, connection_string, error))
+}
+
+fn require_stable_catalog<T: PartialEq>(first: T, second: &T) -> Result<T, CatalogError> {
+    if &first != second {
+        return Err(CatalogError::CatalogChanged(
+            "SQL Server catalog changed while metadata was being collected".to_owned(),
+        ));
+    }
+    Ok(first)
 }
 
 async fn connect_sqlserver(
@@ -1079,6 +1081,39 @@ struct RawSecurityPredicate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct RawXmlSchemaCollection {
+    id: i32,
+    schema: String,
+    name: String,
+    principal_id: Option<i32>,
+    created_at: String,
+    modified_at: String,
+    namespaces: Vec<RawXmlSchemaNamespace>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawXmlSchemaNamespace {
+    id: i32,
+    name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawExtendedProperty {
+    class: u8,
+    class_description: String,
+    major_id: i32,
+    minor_id: i32,
+    name: String,
+    value_type: Option<String>,
+    value_precision: Option<i32>,
+    value_scale: Option<i32>,
+    value_max_length: Option<i32>,
+    value_collation: Option<String>,
+    display_value: Option<String>,
+    value_hex: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RawUnsupportedObject {
     schema: Option<String>,
     name: String,
@@ -1106,6 +1141,8 @@ struct RawSqlServerCatalog {
     partition_schemes: Vec<RawPartitionScheme>,
     partitions: Vec<RawPartition>,
     security_policies: Vec<RawSecurityPolicy>,
+    xml_schema_collections: Vec<RawXmlSchemaCollection>,
+    extended_properties: Vec<RawExtendedProperty>,
 }
 
 impl RawSqlServerCatalog {
@@ -1136,6 +1173,27 @@ impl RawSqlServerCatalog {
         let partition_schemes = read_partition_schemes(client).await?;
         let partitions = read_partitions(client, strategy, &tables, &views).await?;
         let security_policies = read_security_policies(client, selected_schemas).await?;
+        let xml_schema_collections = read_xml_schema_collections(client, selected_schemas).await?;
+        let extended_properties = select_extended_properties(
+            read_extended_properties(client).await?,
+            &schemas,
+            &principals,
+            &tables,
+            &columns,
+            &constraints,
+            &indexes,
+            &views,
+            &routines,
+            &parameters,
+            &triggers,
+            &user_types,
+            &sequences,
+            &synonyms,
+            &partition_functions,
+            &partition_schemes,
+            &security_policies,
+            &xml_schema_collections,
+        );
         let unsupported = read_unsupported_objects(client, strategy, selected_schemas).await?;
         validate_supported_metadata(
             &unsupported,
@@ -1164,6 +1222,8 @@ impl RawSqlServerCatalog {
             partition_schemes,
             partitions,
             security_policies,
+            xml_schema_collections,
+            extended_properties,
         })
     }
 }
@@ -2563,6 +2623,236 @@ async fn read_security_policies(
     Ok(policies.into_values().collect())
 }
 
+async fn read_xml_schema_collections(
+    client: &mut TdsClient,
+    selected_schemas: &BTreeSet<String>,
+) -> Result<Vec<RawXmlSchemaCollection>, CatalogError> {
+    let mut collections = BTreeMap::<i32, RawXmlSchemaCollection>::new();
+    for row in rows(
+        client,
+        "
+        SELECT xsc.xml_collection_id,
+               s.name,
+               xsc.name,
+               xsc.principal_id,
+               CONVERT(nvarchar(33), xsc.create_date, 126),
+               CONVERT(nvarchar(33), xsc.modify_date, 126),
+               xsn.xml_namespace_id,
+               xsn.name
+        FROM sys.xml_schema_collections xsc
+        JOIN sys.schemas s ON s.schema_id = xsc.schema_id
+        LEFT JOIN sys.xml_schema_namespaces xsn
+          ON xsn.xml_collection_id = xsc.xml_collection_id
+        ORDER BY xsc.xml_collection_id, xsn.xml_namespace_id
+        ",
+    )
+    .await?
+    {
+        let schema = required_string(&row, 1, "XML schema collection schema")?;
+        if !selected_schemas.contains(&schema) {
+            continue;
+        }
+        let id = required_value(&row, 0, "XML schema collection id")?;
+        let name = required_string(&row, 2, "XML schema collection name")?;
+        let principal_id = optional_value(&row, 3)?;
+        let created_at = required_string(&row, 4, "XML schema collection creation time")?;
+        let modified_at = required_string(&row, 5, "XML schema collection modification time")?;
+        let entry = collections
+            .entry(id)
+            .or_insert_with(|| RawXmlSchemaCollection {
+                id,
+                schema: schema.clone(),
+                name: name.clone(),
+                principal_id,
+                created_at: created_at.clone(),
+                modified_at: modified_at.clone(),
+                namespaces: Vec::new(),
+            });
+        if entry.schema != schema
+            || entry.name != name
+            || entry.principal_id != principal_id
+            || entry.created_at != created_at
+            || entry.modified_at != modified_at
+        {
+            return Err(CatalogError::Mapping(format!(
+                "XML schema collection {id} has inconsistent catalog rows"
+            )));
+        }
+        if let Some(namespace_id) = optional_value(&row, 6)? {
+            let namespace_name = optional_value::<&str>(&row, 7)?
+                .ok_or_else(|| {
+                    CatalogError::Mapping(format!(
+                        "XML schema collection {id} namespace {namespace_id} has no name"
+                    ))
+                })?
+                .to_owned();
+            if namespace_name.len() > MAX_PROPERTY_STRING_BYTES {
+                return Err(CatalogError::UnsupportedMetadata(format!(
+                    "XML namespace exceeds the {MAX_PROPERTY_STRING_BYTES}-byte property limit"
+                )));
+            }
+            entry.namespaces.push(RawXmlSchemaNamespace {
+                id: namespace_id,
+                name: namespace_name,
+            });
+        }
+    }
+    Ok(collections.into_values().collect())
+}
+
+async fn read_extended_properties(
+    client: &mut TdsClient,
+) -> Result<Vec<RawExtendedProperty>, CatalogError> {
+    rows(
+        client,
+        "
+        SELECT ep.class,
+               ep.class_desc,
+               ep.major_id,
+               ep.minor_id,
+               ep.name,
+               CONVERT(nvarchar(128), SQL_VARIANT_PROPERTY(ep.value, 'BaseType')),
+               TRY_CONVERT(int, SQL_VARIANT_PROPERTY(ep.value, 'Precision')),
+               TRY_CONVERT(int, SQL_VARIANT_PROPERTY(ep.value, 'Scale')),
+               TRY_CONVERT(int, SQL_VARIANT_PROPERTY(ep.value, 'MaxLength')),
+               CONVERT(nvarchar(128), SQL_VARIANT_PROPERTY(ep.value, 'Collation')),
+               CASE
+                 WHEN ep.value IS NULL THEN NULL
+                 WHEN CONVERT(nvarchar(128), SQL_VARIANT_PROPERTY(ep.value, 'BaseType'))
+                      IN (N'binary', N'varbinary')
+                   THEN CONVERT(nvarchar(max), CONVERT(varchar(max), CONVERT(varbinary(8000), ep.value), 2))
+                 ELSE CONVERT(nvarchar(max), ep.value, 126)
+               END,
+               CASE WHEN ep.value IS NULL THEN NULL
+                    ELSE CONVERT(nvarchar(max), CONVERT(varchar(max), CONVERT(varbinary(8000), ep.value), 2))
+               END
+        FROM sys.extended_properties ep
+        ORDER BY ep.class, ep.major_id, ep.minor_id, ep.name
+        ",
+    )
+    .await?
+    .into_iter()
+    .map(|row| {
+        Ok(RawExtendedProperty {
+            class: required_value(&row, 0, "extended property class")?,
+            class_description: required_string(&row, 1, "extended property class description")?,
+            major_id: required_value(&row, 2, "extended property major id")?,
+            minor_id: required_value(&row, 3, "extended property minor id")?,
+            name: required_string(&row, 4, "extended property name")?,
+            value_type: optional_string(&row, 5)?,
+            value_precision: optional_value(&row, 6)?,
+            value_scale: optional_value(&row, 7)?,
+            value_max_length: optional_value(&row, 8)?,
+            value_collation: optional_string(&row, 9)?,
+            display_value: optional_string(&row, 10)?,
+            value_hex: optional_string(&row, 11)?,
+        })
+    })
+    .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_extended_properties(
+    properties: Vec<RawExtendedProperty>,
+    schemas: &[RawSchema],
+    principals: &[RawPrincipal],
+    tables: &[RawTable],
+    columns: &[RawColumn],
+    constraints: &[RawConstraint],
+    indexes: &[RawIndex],
+    views: &[RawView],
+    routines: &[RawRoutine],
+    parameters: &[RawParameter],
+    triggers: &[RawTrigger],
+    user_types: &[RawUserType],
+    sequences: &[RawSequence],
+    synonyms: &[RawSynonym],
+    partition_functions: &[RawPartitionFunction],
+    partition_schemes: &[RawPartitionScheme],
+    security_policies: &[RawSecurityPolicy],
+    xml_schema_collections: &[RawXmlSchemaCollection],
+) -> Vec<RawExtendedProperty> {
+    let mut object_ids = tables
+        .iter()
+        .map(|object| object.id)
+        .collect::<BTreeSet<_>>();
+    object_ids.extend(views.iter().map(|object| object.id));
+    object_ids.extend(routines.iter().map(|object| object.id));
+    object_ids.extend(triggers.iter().map(|object| object.id));
+    object_ids.extend(sequences.iter().map(|object| object.id));
+    object_ids.extend(synonyms.iter().map(|object| object.id));
+    object_ids.extend(security_policies.iter().map(|object| object.id));
+    object_ids.extend(constraints.iter().map(|object| object.id));
+    let column_ids = columns
+        .iter()
+        .map(|column| (column.object_id, column.id))
+        .collect::<BTreeSet<_>>();
+    let parameter_ids = parameters
+        .iter()
+        .map(|parameter| (parameter.object_id, parameter.id))
+        .collect::<BTreeSet<_>>();
+    let schema_ids = schemas
+        .iter()
+        .map(|schema| schema.id)
+        .collect::<BTreeSet<_>>();
+    let principal_ids = principals
+        .iter()
+        .map(|principal| principal.id)
+        .collect::<BTreeSet<_>>();
+    let type_ids = user_types
+        .iter()
+        .map(|data_type| data_type.id)
+        .collect::<BTreeSet<_>>();
+    let index_ids = indexes
+        .iter()
+        .map(|index| (index.object_id, index.id))
+        .collect::<BTreeSet<_>>();
+    let table_type_column_ids = user_types
+        .iter()
+        .filter_map(|data_type| {
+            data_type
+                .table_object_id
+                .map(|object_id| (data_type.id, object_id))
+        })
+        .flat_map(|(user_type_id, object_id)| {
+            columns.iter().filter_map(move |column| {
+                (column.object_id == object_id).then_some((user_type_id, column.id))
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    let xml_collection_ids = xml_schema_collections
+        .iter()
+        .map(|collection| collection.id)
+        .collect::<BTreeSet<_>>();
+    let partition_function_ids = partition_functions
+        .iter()
+        .map(|function| function.id)
+        .collect::<BTreeSet<_>>();
+    let partition_scheme_ids = partition_schemes
+        .iter()
+        .map(|scheme| scheme.id)
+        .collect::<BTreeSet<_>>();
+
+    properties
+        .into_iter()
+        .filter(|property| match property.class {
+            0 => property.major_id == 0 && property.minor_id == 0,
+            1 if property.minor_id == 0 => object_ids.contains(&property.major_id),
+            1 => column_ids.contains(&(property.major_id, property.minor_id)),
+            2 => parameter_ids.contains(&(property.major_id, property.minor_id)),
+            3 => schema_ids.contains(&property.major_id),
+            4 => principal_ids.contains(&property.major_id),
+            6 => type_ids.contains(&property.major_id),
+            7 => index_ids.contains(&(property.major_id, property.minor_id)),
+            8 => table_type_column_ids.contains(&(property.major_id, property.minor_id)),
+            10 => xml_collection_ids.contains(&property.major_id),
+            20 => partition_scheme_ids.contains(&property.major_id),
+            21 => partition_function_ids.contains(&property.major_id),
+            _ => false,
+        })
+        .collect()
+}
+
 async fn read_unsupported_objects(
     client: &mut TdsClient,
     strategy: SqlServerCatalogVersion,
@@ -2941,6 +3231,7 @@ impl SqlServerSnapshotMapper {
 
         let mut schemas = Vec::new();
         let mut schema_keys = BTreeMap::<String, ObjectKey>::new();
+        let mut schema_id_keys = BTreeMap::<i32, ObjectKey>::new();
         let mut schema_owner_ids = BTreeMap::<String, i32>::new();
         for schema in &raw.schemas {
             let key = sqlserver_key(
@@ -2960,6 +3251,7 @@ impl SqlServerSnapshotMapper {
                     schema.name
                 )));
             }
+            insert_unique_id(&mut schema_id_keys, schema.id, &key, "schema")?;
             schema_owner_ids.insert(schema.name.clone(), schema.principal_id);
             schemas.push(SchemaObject {
                 key: key.clone(),
@@ -2973,6 +3265,7 @@ impl SqlServerSnapshotMapper {
         let mut name_keys = BTreeMap::<(String, String), ObjectKey>::new();
         let mut type_keys = BTreeMap::<i32, ObjectKey>::new();
         let mut table_type_keys = BTreeMap::<i32, ObjectKey>::new();
+        let mut table_type_user_ids = BTreeMap::<i32, i32>::new();
         for data_type in &raw.user_types {
             let schema_key =
                 required_key(&schema_keys, &data_type.schema, "user-defined type schema")?;
@@ -3001,6 +3294,14 @@ impl SqlServerSnapshotMapper {
                     return Err(CatalogError::Mapping(format!(
                         "duplicate SQL Server object id {table_object_id} for table type '{}.{}'",
                         data_type.schema, data_type.name
+                    )));
+                }
+                if table_type_user_ids
+                    .insert(table_object_id, data_type.id)
+                    .is_some()
+                {
+                    return Err(CatalogError::Mapping(format!(
+                        "duplicate SQL Server table type object id {table_object_id}"
                     )));
                 }
             }
@@ -3041,6 +3342,16 @@ impl SqlServerSnapshotMapper {
                 properties,
             });
         }
+
+        let xml_collection_keys = map_xml_schema_collections(
+            &mut metadata,
+            &self.connection_alias,
+            &database_name,
+            &raw.xml_schema_collections,
+            &schema_keys,
+            &schema_owner_ids,
+            &principal_keys,
+        )?;
 
         let mut sequence_keys = BTreeMap::<i32, ObjectKey>::new();
         for sequence in &raw.sequences {
@@ -3327,6 +3638,7 @@ impl SqlServerSnapshotMapper {
 
         let mut columns = Vec::<ColumnObject>::new();
         let mut column_keys = BTreeMap::<(i32, i32), ObjectKey>::new();
+        let mut table_type_property_column_keys = BTreeMap::<(i32, i32), ObjectKey>::new();
         let mut dependency_source_keys = BTreeMap::<i32, ObjectKey>::new();
         for column in &raw.columns {
             let parent_key = object_keys.get(&column.object_id).cloned().ok_or_else(|| {
@@ -3429,6 +3741,17 @@ impl SqlServerSnapshotMapper {
                     column.object_id, column.id
                 )));
             }
+            if let Some(user_type_id) = table_type_user_ids.get(&column.object_id) {
+                if table_type_property_column_keys
+                    .insert((*user_type_id, column.id), key.clone())
+                    .is_some()
+                {
+                    return Err(CatalogError::Mapping(format!(
+                        "duplicate table type property column identity {}:{}",
+                        user_type_id, column.id
+                    )));
+                }
+            }
             if column.default_object_id > 0
                 && dependency_source_keys
                     .insert(column.default_object_id, key.clone())
@@ -3449,6 +3772,24 @@ impl SqlServerSnapshotMapper {
                     },
                     &key,
                     type_key,
+                    None,
+                    BTreeMap::new(),
+                );
+            }
+            if column.xml_collection_id > 0 {
+                let collection_key = xml_collection_keys
+                    .get(&column.xml_collection_id)
+                    .ok_or_else(|| {
+                        CatalogError::Mapping(format!(
+                            "column '{}.{}.{}' references missing XML schema collection {}",
+                            column.schema, column.relation, column.name, column.xml_collection_id
+                        ))
+                    })?;
+                add_relationship(
+                    &mut metadata,
+                    MetadataRelationshipKind::Extension("uses_xml_schema_collection".to_owned()),
+                    &key,
+                    collection_key,
                     None,
                     BTreeMap::new(),
                 );
@@ -3789,6 +4130,7 @@ impl SqlServerSnapshotMapper {
             }
         }
 
+        let mut parameter_keys = BTreeMap::<(i32, i32), ObjectKey>::new();
         for parameter in &raw.parameters {
             let routine_key = routine_keys
                 .get(&parameter.object_id)
@@ -3807,6 +4149,15 @@ impl SqlServerSnapshotMapper {
                 &routine_key.object_name,
                 Some(format!("{}:{}", parameter.id, parameter.name)),
             );
+            if parameter_keys
+                .insert((parameter.object_id, parameter.id), key.clone())
+                .is_some()
+            {
+                return Err(CatalogError::Mapping(format!(
+                    "duplicate routine parameter identity {}:{}",
+                    parameter.object_id, parameter.id
+                )));
+            }
             metadata.objects.push(MetadataObject {
                 key: key.clone(),
                 parent_key: Some(routine_key.clone()),
@@ -3837,6 +4188,28 @@ impl SqlServerSnapshotMapper {
                         &key
                     },
                     type_key,
+                    None,
+                    BTreeMap::new(),
+                );
+            }
+            if parameter.xml_collection_id > 0 {
+                let collection_key = xml_collection_keys
+                    .get(&parameter.xml_collection_id)
+                    .ok_or_else(|| {
+                        CatalogError::Mapping(format!(
+                            "routine parameter '{}:{}' references missing XML schema collection {}",
+                            parameter.object_id, parameter.id, parameter.xml_collection_id
+                        ))
+                    })?;
+                add_relationship(
+                    &mut metadata,
+                    MetadataRelationshipKind::Extension("uses_xml_schema_collection".to_owned()),
+                    if parameter.id == 0 {
+                        &routine_key
+                    } else {
+                        &key
+                    },
+                    collection_key,
                     None,
                     BTreeMap::new(),
                 );
@@ -3963,7 +4336,7 @@ impl SqlServerSnapshotMapper {
             }
         }
 
-        let partition_keys = map_partitions(
+        let partition_mapping = map_partitions(
             &mut metadata,
             &self.connection_alias,
             &database_name,
@@ -3971,6 +4344,27 @@ impl SqlServerSnapshotMapper {
             &raw,
             &object_keys,
             &index_keys,
+        )?;
+
+        map_extended_properties(
+            &mut metadata,
+            &self.connection_alias,
+            &database_name,
+            &raw.extended_properties,
+            ExtendedPropertyTargetRegistry {
+                database: &database_key,
+                schemas: &schema_id_keys,
+                principals: &principal_keys,
+                objects: &object_keys,
+                columns: &column_keys,
+                table_type_columns: &table_type_property_column_keys,
+                parameters: &parameter_keys,
+                user_types: &type_keys,
+                indexes: &index_keys,
+                xml_collections: &xml_collection_keys,
+                partition_schemes: &partition_mapping.scheme_keys,
+                partition_functions: &partition_mapping.function_keys,
+            },
         )?;
 
         let mut external_reference_keys = BTreeMap::<String, ObjectKey>::new();
@@ -3991,8 +4385,9 @@ impl SqlServerSnapshotMapper {
             &column_keys,
             &dependency_source_keys,
             &type_keys,
+            &xml_collection_keys,
             &index_keys,
-            &partition_keys,
+            &partition_mapping.function_keys,
             &name_keys,
             &mut external_reference_keys,
             &self.connection_alias,
@@ -4089,8 +4484,20 @@ fn validate_raw_inventory(raw: &RawSqlServerCatalog) -> Result<(), CatalogError>
         "principal id",
     )?;
     require_unique(raw.tables.iter().map(|table| table.id), "table id")?;
+    require_unique(
+        raw.columns
+            .iter()
+            .map(|column| (column.object_id, column.id)),
+        "column identity",
+    )?;
     require_unique(raw.views.iter().map(|view| view.id), "view id")?;
     require_unique(raw.routines.iter().map(|routine| routine.id), "routine id")?;
+    require_unique(
+        raw.parameters
+            .iter()
+            .map(|parameter| (parameter.object_id, parameter.id)),
+        "routine parameter identity",
+    )?;
     require_unique(raw.triggers.iter().map(|trigger| trigger.id), "trigger id")?;
     require_unique(
         raw.constraints.iter().map(|constraint| constraint.id),
@@ -4105,10 +4512,76 @@ fn validate_raw_inventory(raw: &RawSqlServerCatalog) -> Result<(), CatalogError>
         "sequence id",
     )?;
     require_unique(raw.synonyms.iter().map(|synonym| synonym.id), "synonym id")?;
+    require_unique(
+        raw.indexes.iter().map(|index| (index.object_id, index.id)),
+        "index identity",
+    )?;
+    require_unique(
+        raw.partition_functions.iter().map(|function| function.id),
+        "partition function id",
+    )?;
+    require_unique(
+        raw.partition_schemes.iter().map(|scheme| scheme.id),
+        "partition scheme id",
+    )?;
+    require_unique(
+        raw.security_policies.iter().map(|policy| policy.id),
+        "security policy id",
+    )?;
+    require_unique(
+        raw.security_policies.iter().flat_map(|policy| {
+            policy
+                .predicates
+                .iter()
+                .map(move |predicate| (policy.id, predicate.id))
+        }),
+        "security predicate identity",
+    )?;
+    require_unique(
+        raw.xml_schema_collections
+            .iter()
+            .map(|collection| collection.id),
+        "XML schema collection id",
+    )?;
+    require_unique(
+        raw.xml_schema_collections.iter().flat_map(|collection| {
+            collection
+                .namespaces
+                .iter()
+                .map(move |namespace| (collection.id, namespace.id))
+        }),
+        "XML schema namespace identity",
+    )?;
+    require_unique(
+        raw.extended_properties.iter().map(|property| {
+            (
+                property.class,
+                property.major_id,
+                property.minor_id,
+                property.name.clone(),
+            )
+        }),
+        "extended property identity",
+    )?;
+    for property in &raw.extended_properties {
+        let value_is_null = property.value_type.is_none();
+        let typed_fields_are_empty = property.value_precision.is_none()
+            && property.value_scale.is_none()
+            && property.value_max_length.is_none()
+            && property.value_collation.is_none()
+            && property.display_value.is_none()
+            && property.value_hex.is_none();
+        if value_is_null != typed_fields_are_empty {
+            return Err(CatalogError::Mapping(format!(
+                "extended property '{}:{}:{}:{}' has inconsistent sql_variant metadata",
+                property.class, property.major_id, property.minor_id, property.name
+            )));
+        }
+    }
     Ok(())
 }
 
-fn require_unique<T: Ord + std::fmt::Display>(
+fn require_unique<T: Ord>(
     values: impl IntoIterator<Item = T>,
     subject: &str,
 ) -> Result<(), CatalogError> {
@@ -4790,6 +5263,211 @@ fn insert_optional_i64(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn map_xml_schema_collections(
+    metadata: &mut CanonicalMetadata,
+    connection_alias: &str,
+    database: &str,
+    collections: &[RawXmlSchemaCollection],
+    schema_keys: &BTreeMap<String, ObjectKey>,
+    schema_owner_ids: &BTreeMap<String, i32>,
+    principal_keys: &BTreeMap<i32, ObjectKey>,
+) -> Result<BTreeMap<i32, ObjectKey>, CatalogError> {
+    let mut collection_keys = BTreeMap::<i32, ObjectKey>::new();
+    for collection in collections {
+        let schema_key = required_key(
+            schema_keys,
+            &collection.schema,
+            "XML schema collection schema",
+        )?;
+        let key = sqlserver_key(
+            connection_alias,
+            database,
+            &collection.schema,
+            ObjectKind::Extension,
+            &collection.name,
+            Some("xml-schema-collection".to_owned()),
+        );
+        insert_unique_id(
+            &mut collection_keys,
+            collection.id,
+            &key,
+            "XML schema collection",
+        )?;
+        let mut properties = BTreeMap::new();
+        insert_i64(
+            &mut properties,
+            "xml_collection_id",
+            i64::from(collection.id),
+        );
+        insert_string(&mut properties, "created_at", &collection.created_at);
+        insert_string(&mut properties, "modified_at", &collection.modified_at);
+        metadata.objects.push(MetadataObject {
+            key: key.clone(),
+            parent_key: Some(schema_key.clone()),
+            name: collection.name.clone(),
+            extension_kind: Some("sqlserver_xml_schema_collection".to_owned()),
+            definition: None,
+            properties,
+        });
+        add_effective_owner(
+            metadata,
+            &key,
+            collection.principal_id,
+            &collection.schema,
+            schema_owner_ids,
+            principal_keys,
+        )?;
+
+        for namespace in &collection.namespaces {
+            let namespace_key = sqlserver_key(
+                connection_alias,
+                database,
+                &collection.schema,
+                ObjectKind::Extension,
+                &collection.name,
+                Some(format!("xml-schema-namespace:{}", namespace.id)),
+            );
+            let mut namespace_properties = BTreeMap::new();
+            insert_i64(
+                &mut namespace_properties,
+                "xml_namespace_id",
+                i64::from(namespace.id),
+            );
+            insert_string(&mut namespace_properties, "namespace", &namespace.name);
+            metadata.objects.push(MetadataObject {
+                key: namespace_key,
+                parent_key: Some(key.clone()),
+                name: if namespace.name.is_empty() {
+                    "default namespace".to_owned()
+                } else {
+                    namespace.name.clone()
+                },
+                extension_kind: Some("sqlserver_xml_schema_namespace".to_owned()),
+                definition: None,
+                properties: namespace_properties,
+            });
+        }
+    }
+    Ok(collection_keys)
+}
+
+struct ExtendedPropertyTargetRegistry<'a> {
+    database: &'a ObjectKey,
+    schemas: &'a BTreeMap<i32, ObjectKey>,
+    principals: &'a BTreeMap<i32, ObjectKey>,
+    objects: &'a BTreeMap<i32, ObjectKey>,
+    columns: &'a BTreeMap<(i32, i32), ObjectKey>,
+    table_type_columns: &'a BTreeMap<(i32, i32), ObjectKey>,
+    parameters: &'a BTreeMap<(i32, i32), ObjectKey>,
+    user_types: &'a BTreeMap<i32, ObjectKey>,
+    indexes: &'a BTreeMap<(i32, i32), ObjectKey>,
+    xml_collections: &'a BTreeMap<i32, ObjectKey>,
+    partition_schemes: &'a BTreeMap<i32, ObjectKey>,
+    partition_functions: &'a BTreeMap<i32, ObjectKey>,
+}
+
+impl ExtendedPropertyTargetRegistry<'_> {
+    fn resolve(&self, property: &RawExtendedProperty) -> Option<&ObjectKey> {
+        match property.class {
+            0 if property.major_id == 0 && property.minor_id == 0 => Some(self.database),
+            1 if property.minor_id == 0 => self.objects.get(&property.major_id),
+            1 => self.columns.get(&(property.major_id, property.minor_id)),
+            2 => self.parameters.get(&(property.major_id, property.minor_id)),
+            3 => self.schemas.get(&property.major_id),
+            4 => self.principals.get(&property.major_id),
+            6 => self.user_types.get(&property.major_id),
+            7 => self.indexes.get(&(property.major_id, property.minor_id)),
+            8 => self
+                .table_type_columns
+                .get(&(property.major_id, property.minor_id)),
+            10 => self.xml_collections.get(&property.major_id),
+            20 => self.partition_schemes.get(&property.major_id),
+            21 => self.partition_functions.get(&property.major_id),
+            _ => None,
+        }
+    }
+}
+
+fn map_extended_properties(
+    metadata: &mut CanonicalMetadata,
+    connection_alias: &str,
+    database: &str,
+    properties: &[RawExtendedProperty],
+    targets: ExtendedPropertyTargetRegistry<'_>,
+) -> Result<(), CatalogError> {
+    for property in properties {
+        let target = targets.resolve(property).ok_or_else(|| {
+            CatalogError::Mapping(format!(
+                "extended property '{}:{}:{}:{}' references an unmapped target",
+                property.class, property.major_id, property.minor_id, property.name
+            ))
+        })?;
+        let key = sqlserver_key(
+            connection_alias,
+            database,
+            &target.schema,
+            ObjectKind::Extension,
+            &target.object_name,
+            Some(format!(
+                "extended-property:{}:{}:{}:{}",
+                property.class, property.major_id, property.minor_id, property.name
+            )),
+        );
+        let mut values = BTreeMap::new();
+        insert_i64(&mut values, "class", i64::from(property.class));
+        insert_string(
+            &mut values,
+            "class_description",
+            &property.class_description,
+        );
+        insert_i64(&mut values, "major_id", i64::from(property.major_id));
+        insert_i64(&mut values, "minor_id", i64::from(property.minor_id));
+        insert_bool(&mut values, "value_is_null", property.value_type.is_none());
+        insert_optional_string(&mut values, "value_type", property.value_type.as_deref());
+        insert_optional_i64(
+            &mut values,
+            "value_precision",
+            property.value_precision.map(i64::from),
+        );
+        insert_optional_i64(
+            &mut values,
+            "value_scale",
+            property.value_scale.map(i64::from),
+        );
+        insert_optional_i64(
+            &mut values,
+            "value_max_length",
+            property.value_max_length.map(i64::from),
+        );
+        insert_optional_string(
+            &mut values,
+            "value_collation",
+            property.value_collation.as_deref(),
+        );
+        insert_optional_string(
+            &mut values,
+            "display_value",
+            property.display_value.as_deref(),
+        );
+        insert_optional_string(&mut values, "value_hex", property.value_hex.as_deref());
+        metadata.objects.push(MetadataObject {
+            key,
+            parent_key: Some(target.clone()),
+            name: property.name.clone(),
+            extension_kind: Some("sqlserver_extended_property".to_owned()),
+            definition: None,
+            properties: values,
+        });
+    }
+    Ok(())
+}
+
+struct PartitionMappingResult {
+    function_keys: BTreeMap<i32, ObjectKey>,
+    scheme_keys: BTreeMap<i32, ObjectKey>,
+}
+
 fn map_partitions(
     metadata: &mut CanonicalMetadata,
     connection_alias: &str,
@@ -4798,7 +5476,7 @@ fn map_partitions(
     raw: &RawSqlServerCatalog,
     object_keys: &BTreeMap<i32, ObjectKey>,
     index_keys: &BTreeMap<(i32, i32), ObjectKey>,
-) -> Result<BTreeMap<i32, ObjectKey>, CatalogError> {
+) -> Result<PartitionMappingResult, CatalogError> {
     let mut function_keys = BTreeMap::<i32, ObjectKey>::new();
     for function in &raw.partition_functions {
         let key = sqlserver_key(
@@ -4993,7 +5671,10 @@ fn map_partitions(
             BTreeMap::new(),
         );
     }
-    Ok(function_keys)
+    Ok(PartitionMappingResult {
+        function_keys,
+        scheme_keys,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5093,6 +5774,7 @@ fn map_dependencies(
     column_keys: &BTreeMap<(i32, i32), ObjectKey>,
     dependency_source_keys: &BTreeMap<i32, ObjectKey>,
     type_keys: &BTreeMap<i32, ObjectKey>,
+    xml_collection_keys: &BTreeMap<i32, ObjectKey>,
     index_keys: &BTreeMap<(i32, i32), ObjectKey>,
     partition_function_keys: &BTreeMap<i32, ObjectKey>,
     name_keys: &BTreeMap<(String, String), ObjectKey>,
@@ -5129,6 +5811,7 @@ fn map_dependencies(
             object_keys,
             column_keys,
             type_keys,
+            xml_collection_keys,
             index_keys,
             partition_function_keys,
             name_keys,
@@ -5225,6 +5908,7 @@ fn resolve_dependency_target(
     object_keys: &BTreeMap<i32, ObjectKey>,
     column_keys: &BTreeMap<(i32, i32), ObjectKey>,
     type_keys: &BTreeMap<i32, ObjectKey>,
+    xml_collection_keys: &BTreeMap<i32, ObjectKey>,
     index_keys: &BTreeMap<(i32, i32), ObjectKey>,
     partition_function_keys: &BTreeMap<i32, ObjectKey>,
     name_keys: &BTreeMap<(String, String), ObjectKey>,
@@ -5251,10 +5935,12 @@ fn resolve_dependency_target(
                 .get(&(object_id, dependency.referenced_minor_id))
                 .cloned()
         }),
+        10 => dependency
+            .referenced_id
+            .and_then(|id| xml_collection_keys.get(&id).cloned()),
         21 => dependency
             .referenced_id
             .and_then(|id| partition_function_keys.get(&id).cloned()),
-        10 => None,
         other => {
             return Err(CatalogError::UnsupportedMetadata(format!(
                 "dependency uses unsupported referenced class {other}"
@@ -5713,6 +6399,11 @@ fn expected_extension_object_count(
         .iter()
         .map(|function| function.values.len() as u64)
         .sum::<u64>();
+    let xml_namespaces = raw
+        .xml_schema_collections
+        .iter()
+        .map(|collection| collection.namespaces.len() as u64)
+        .sum::<u64>();
 
     table_type_columns
         + table_type_constraints
@@ -5722,6 +6413,9 @@ fn expected_extension_object_count(
         + partition_boundaries
         + raw.partition_schemes.len() as u64
         + raw.partitions.len() as u64
+        + raw.xml_schema_collections.len() as u64
+        + xml_namespaces
+        + raw.extended_properties.len() as u64
         + projection.external_reference_objects
 }
 
@@ -5851,6 +6545,16 @@ fn expected_metadata_relationship_count(
         .iter()
         .filter(|table| table.history_schema.is_some() && table.history_table.is_some())
         .count() as u64;
+    let typed_xml_columns = raw
+        .columns
+        .iter()
+        .filter(|column| column.xml_collection_id > 0)
+        .count() as u64;
+    let typed_xml_parameters = raw
+        .parameters
+        .iter()
+        .filter(|parameter| parameter.xml_collection_id > 0)
+        .count() as u64;
 
     ownerships as u64
         + sequence_types
@@ -5865,6 +6569,9 @@ fn expected_metadata_relationship_count(
         + partition_scheme_uses
         + temporal_histories
         + raw.synonyms.len() as u64
+        + raw.xml_schema_collections.len() as u64
+        + typed_xml_columns
+        + typed_xml_parameters
         + projection.dependency_metadata_relationships
 }
 
@@ -5937,6 +6644,16 @@ fn sqlserver_capability_checks(
             evidence: "dynamic, encrypted, CLR, caller-dependent, and ambiguous modules reject certification"
                 .to_owned(),
         },
+        CapabilityCheck {
+            name: "xml_schema_collections".to_owned(),
+            evidence: "typed XML columns and parameters resolve to sys.xml_schema_collections"
+                .to_owned(),
+        },
+        CapabilityCheck {
+            name: "extended_properties".to_owned(),
+            evidence: "supported sys.extended_properties targets preserve sql_variant type, display, and raw hex values"
+                .to_owned(),
+        },
     ]
 }
 
@@ -5946,7 +6663,7 @@ mod tests {
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::analysis_outcome::{AnalysisFailureCode, AnalysisStatus};
+    use crate::analysis_outcome::{AnalysisFailureCode, AnalysisStage, AnalysisStatus};
 
     use super::*;
 
@@ -5974,6 +6691,15 @@ mod tests {
         assert!(matches!(
             unsupported_engine,
             Err(CatalogError::UnsupportedProduct(_))
+        ));
+    }
+
+    #[test]
+    fn changed_catalog_signature_is_never_accepted_as_stable() {
+        assert_eq!(require_stable_catalog("same", &"same").unwrap(), "same");
+        assert!(matches!(
+            require_stable_catalog("first", &"second"),
+            Err(CatalogError::CatalogChanged(_))
         ));
     }
 
@@ -6419,6 +7145,324 @@ mod tests {
     }
 
     #[test]
+    fn xml_schema_and_extended_properties_are_certified_across_the_live_matrix() {
+        let _guard = live_test_guard();
+        let configured = configured_sqlserver_matrix();
+        if configured.is_empty() {
+            eprintln!("skipping SQL Server XML metadata matrix; configure SQL Server matrix URLs");
+            return;
+        }
+        for (strategy, connection_string) in configured {
+            assert_xml_metadata_catalog(strategy, &connection_string);
+        }
+    }
+
+    fn assert_xml_metadata_catalog(strategy: &str, connection_string: &str) {
+        let schema = format!("dm_{}", unique_suffix());
+        let creation = execute_admin_batches(
+            connection_string,
+            &[
+                format!("CREATE SCHEMA [{schema}] AUTHORIZATION [dbo]"),
+                format!(
+                    "CREATE XML SCHEMA COLLECTION [{schema}].[payload_xsd] AS \
+                     N'<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" \
+                     targetNamespace=\"urn:dbmcp:test\" elementFormDefault=\"qualified\">\
+                     <xs:element name=\"payload\" type=\"xs:string\"/>\
+                     </xs:schema>'"
+                ),
+                format!(
+                    "CREATE TABLE [{schema}].[typed_documents] (\
+                     [id] int NOT NULL PRIMARY KEY, \
+                     [payload] xml(CONTENT [{schema}].[payload_xsd]) NULL); \
+                     CREATE INDEX [ix_typed_documents_payload] \
+                     ON [{schema}].[typed_documents] ([id]) INCLUDE ([payload])"
+                ),
+                format!(
+                    "CREATE PROCEDURE [{schema}].[read_payload] \
+                     @payload xml(CONTENT [{schema}].[payload_xsd]) AS \
+                     SELECT @payload AS [payload]"
+                ),
+                format!(
+                    "CREATE TYPE [{schema}].[payload_type] AS TABLE (\
+                     [id] int NOT NULL PRIMARY KEY, [label] nvarchar(20) NULL)"
+                ),
+                format!(
+                    "EXEC sys.sp_addextendedproperty @name=N'MS_Description', \
+                     @value=N'XML metadata fixture schema', \
+                     @level0type=N'SCHEMA', @level0name=N'{schema}'"
+                ),
+                format!(
+                    "EXEC sys.sp_addextendedproperty @name=N'MS_Description', \
+                     @value=N'Typed document table', \
+                     @level0type=N'SCHEMA', @level0name=N'{schema}', \
+                     @level1type=N'TABLE', @level1name=N'typed_documents'"
+                ),
+                format!(
+                    "EXEC sys.sp_addextendedproperty @name=N'DisplayLabel', \
+                     @value=N'Validated XML payload', \
+                     @level0type=N'SCHEMA', @level0name=N'{schema}', \
+                     @level1type=N'TABLE', @level1name=N'typed_documents', \
+                     @level2type=N'COLUMN', @level2name=N'payload'"
+                ),
+                format!(
+                    "EXEC sys.sp_addextendedproperty @name=N'LookupIndex', @value=7, \
+                     @level0type=N'SCHEMA', @level0name=N'{schema}', \
+                     @level1type=N'TABLE', @level1name=N'typed_documents', \
+                     @level2type=N'INDEX', @level2name=N'ix_typed_documents_payload'"
+                ),
+                format!(
+                    "EXEC sys.sp_addextendedproperty @name=N'InputContract', \
+                     @value=N'Validated payload input', \
+                     @level0type=N'SCHEMA', @level0name=N'{schema}', \
+                     @level1type=N'PROCEDURE', @level1name=N'read_payload', \
+                     @level2type=N'PARAMETER', @level2name=N'@payload'"
+                ),
+                format!(
+                    "EXEC sys.sp_addextendedproperty @name=N'ContractKind', \
+                     @value=N'table-valued payload', \
+                     @level0type=N'SCHEMA', @level0name=N'{schema}', \
+                     @level1type=N'TYPE', @level1name=N'payload_type'"
+                ),
+                format!(
+                    "EXEC sys.sp_addextendedproperty @name=N'FieldHint', \
+                     @value=N'payload label', \
+                     @level0type=N'SCHEMA', @level0name=N'{schema}', \
+                     @level1type=N'TYPE', @level1name=N'payload_type', \
+                     @level2type=N'COLUMN', @level2name=N'label'"
+                ),
+                format!(
+                    "EXEC sys.sp_addextendedproperty @name=N'NamespaceOwner', \
+                     @value=N'backend-map', \
+                     @level0type=N'SCHEMA', @level0name=N'{schema}', \
+                     @level1type=N'XML SCHEMA COLLECTION', @level1name=N'payload_xsd'"
+                ),
+                format!(
+                    "EXEC sys.sp_addextendedproperty @name=N'BinaryMarker', \
+                     @value=0x01020304, \
+                     @level0type=N'SCHEMA', @level0name=N'{schema}', \
+                     @level1type=N'TABLE', @level1name=N'typed_documents'"
+                ),
+                format!(
+                    "EXEC sys.sp_addextendedproperty @name=N'NullMarker', \
+                     @level0type=N'SCHEMA', @level0name=N'{schema}', \
+                     @level1type=N'TABLE', @level1name=N'typed_documents'"
+                ),
+            ],
+        );
+        if let Err(error) = creation {
+            let cleanup = drop_xml_metadata_fixture(connection_string, &schema);
+            panic!(
+                "{strategy}: failed to create XML metadata fixture: {error}; cleanup={cleanup:?}"
+            );
+        }
+
+        let outcome = analyze_sqlserver(
+            connection_string,
+            &format!("{strategy}-xml-metadata"),
+            Vec::new(),
+            vec![schema.clone()],
+            30_000,
+        );
+        let failure = outcome.failure().cloned();
+        let certified = outcome.certified_snapshot().cloned();
+        drop_xml_metadata_fixture(connection_string, &schema).unwrap();
+
+        assert_eq!(
+            outcome.status(),
+            AnalysisStatus::Complete,
+            "{strategy}: {failure:?}"
+        );
+        let certified = certified.unwrap();
+        let snapshot = &certified.snapshot;
+        let collection = snapshot
+            .metadata
+            .objects
+            .iter()
+            .find(|object| {
+                object.extension_kind.as_deref() == Some("sqlserver_xml_schema_collection")
+                    && object.key.schema == schema
+                    && object.name == "payload_xsd"
+            })
+            .unwrap();
+        assert!(snapshot.metadata.objects.iter().any(|object| {
+            object.extension_kind.as_deref() == Some("sqlserver_xml_schema_namespace")
+                && object.properties.get("namespace")
+                    == Some(&MetadataValue::String("urn:dbmcp:test".to_owned()))
+        }));
+        assert_eq!(
+            snapshot
+                .metadata
+                .relationships
+                .iter()
+                .filter(|relationship| {
+                    relationship.kind
+                        == MetadataRelationshipKind::Extension(
+                            "uses_xml_schema_collection".to_owned(),
+                        )
+                        && relationship.to_key == collection.key
+                })
+                .count(),
+            2,
+            "{strategy}"
+        );
+
+        let extended_properties = snapshot
+            .metadata
+            .objects
+            .iter()
+            .filter(|object| {
+                object.extension_kind.as_deref() == Some("sqlserver_extended_property")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(extended_properties.len(), 10, "{strategy}");
+        let binary = extended_properties
+            .iter()
+            .find(|property| property.name == "BinaryMarker")
+            .unwrap();
+        assert_eq!(
+            binary.properties.get("value_hex"),
+            Some(&MetadataValue::String("01020304".to_owned())),
+            "{strategy}"
+        );
+        let null_value = extended_properties
+            .iter()
+            .find(|property| property.name == "NullMarker")
+            .unwrap();
+        assert_eq!(
+            null_value.properties.get("value_is_null"),
+            Some(&MetadataValue::Boolean(true)),
+            "{strategy}"
+        );
+        let extension_reconciliation = certified
+            .completeness
+            .object_counts
+            .iter()
+            .find(|count| count.category == ObjectCategory::Extension)
+            .unwrap();
+        assert_eq!(
+            extension_reconciliation.discovered, extension_reconciliation.emitted,
+            "{strategy}"
+        );
+    }
+
+    #[test]
+    fn cross_schema_foreign_keys_require_a_complete_scope_across_the_live_matrix() {
+        let _guard = live_test_guard();
+        let configured = configured_sqlserver_matrix();
+        if configured.is_empty() {
+            eprintln!("skipping SQL Server scope matrix; configure SQL Server matrix URLs");
+            return;
+        }
+        for (strategy, connection_string) in configured {
+            let suffix = unique_suffix();
+            let child_schema = format!("dm_child_{suffix}");
+            let parent_schema = format!("dm_parent_{suffix}");
+            let creation = execute_admin_batches(
+                &connection_string,
+                &[
+                    format!("CREATE SCHEMA [{parent_schema}] AUTHORIZATION [dbo]"),
+                    format!("CREATE SCHEMA [{child_schema}] AUTHORIZATION [dbo]"),
+                    format!(
+                        "CREATE TABLE [{parent_schema}].[accounts] (\
+                         [id] int NOT NULL PRIMARY KEY)"
+                    ),
+                    format!(
+                        "CREATE TABLE [{child_schema}].[orders] (\
+                         [id] int NOT NULL PRIMARY KEY, [account_id] int NOT NULL, \
+                         CONSTRAINT [fk_orders_accounts] FOREIGN KEY ([account_id]) \
+                         REFERENCES [{parent_schema}].[accounts] ([id]))"
+                    ),
+                ],
+            );
+            if let Err(error) = creation {
+                let cleanup =
+                    drop_cross_schema_fixture(&connection_string, &child_schema, &parent_schema);
+                panic!("{strategy}: failed to create scope fixture: {error}; cleanup={cleanup:?}");
+            }
+
+            let incomplete = analyze_sqlserver(
+                &connection_string,
+                &format!("{strategy}-incomplete-scope"),
+                Vec::new(),
+                vec![child_schema.clone()],
+                30_000,
+            );
+            assert_eq!(incomplete.status(), AnalysisStatus::Failed, "{strategy}");
+            assert_eq!(
+                incomplete.failure().map(|failure| failure.code),
+                Some(AnalysisFailureCode::InvalidConfiguration),
+                "{strategy}: {:?}",
+                incomplete.failure()
+            );
+            assert!(
+                incomplete
+                    .failure()
+                    .is_some_and(|failure| failure.message.contains(&parent_schema)),
+                "{strategy}: {:?}",
+                incomplete.failure()
+            );
+            assert!(incomplete.certified_snapshot().is_none(), "{strategy}");
+
+            let complete = analyze_sqlserver(
+                &connection_string,
+                &format!("{strategy}-complete-scope"),
+                Vec::new(),
+                vec![child_schema.clone(), parent_schema.clone()],
+                30_000,
+            );
+            let failure = complete.failure().cloned();
+            let certified = complete.certified_snapshot().cloned();
+            drop_cross_schema_fixture(&connection_string, &child_schema, &parent_schema).unwrap();
+
+            assert_eq!(
+                complete.status(),
+                AnalysisStatus::Complete,
+                "{strategy}: {failure:?}"
+            );
+            let snapshot = &certified.unwrap().snapshot;
+            let foreign_key = snapshot
+                .schema
+                .constraints
+                .iter()
+                .find(|constraint| constraint.name == "fk_orders_accounts")
+                .unwrap();
+            assert_eq!(
+                foreign_key
+                    .referenced_table_key
+                    .as_ref()
+                    .map(|key| key.schema.as_str()),
+                Some(parent_schema.as_str()),
+                "{strategy}"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_never_emits_a_partial_snapshot_across_the_live_matrix() {
+        let _guard = live_test_guard();
+        let configured = configured_sqlserver_matrix();
+        if configured.is_empty() {
+            eprintln!("skipping SQL Server timeout matrix; configure SQL Server matrix URLs");
+            return;
+        }
+        for (strategy, connection_string) in configured {
+            let outcome = analyze_sqlserver(
+                &connection_string,
+                &format!("{strategy}-timeout"),
+                Vec::new(),
+                Vec::new(),
+                1,
+            );
+            assert_eq!(outcome.status(), AnalysisStatus::Failed, "{strategy}");
+            let failure = outcome.failure().unwrap();
+            assert_eq!(failure.code, AnalysisFailureCode::Timeout, "{strategy}");
+            assert_eq!(failure.stage, AnalysisStage::Discovery, "{strategy}");
+            assert!(failure.retryable, "{strategy}");
+            assert!(outcome.certified_snapshot().is_none(), "{strategy}");
+        }
+    }
+
+    #[test]
     fn metadata_visibility_is_required_and_sufficient_on_the_live_server() {
         let _guard = live_test_guard();
         let Ok(admin_connection) = std::env::var("DATABASE_MEMORY_TEST_SQLSERVER2022_URL") else {
@@ -6775,6 +7819,40 @@ mod tests {
                 format!("DROP TYPE IF EXISTS [{schema}].[payload]"),
                 format!("DROP TYPE IF EXISTS [{schema}].[code]"),
                 format!("DROP SCHEMA IF EXISTS [{schema}]"),
+            ],
+        )
+    }
+
+    fn drop_xml_metadata_fixture(connection_string: &str, schema: &str) -> Result<(), String> {
+        execute_admin_batches(
+            connection_string,
+            &[
+                format!("DROP PROCEDURE IF EXISTS [{schema}].[read_payload]"),
+                format!("DROP TABLE IF EXISTS [{schema}].[typed_documents]"),
+                format!("DROP TYPE IF EXISTS [{schema}].[payload_type]"),
+                format!(
+                    "IF EXISTS (SELECT 1 FROM sys.xml_schema_collections xsc \
+                     JOIN sys.schemas s ON s.schema_id = xsc.schema_id \
+                     WHERE s.name = N'{schema}' AND xsc.name = N'payload_xsd') \
+                     DROP XML SCHEMA COLLECTION [{schema}].[payload_xsd]"
+                ),
+                format!("DROP SCHEMA IF EXISTS [{schema}]"),
+            ],
+        )
+    }
+
+    fn drop_cross_schema_fixture(
+        connection_string: &str,
+        child_schema: &str,
+        parent_schema: &str,
+    ) -> Result<(), String> {
+        execute_admin_batches(
+            connection_string,
+            &[
+                format!("DROP TABLE IF EXISTS [{child_schema}].[orders]"),
+                format!("DROP TABLE IF EXISTS [{parent_schema}].[accounts]"),
+                format!("DROP SCHEMA IF EXISTS [{child_schema}]"),
+                format!("DROP SCHEMA IF EXISTS [{parent_schema}]"),
             ],
         )
     }
