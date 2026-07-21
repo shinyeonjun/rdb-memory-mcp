@@ -21,7 +21,7 @@ use crate::introspection::{
 use crate::{
     AdapterCapabilities, CapabilitySupport, ColumnObject, ConstraintKind, ConstraintObject,
     DatabaseObject, IndexObject, ObjectKey, ObjectKind, SchemaObject, SchemaSnapshot, TableKind,
-    TableObject,
+    TableObject, ViewObject,
 };
 
 const ORACLE_SOURCE: &str = "oracle";
@@ -778,6 +778,26 @@ struct RawIdentityColumn {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct RawView {
+    owner: String,
+    name: String,
+    text_length: Option<i64>,
+    definition: Option<String>,
+    type_owner: Option<String>,
+    view_type: Option<String>,
+    superview: Option<String>,
+    editioning: Option<String>,
+    read_only: Option<String>,
+    container_data: Option<String>,
+    bequeath: Option<String>,
+    default_collation: Option<String>,
+    has_sensitive_column: Option<String>,
+    admit_null: Option<String>,
+    pdb_local_only: Option<String>,
+    duality_view: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RawConstraintColumn {
     name: String,
     position: Option<i64>,
@@ -850,6 +870,8 @@ struct RawOracleCatalog {
     columns: Vec<RawColumn>,
     sequences: Vec<RawSequence>,
     identity_columns: Vec<RawIdentityColumn>,
+    views: Vec<RawView>,
+    view_columns: Vec<RawColumn>,
     constraints: Vec<RawConstraint>,
     indexes: Vec<RawIndex>,
     dependencies: Vec<RawDependency>,
@@ -873,6 +895,10 @@ impl RawOracleCatalog {
             .map_err(|error| error.catalog_context("sequence"))?;
         let identity_columns = read_identity_columns(connection, scope, deadline)
             .map_err(|error| error.catalog_context("identity-column"))?;
+        let views = read_views(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("view"))?;
+        let view_columns = read_view_columns(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("view-column"))?;
         let mut constraints = read_constraints(connection, scope, &recycle, deadline)
             .map_err(|error| error.catalog_context("constraint"))?;
         attach_constraint_columns(connection, scope, &mut constraints, deadline)
@@ -892,6 +918,8 @@ impl RawOracleCatalog {
             columns,
             sequences,
             identity_columns,
+            views,
+            view_columns,
             constraints,
             indexes,
             dependencies,
@@ -1545,6 +1573,275 @@ fn read_identity_columns(
     Ok(identities)
 }
 
+fn read_views(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawView>, CatalogError> {
+    type ViewTuple = (
+        String,
+        String,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let mut views = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let sql = match scope.mode {
+            DictionaryScopeMode::User => {
+                "
+                SELECT :1,
+                       VIEW_NAME,
+                       TEXT_LENGTH,
+                       TEXT,
+                       VIEW_TYPE_OWNER,
+                       VIEW_TYPE,
+                       SUPERVIEW_NAME,
+                       EDITIONING_VIEW,
+                       READ_ONLY,
+                       CONTAINER_DATA,
+                       BEQUEATH,
+                       DEFAULT_COLLATION,
+                       HAS_SENSITIVE_COLUMN,
+                       ADMIT_NULL,
+                       PDB_LOCAL_ONLY,
+                       DUALITY_VIEW
+                FROM USER_VIEWS
+                ORDER BY VIEW_NAME
+                "
+            }
+            DictionaryScopeMode::Dba => {
+                "
+                SELECT OWNER,
+                       VIEW_NAME,
+                       TEXT_LENGTH,
+                       TEXT,
+                       VIEW_TYPE_OWNER,
+                       VIEW_TYPE,
+                       SUPERVIEW_NAME,
+                       EDITIONING_VIEW,
+                       READ_ONLY,
+                       CONTAINER_DATA,
+                       BEQUEATH,
+                       DEFAULT_COLLATION,
+                       HAS_SENSITIVE_COLUMN,
+                       ADMIT_NULL,
+                       PDB_LOCAL_ONLY,
+                       DUALITY_VIEW
+                FROM DBA_VIEWS
+                WHERE OWNER = :1
+                ORDER BY OWNER, VIEW_NAME
+                "
+            }
+        };
+        let rows = connection.query_as::<ViewTuple>(sql, &[owner])?;
+        for row in rows {
+            let (
+                owner,
+                name,
+                text_length,
+                definition,
+                type_owner,
+                view_type,
+                superview,
+                editioning,
+                read_only,
+                container_data,
+                bequeath,
+                default_collation,
+                has_sensitive_column,
+                admit_null,
+                pdb_local_only,
+                duality_view,
+            ) = row?;
+            if text_length.is_some_and(|length| length > MAX_DEFINITION_BYTES as i64) {
+                return Err(CatalogError::UnsupportedMetadata(format!(
+                    "Oracle view definition exceeds the {MAX_DEFINITION_BYTES}-byte safety limit for {owner}.{name}"
+                )));
+            }
+            views.push(RawView {
+                owner,
+                name,
+                text_length,
+                definition: normalize_definition(definition)?,
+                type_owner,
+                view_type,
+                superview,
+                editioning,
+                read_only,
+                container_data,
+                bequeath,
+                default_collation,
+                has_sensitive_column,
+                admit_null,
+                pdb_local_only,
+                duality_view,
+            });
+        }
+    }
+    views.sort_by(|left, right| (&left.owner, &left.name).cmp(&(&right.owner, &right.name)));
+    Ok(views)
+}
+
+fn read_view_columns(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawColumn>, CatalogError> {
+    type ColumnTuple = (
+        String,
+        String,
+        String,
+        Option<i64>,
+        i64,
+        String,
+        Option<String>,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    );
+    let mut columns = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let sql = match scope.mode {
+            DictionaryScopeMode::User => {
+                "
+                SELECT :1,
+                       c.TABLE_NAME,
+                       c.COLUMN_NAME,
+                       c.COLUMN_ID,
+                       c.INTERNAL_COLUMN_ID,
+                       c.DATA_TYPE,
+                       c.DATA_TYPE_OWNER,
+                       c.DATA_LENGTH,
+                       c.DATA_PRECISION,
+                       c.DATA_SCALE,
+                       c.NULLABLE,
+                       c.DATA_DEFAULT,
+                       c.HIDDEN_COLUMN,
+                       c.VIRTUAL_COLUMN,
+                       c.USER_GENERATED,
+                       c.DEFAULT_ON_NULL,
+                       c.IDENTITY_COLUMN,
+                       c.CHAR_LENGTH,
+                       c.CHAR_USED,
+                       c.COLLATION
+                FROM USER_TAB_COLS c
+                JOIN USER_VIEWS v ON v.VIEW_NAME = c.TABLE_NAME
+                ORDER BY c.TABLE_NAME, c.INTERNAL_COLUMN_ID
+                "
+            }
+            DictionaryScopeMode::Dba => {
+                "
+                SELECT c.OWNER,
+                       c.TABLE_NAME,
+                       c.COLUMN_NAME,
+                       c.COLUMN_ID,
+                       c.INTERNAL_COLUMN_ID,
+                       c.DATA_TYPE,
+                       c.DATA_TYPE_OWNER,
+                       c.DATA_LENGTH,
+                       c.DATA_PRECISION,
+                       c.DATA_SCALE,
+                       c.NULLABLE,
+                       c.DATA_DEFAULT,
+                       c.HIDDEN_COLUMN,
+                       c.VIRTUAL_COLUMN,
+                       c.USER_GENERATED,
+                       c.DEFAULT_ON_NULL,
+                       c.IDENTITY_COLUMN,
+                       c.CHAR_LENGTH,
+                       c.CHAR_USED,
+                       c.COLLATION
+                FROM DBA_TAB_COLS c
+                JOIN DBA_VIEWS v
+                  ON v.OWNER = c.OWNER
+                 AND v.VIEW_NAME = c.TABLE_NAME
+                WHERE c.OWNER = :1
+                ORDER BY c.OWNER, c.TABLE_NAME, c.INTERNAL_COLUMN_ID
+                "
+            }
+        };
+        let rows = connection.query_as::<ColumnTuple>(sql, &[owner])?;
+        for row in rows {
+            let (
+                owner,
+                table,
+                name,
+                column_id,
+                internal_column_id,
+                data_type,
+                data_type_owner,
+                data_length,
+                data_precision,
+                data_scale,
+                nullable,
+                default_value,
+                hidden,
+                virtual_column,
+                user_generated,
+                default_on_null,
+                identity,
+                char_length,
+                char_used,
+                collation,
+            ) = row?;
+            columns.push(RawColumn {
+                owner,
+                table,
+                name,
+                column_id,
+                internal_column_id,
+                data_type,
+                data_type_owner,
+                data_length,
+                data_precision,
+                data_scale,
+                nullable: nullable == "Y",
+                default_value: normalize_definition(default_value)?,
+                hidden: hidden == "YES",
+                virtual_column: virtual_column == "YES",
+                user_generated: user_generated == "YES",
+                default_on_null: default_on_null == "YES",
+                identity: identity == "YES",
+                char_length,
+                char_used,
+                collation,
+            });
+        }
+    }
+    columns.sort_by(|left, right| {
+        (&left.owner, &left.table, left.internal_column_id).cmp(&(
+            &right.owner,
+            &right.table,
+            right.internal_column_id,
+        ))
+    });
+    Ok(columns)
+}
+
 fn normalize_definition(value: Option<String>) -> Result<Option<String>, CatalogError> {
     let Some(value) = value else {
         return Ok(None);
@@ -2103,6 +2400,7 @@ fn read_dependencies(
                 &right.referenced_type,
             ))
     });
+    dependencies.dedup();
     Ok(dependencies)
 }
 
@@ -2110,11 +2408,6 @@ fn validate_raw_catalog(
     raw: &RawOracleCatalog,
     scope: &DictionaryScope,
 ) -> Result<(), CatalogError> {
-    if raw.inventory.iter().any(|object| object.secondary) {
-        // Secondary objects are Oracle-maintained implementation artifacts and are
-        // intentionally outside the application-schema inventory contract.
-    }
-
     let inventory = raw
         .inventory
         .iter()
@@ -2122,7 +2415,12 @@ fn validate_raw_catalog(
         .collect::<Vec<_>>();
     let unsupported = inventory
         .iter()
-        .filter(|object| !matches!(object.object_type.as_str(), "TABLE" | "INDEX" | "SEQUENCE"))
+        .filter(|object| {
+            !matches!(
+                object.object_type.as_str(),
+                "TABLE" | "INDEX" | "SEQUENCE" | "VIEW"
+            )
+        })
         .take(8)
         .map(|object| format!("{}.{} ({})", object.owner, object.name, object.object_type))
         .collect::<Vec<_>>();
@@ -2141,29 +2439,16 @@ fn validate_raw_catalog(
             object.subobject.as_deref().unwrap_or_default()
         )));
     }
-    if let Some(dependency) = raw.dependencies.first() {
-        let remote = dependency
-            .referenced_link
-            .as_deref()
-            .map(|link| format!(" over database link {link}"))
-            .unwrap_or_default();
-        return Err(CatalogError::UnsupportedMetadata(format!(
-            "Oracle dependency mapping is not yet certified: {}.{} ({}) references {}.{} ({}){} using {} dependency",
-            dependency.owner,
-            dependency.name,
-            dependency.object_type,
-            dependency.referenced_owner,
-            dependency.referenced_name,
-            dependency.referenced_type,
-            remote,
-            dependency.dependency_type
-        )));
-    }
-
     let mut inventory_ids = BTreeSet::new();
     let mut inventory_keys = BTreeSet::new();
     for object in &inventory {
         ensure_owner(scope, &object.owner, "inventory object")?;
+        if object.status != "VALID" {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle inventory object {}.{} ({}) has non-valid status '{}'",
+                object.owner, object.name, object.object_type, object.status
+            )));
+        }
         if !inventory_ids.insert(object.object_id) {
             return Err(CatalogError::Mapping(format!(
                 "duplicate Oracle object id {}",
@@ -2354,6 +2639,122 @@ fn validate_raw_catalog(
             return Err(CatalogError::Mapping(format!(
                 "Oracle table identity flag mismatch for {}.{}",
                 table.owner, table.name
+            )));
+        }
+    }
+
+    let mut views = BTreeSet::new();
+    for view in &raw.views {
+        ensure_owner(scope, &view.owner, "view")?;
+        if !views.insert((view.owner.clone(), view.name.clone())) {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle view {}.{}",
+                view.owner, view.name
+            )));
+        }
+        if view.definition.is_none() {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle view {}.{} has no complete definition",
+                view.owner, view.name
+            )));
+        }
+        if view.type_owner.is_some() || view.view_type.is_some() || view.superview.is_some() {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "typed Oracle view metadata is not yet covered for {}.{}",
+                view.owner, view.name
+            )));
+        }
+        if !inventory_keys.contains(&(view.owner.clone(), "VIEW".to_owned(), view.name.clone())) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle view {}.{} is missing from the independent object inventory",
+                view.owner, view.name
+            )));
+        }
+    }
+    let inventory_view_count = inventory
+        .iter()
+        .filter(|object| object.object_type == "VIEW")
+        .count();
+    if inventory_view_count != raw.views.len() {
+        return Err(CatalogError::Mapping(format!(
+            "Oracle view inventory mismatch: USER/DBA_OBJECTS reports {inventory_view_count}, USER/DBA_VIEWS reports {}",
+            raw.views.len()
+        )));
+    }
+
+    let mut view_column_keys = BTreeSet::new();
+    let mut view_column_ordinals = BTreeSet::new();
+    for column in &raw.view_columns {
+        ensure_owner(scope, &column.owner, "view column")?;
+        if !views.contains(&(column.owner.clone(), column.table.clone())) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle view column {}.{}.{} has no mapped view",
+                column.owner, column.table, column.name
+            )));
+        }
+        positive_u32(column.internal_column_id, "Oracle view-column ordinal")?;
+        if !view_column_keys.insert((
+            column.owner.clone(),
+            column.table.clone(),
+            column.name.clone(),
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle view column {}.{}.{}",
+                column.owner, column.table, column.name
+            )));
+        }
+        if !view_column_ordinals.insert((
+            column.owner.clone(),
+            column.table.clone(),
+            column.internal_column_id,
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle view-column ordinal {} for {}.{}",
+                column.internal_column_id, column.owner, column.table
+            )));
+        }
+    }
+
+    for dependency in &raw.dependencies {
+        ensure_owner(scope, &dependency.owner, "dependency source")?;
+        if dependency.referenced_link.is_some() {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle dependency {}.{} uses remote database link '{}'",
+                dependency.owner,
+                dependency.name,
+                dependency.referenced_link.as_deref().unwrap_or_default()
+            )));
+        }
+        if dependency.object_type != "VIEW"
+            || !views.contains(&(dependency.owner.clone(), dependency.name.clone()))
+        {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle dependency source is not yet covered: {}.{} ({})",
+                dependency.owner, dependency.name, dependency.object_type
+            )));
+        }
+        if dependency.dependency_type != "HARD" {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle dependency type '{}' is not covered for {}.{}",
+                dependency.dependency_type, dependency.owner, dependency.name
+            )));
+        }
+        ensure_owner(scope, &dependency.referenced_owner, "dependency target")?;
+        let target_exists = match dependency.referenced_type.as_str() {
+            "TABLE" => tables.contains(&(
+                dependency.referenced_owner.clone(),
+                dependency.referenced_name.clone(),
+            )),
+            "VIEW" => views.contains(&(
+                dependency.referenced_owner.clone(),
+                dependency.referenced_name.clone(),
+            )),
+            _ => false,
+        };
+        if !target_exists {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle dependency target is outside the covered object set: {}.{} ({})",
+                dependency.referenced_owner, dependency.referenced_name, dependency.referenced_type
             )));
         }
     }
@@ -2761,6 +3162,157 @@ impl<'a> OracleSnapshotMapper<'a> {
             });
         }
 
+        let mut views = Vec::new();
+        let mut view_keys = BTreeMap::new();
+        let mut view_positions = BTreeMap::new();
+        for view in &raw.views {
+            let schema_key = required(
+                schema_keys.get(&view.owner),
+                format!("schema key for Oracle view {}.{}", view.owner, view.name),
+            )?;
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &view.owner,
+                ObjectKind::View,
+                &view.name,
+                None,
+            );
+            view_keys.insert((view.owner.clone(), view.name.clone()), key.clone());
+            view_positions.insert((view.owner.clone(), view.name.clone()), views.len());
+            views.push(ViewObject {
+                key: key.clone(),
+                schema_key: schema_key.clone(),
+                name: view.name.clone(),
+                definition: view.definition.clone(),
+                depends_on: Vec::new(),
+            });
+            let inventory_object = required(
+                inventory.get(&(view.owner.clone(), "VIEW".to_owned(), view.name.clone())),
+                format!("inventory row for Oracle view {}.{}", view.owner, view.name),
+            )?;
+            let mut properties = inventory_properties(inventory_object);
+            insert_optional_i64(&mut properties, "text_length", view.text_length);
+            insert_optional_string(&mut properties, "editioning", view.editioning.as_deref());
+            insert_optional_string(&mut properties, "read_only", view.read_only.as_deref());
+            insert_optional_string(
+                &mut properties,
+                "container_data",
+                view.container_data.as_deref(),
+            );
+            insert_optional_string(&mut properties, "bequeath", view.bequeath.as_deref());
+            insert_optional_string(
+                &mut properties,
+                "default_collation",
+                view.default_collation.as_deref(),
+            );
+            insert_optional_string(
+                &mut properties,
+                "has_sensitive_column",
+                view.has_sensitive_column.as_deref(),
+            );
+            insert_optional_string(&mut properties, "admit_null", view.admit_null.as_deref());
+            insert_optional_string(
+                &mut properties,
+                "pdb_local_only",
+                view.pdb_local_only.as_deref(),
+            );
+            insert_optional_string(
+                &mut properties,
+                "duality_view",
+                view.duality_view.as_deref(),
+            );
+            metadata.annotations.push(ObjectAnnotation {
+                object_key: key,
+                definition: None,
+                properties,
+            });
+        }
+
+        for column in &raw.view_columns {
+            let view_key = required(
+                view_keys.get(&(column.owner.clone(), column.table.clone())),
+                format!(
+                    "view key for Oracle output column {}.{}.{}",
+                    column.owner, column.table, column.name
+                ),
+            )?;
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &column.owner,
+                ObjectKind::ViewColumn,
+                &column.table,
+                Some(column.name.clone()),
+            );
+            let mut properties = oracle_column_properties(column);
+            insert_i64(
+                &mut properties,
+                "ordinal_position",
+                i64::from(positive_u32(
+                    column.internal_column_id,
+                    "Oracle view-column ordinal",
+                )?),
+            );
+            insert_string(
+                &mut properties,
+                "data_type",
+                format_oracle_data_type(column),
+            );
+            insert_bool(&mut properties, "nullable", column.nullable);
+            insert_optional_string(
+                &mut properties,
+                "default_value",
+                column.default_value.as_deref(),
+            );
+            metadata.objects.push(MetadataObject {
+                key,
+                parent_key: Some(view_key.clone()),
+                name: column.name.clone(),
+                extension_kind: None,
+                definition: None,
+                properties,
+            });
+        }
+
+        for dependency in &raw.dependencies {
+            let source_position = required(
+                view_positions.get(&(dependency.owner.clone(), dependency.name.clone())),
+                format!(
+                    "view position for Oracle dependency {}.{}",
+                    dependency.owner, dependency.name
+                ),
+            )?;
+            let target_key = match dependency.referenced_type.as_str() {
+                "TABLE" => required(
+                    table_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )),
+                    format!(
+                        "table target for Oracle view dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
+                "VIEW" => required(
+                    view_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )),
+                    format!(
+                        "view target for Oracle view dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
+                other => {
+                    return Err(CatalogError::Mapping(format!(
+                        "unmapped Oracle view dependency target type '{other}'"
+                    )));
+                }
+            };
+            views[*source_position].depends_on.push(target_key.clone());
+        }
+
         let identities = raw
             .identity_columns
             .iter()
@@ -2817,29 +3369,7 @@ impl<'a> OracleSnapshotMapper<'a> {
                     || !column.user_generated
                     || column.identity,
             });
-            let mut properties = BTreeMap::new();
-            insert_optional_i64(&mut properties, "column_id", column.column_id);
-            insert_i64(
-                &mut properties,
-                "internal_column_id",
-                column.internal_column_id,
-            );
-            insert_i64(&mut properties, "data_length", column.data_length);
-            insert_optional_i64(&mut properties, "data_precision", column.data_precision);
-            insert_optional_i64(&mut properties, "data_scale", column.data_scale);
-            insert_optional_i64(&mut properties, "char_length", column.char_length);
-            insert_optional_string(&mut properties, "char_used", column.char_used.as_deref());
-            insert_optional_string(&mut properties, "collation", column.collation.as_deref());
-            insert_optional_string(
-                &mut properties,
-                "data_type_owner",
-                column.data_type_owner.as_deref(),
-            );
-            insert_bool(&mut properties, "hidden", column.hidden);
-            insert_bool(&mut properties, "virtual", column.virtual_column);
-            insert_bool(&mut properties, "user_generated", column.user_generated);
-            insert_bool(&mut properties, "default_on_null", column.default_on_null);
-            insert_bool(&mut properties, "identity", column.identity);
+            let mut properties = oracle_column_properties(column);
             if let Some(identity) = identities.get(&(
                 column.owner.clone(),
                 column.table.clone(),
@@ -3082,7 +3612,7 @@ impl<'a> OracleSnapshotMapper<'a> {
                 columns,
                 constraints,
                 indexes,
-                views: Vec::new(),
+                views,
                 triggers: Vec::new(),
                 routines: Vec::new(),
                 capabilities: oracle_complete_capabilities(&self.scope),
@@ -3150,8 +3680,10 @@ impl<'a> OracleSnapshotMapper<'a> {
                 },
                 CapabilityCheck {
                     name: "dependency_coverage".to_owned(),
-                    evidence: "USER/DBA_DEPENDENCIES reported zero rows for the accepted base-schema object set; any dependency fails closed until mapped"
-                        .to_owned(),
+                    evidence: format!(
+                        "{} unique USER/DBA_DEPENDENCIES row(s) were resolved for the accepted object set",
+                        raw.dependencies.len()
+                    ),
                 },
                 CapabilityCheck {
                     name: "principal_context".to_owned(),
@@ -3236,6 +3768,33 @@ fn inventory_properties(object: &RawInventoryObject) -> BTreeMap<String, Metadat
         "default_collation",
         object.default_collation.as_deref(),
     );
+    properties
+}
+
+fn oracle_column_properties(column: &RawColumn) -> BTreeMap<String, MetadataValue> {
+    let mut properties = BTreeMap::new();
+    insert_optional_i64(&mut properties, "column_id", column.column_id);
+    insert_i64(
+        &mut properties,
+        "internal_column_id",
+        column.internal_column_id,
+    );
+    insert_i64(&mut properties, "data_length", column.data_length);
+    insert_optional_i64(&mut properties, "data_precision", column.data_precision);
+    insert_optional_i64(&mut properties, "data_scale", column.data_scale);
+    insert_optional_i64(&mut properties, "char_length", column.char_length);
+    insert_optional_string(&mut properties, "char_used", column.char_used.as_deref());
+    insert_optional_string(&mut properties, "collation", column.collation.as_deref());
+    insert_optional_string(
+        &mut properties,
+        "data_type_owner",
+        column.data_type_owner.as_deref(),
+    );
+    insert_bool(&mut properties, "hidden", column.hidden);
+    insert_bool(&mut properties, "virtual", column.virtual_column);
+    insert_bool(&mut properties, "user_generated", column.user_generated);
+    insert_bool(&mut properties, "default_on_null", column.default_on_null);
+    insert_bool(&mut properties, "identity", column.identity);
     properties
 }
 
@@ -3362,6 +3921,12 @@ fn discovery_counts_from_catalog(
     set_object_count(&mut objects, ObjectCategory::Column, raw.columns.len());
     set_object_count(&mut objects, ObjectCategory::Index, raw.indexes.len());
     set_object_count(&mut objects, ObjectCategory::Sequence, raw.sequences.len());
+    set_object_count(&mut objects, ObjectCategory::View, raw.views.len());
+    set_object_count(
+        &mut objects,
+        ObjectCategory::ViewColumn,
+        raw.view_columns.len(),
+    );
     set_object_count(
         &mut objects,
         ObjectCategory::Principal,
@@ -3428,8 +3993,18 @@ fn discovery_counts_from_catalog(
     );
     set_relationship_count(
         &mut relationships,
+        RelationshipCategory::SchemaHasView,
+        raw.views.len(),
+    );
+    set_relationship_count(
+        &mut relationships,
+        RelationshipCategory::ViewDependency,
+        raw.dependencies.len(),
+    );
+    set_relationship_count(
+        &mut relationships,
         RelationshipCategory::MetadataParent,
-        scope.principals.len() + raw.sequences.len(),
+        scope.principals.len() + raw.sequences.len() + raw.view_columns.len(),
     );
     set_relationship_count(
         &mut relationships,
@@ -3636,7 +4211,7 @@ mod tests {
             .admin
             .execute(
                 &format!(
-                    "GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW TO {}",
+                    "GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW, CREATE MATERIALIZED VIEW TO {}",
                     cleanup.username
                 ),
                 &[],
@@ -3667,6 +4242,12 @@ mod tests {
         setup
             .execute("CREATE SEQUENCE AUDIT_SEQUENCE START WITH 10", &[])
             .expect("create explicit sequence");
+        setup
+            .execute(
+                "CREATE VIEW ACTIVE_PARENT AS SELECT ID, CODE FROM PARENT_ENTITY WHERE ID > 0",
+                &[],
+            )
+            .expect("create view");
         drop(setup);
 
         let complete = analyze_oracle(&user_url, "oracle-live", Vec::new(), Vec::new(), 30_000);
@@ -3703,12 +4284,33 @@ mod tests {
             .relationships
             .iter()
             .any(|relationship| relationship.kind == MetadataRelationshipKind::UsesSequence));
+        let view = certified
+            .snapshot
+            .schema
+            .views
+            .iter()
+            .find(|view| view.name == "ACTIVE_PARENT")
+            .expect("view is mapped");
+        assert!(view
+            .depends_on
+            .iter()
+            .any(|key| key.object_kind == ObjectKind::Table && key.object_name == "PARENT_ENTITY"));
+        assert_eq!(
+            certified
+                .snapshot
+                .metadata
+                .objects
+                .iter()
+                .filter(|object| object.key.object_kind == ObjectKind::ViewColumn)
+                .count(),
+            2
+        );
 
         let setup = Connection::connect(&cleanup.username, password, &connect_string)
             .expect("reconnect as isolated Oracle test user");
         setup
             .execute(
-                "CREATE VIEW UNSUPPORTED_VIEW AS SELECT ID, CODE FROM PARENT_ENTITY",
+                "CREATE MATERIALIZED VIEW UNSUPPORTED_MV BUILD IMMEDIATE REFRESH COMPLETE ON DEMAND AS SELECT ID, CODE FROM PARENT_ENTITY",
                 &[],
             )
             .expect("create fail-closed fixture");
