@@ -162,7 +162,9 @@ fn validate_extension_identity(
 fn is_canonical_metadata_kind(kind: ObjectKind) -> bool {
     matches!(
         kind,
-        ObjectKind::CheckConstraint
+        ObjectKind::PrimaryKey
+            | ObjectKind::UniqueConstraint
+            | ObjectKind::CheckConstraint
             | ObjectKind::Index
             | ObjectKind::MaterializedView
             | ObjectKind::ViewColumn
@@ -271,7 +273,8 @@ fn require_metadata_parent_kind(
         | ObjectKind::Domain
         | ObjectKind::Synonym
         | ObjectKind::Package => &[ObjectKind::Schema],
-        ObjectKind::CheckConstraint => &[ObjectKind::Domain],
+        ObjectKind::PrimaryKey | ObjectKind::UniqueConstraint => &[ObjectKind::MaterializedView],
+        ObjectKind::CheckConstraint => &[ObjectKind::Domain, ObjectKind::MaterializedView],
         ObjectKind::Index => &[ObjectKind::MaterializedView],
         ObjectKind::Event => &[ObjectKind::Database, ObjectKind::Schema],
         ObjectKind::RoutineParameter => &[ObjectKind::Routine],
@@ -545,6 +548,49 @@ mod tests {
             definition: None,
             properties: BTreeMap::from([("cache".to_owned(), MetadataValue::Unsigned(1))]),
         });
+
+        assert!(validate_canonical_schema_snapshot(&snapshot).is_ok());
+    }
+
+    #[test]
+    fn accepts_materialized_view_check_constraints() {
+        let mut snapshot = canonical_snapshot();
+        let schema_key = key(ObjectKind::Schema, "main", None);
+        let materialized_view_key = key(ObjectKind::MaterializedView, "account_rollup", None);
+        snapshot.metadata.objects.extend([
+            MetadataObject {
+                key: materialized_view_key.clone(),
+                parent_key: Some(schema_key),
+                name: "account_rollup".to_owned(),
+                extension_kind: None,
+                definition: Some("SELECT id FROM accounts".to_owned()),
+                properties: BTreeMap::new(),
+            },
+            MetadataObject {
+                key: key(
+                    ObjectKind::PrimaryKey,
+                    "account_rollup",
+                    Some("PK_ACCOUNT_ROLLUP"),
+                ),
+                parent_key: Some(materialized_view_key.clone()),
+                name: "PK_ACCOUNT_ROLLUP".to_owned(),
+                extension_kind: None,
+                definition: None,
+                properties: BTreeMap::new(),
+            },
+            MetadataObject {
+                key: key(
+                    ObjectKind::CheckConstraint,
+                    "account_rollup",
+                    Some("SYS_C000001"),
+                ),
+                parent_key: Some(materialized_view_key),
+                name: "SYS_C000001".to_owned(),
+                extension_kind: None,
+                definition: Some("id IS NOT NULL".to_owned()),
+                properties: BTreeMap::new(),
+            },
+        ]);
 
         assert!(validate_canonical_schema_snapshot(&snapshot).is_ok());
     }

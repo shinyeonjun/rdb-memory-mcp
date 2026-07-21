@@ -798,6 +798,30 @@ struct RawView {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct RawMaterializedView {
+    owner: String,
+    name: String,
+    container_name: String,
+    query_length: Option<i64>,
+    definition: Option<String>,
+    updatable: Option<String>,
+    master_link: Option<String>,
+    rewrite_enabled: Option<String>,
+    rewrite_capability: Option<String>,
+    refresh_mode: Option<String>,
+    refresh_method: Option<String>,
+    build_mode: Option<String>,
+    fast_refreshable: Option<String>,
+    compile_state: Option<String>,
+    use_no_index: Option<String>,
+    segment_created: Option<String>,
+    default_collation: Option<String>,
+    on_query_computation: Option<String>,
+    automatic: Option<String>,
+    concurrent_refresh: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RawConstraintColumn {
     name: String,
     position: Option<i64>,
@@ -872,6 +896,7 @@ struct RawOracleCatalog {
     identity_columns: Vec<RawIdentityColumn>,
     views: Vec<RawView>,
     view_columns: Vec<RawColumn>,
+    materialized_views: Vec<RawMaterializedView>,
     constraints: Vec<RawConstraint>,
     indexes: Vec<RawIndex>,
     dependencies: Vec<RawDependency>,
@@ -899,6 +924,8 @@ impl RawOracleCatalog {
             .map_err(|error| error.catalog_context("view"))?;
         let view_columns = read_view_columns(connection, scope, deadline)
             .map_err(|error| error.catalog_context("view-column"))?;
+        let materialized_views = read_materialized_views(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("materialized-view"))?;
         let mut constraints = read_constraints(connection, scope, &recycle, deadline)
             .map_err(|error| error.catalog_context("constraint"))?;
         attach_constraint_columns(connection, scope, &mut constraints, deadline)
@@ -920,6 +947,7 @@ impl RawOracleCatalog {
             identity_columns,
             views,
             view_columns,
+            materialized_views,
             constraints,
             indexes,
             dependencies,
@@ -1695,6 +1723,125 @@ fn read_views(
     Ok(views)
 }
 
+fn read_materialized_views(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawMaterializedView>, CatalogError> {
+    type MaterializedViewTuple = (
+        String,
+        String,
+        String,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let mut materialized_views = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let view = match scope.mode {
+            DictionaryScopeMode::User => "USER_MVIEWS",
+            DictionaryScopeMode::Dba => "DBA_MVIEWS",
+        };
+        let sql = format!(
+            "
+            SELECT OWNER,
+                   MVIEW_NAME,
+                   CONTAINER_NAME,
+                   QUERY_LEN,
+                   QUERY,
+                   UPDATABLE,
+                   MASTER_LINK,
+                   REWRITE_ENABLED,
+                   REWRITE_CAPABILITY,
+                   REFRESH_MODE,
+                   REFRESH_METHOD,
+                   BUILD_MODE,
+                   FAST_REFRESHABLE,
+                   COMPILE_STATE,
+                   USE_NO_INDEX,
+                   SEGMENT_CREATED,
+                   DEFAULT_COLLATION,
+                   ON_QUERY_COMPUTATION,
+                   AUTO,
+                   CONCURRENT_REFRESH_ENABLED
+            FROM {view}
+            WHERE OWNER = :1
+            ORDER BY OWNER, MVIEW_NAME
+            "
+        );
+        let rows = connection.query_as::<MaterializedViewTuple>(&sql, &[owner])?;
+        for row in rows {
+            let (
+                owner,
+                name,
+                container_name,
+                query_length,
+                definition,
+                updatable,
+                master_link,
+                rewrite_enabled,
+                rewrite_capability,
+                refresh_mode,
+                refresh_method,
+                build_mode,
+                fast_refreshable,
+                compile_state,
+                use_no_index,
+                segment_created,
+                default_collation,
+                on_query_computation,
+                automatic,
+                concurrent_refresh,
+            ) = row?;
+            if query_length.is_some_and(|length| length > MAX_DEFINITION_BYTES as i64) {
+                return Err(CatalogError::UnsupportedMetadata(format!(
+                    "Oracle materialized-view definition exceeds the {MAX_DEFINITION_BYTES}-byte safety limit for {owner}.{name}"
+                )));
+            }
+            materialized_views.push(RawMaterializedView {
+                owner,
+                name,
+                container_name,
+                query_length,
+                definition: normalize_definition(definition)?,
+                updatable,
+                master_link,
+                rewrite_enabled,
+                rewrite_capability,
+                refresh_mode,
+                refresh_method,
+                build_mode,
+                fast_refreshable,
+                compile_state,
+                use_no_index,
+                segment_created,
+                default_collation,
+                on_query_computation,
+                automatic,
+                concurrent_refresh,
+            });
+        }
+    }
+    materialized_views
+        .sort_by(|left, right| (&left.owner, &left.name).cmp(&(&right.owner, &right.name)));
+    Ok(materialized_views)
+}
+
 fn read_view_columns(
     connection: &Connection,
     scope: &DictionaryScope,
@@ -2418,7 +2565,7 @@ fn validate_raw_catalog(
         .filter(|object| {
             !matches!(
                 object.object_type.as_str(),
-                "TABLE" | "INDEX" | "SEQUENCE" | "VIEW"
+                "TABLE" | "INDEX" | "SEQUENCE" | "VIEW" | "MATERIALIZED VIEW"
             )
         })
         .take(8)
@@ -2682,6 +2829,73 @@ fn validate_raw_catalog(
         )));
     }
 
+    let mut materialized_views = BTreeSet::new();
+    for view in &raw.materialized_views {
+        ensure_owner(scope, &view.owner, "materialized view")?;
+        if !materialized_views.insert((view.owner.clone(), view.name.clone())) {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle materialized view {}.{}",
+                view.owner, view.name
+            )));
+        }
+        if view.definition.is_none() {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle materialized view {}.{} has no complete definition",
+                view.owner, view.name
+            )));
+        }
+        if view.master_link.is_some() {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle materialized view {}.{} uses remote master link '{}'",
+                view.owner,
+                view.name,
+                view.master_link.as_deref().unwrap_or_default()
+            )));
+        }
+        if view.compile_state.as_deref() != Some("VALID") {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle materialized view {}.{} has compile state '{}'",
+                view.owner,
+                view.name,
+                view.compile_state.as_deref().unwrap_or("missing")
+            )));
+        }
+        if view.container_name != view.name {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle materialized view {}.{} uses non-default container table '{}'",
+                view.owner, view.name, view.container_name
+            )));
+        }
+        if !tables.contains(&(view.owner.clone(), view.container_name.clone())) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle materialized view {}.{} has no storage table {}.{}",
+                view.owner, view.name, view.owner, view.container_name
+            )));
+        }
+        for object_type in ["MATERIALIZED VIEW", "TABLE"] {
+            if !inventory_keys.contains(&(
+                view.owner.clone(),
+                object_type.to_owned(),
+                view.name.clone(),
+            )) {
+                return Err(CatalogError::Mapping(format!(
+                    "Oracle materialized view {}.{} is missing its {object_type} inventory row",
+                    view.owner, view.name
+                )));
+            }
+        }
+    }
+    let inventory_mview_count = inventory
+        .iter()
+        .filter(|object| object.object_type == "MATERIALIZED VIEW")
+        .count();
+    if inventory_mview_count != raw.materialized_views.len() {
+        return Err(CatalogError::Mapping(format!(
+            "Oracle materialized-view inventory mismatch: USER/DBA_OBJECTS reports {inventory_mview_count}, USER/DBA_MVIEWS reports {}",
+            raw.materialized_views.len()
+        )));
+    }
+
     let mut view_column_keys = BTreeSet::new();
     let mut view_column_ordinals = BTreeSet::new();
     for column in &raw.view_columns {
@@ -2725,18 +2939,24 @@ fn validate_raw_catalog(
                 dependency.referenced_link.as_deref().unwrap_or_default()
             )));
         }
-        if dependency.object_type != "VIEW"
-            || !views.contains(&(dependency.owner.clone(), dependency.name.clone()))
-        {
+        let source_is_view = dependency.object_type == "VIEW"
+            && views.contains(&(dependency.owner.clone(), dependency.name.clone()));
+        let source_is_mview = dependency.object_type == "MATERIALIZED VIEW"
+            && materialized_views.contains(&(dependency.owner.clone(), dependency.name.clone()));
+        if !source_is_view && !source_is_mview {
             return Err(CatalogError::UnsupportedMetadata(format!(
                 "Oracle dependency source is not yet covered: {}.{} ({})",
                 dependency.owner, dependency.name, dependency.object_type
             )));
         }
-        if dependency.dependency_type != "HARD" {
+        let expected_dependency_type = if source_is_view { "HARD" } else { "REF" };
+        if dependency.dependency_type != expected_dependency_type {
             return Err(CatalogError::UnsupportedMetadata(format!(
-                "Oracle dependency type '{}' is not covered for {}.{}",
-                dependency.dependency_type, dependency.owner, dependency.name
+                "Oracle dependency type '{}' is not covered for {}.{}; expected '{}'",
+                dependency.dependency_type,
+                dependency.owner,
+                dependency.name,
+                expected_dependency_type
             )));
         }
         ensure_owner(scope, &dependency.referenced_owner, "dependency target")?;
@@ -2749,12 +2969,36 @@ fn validate_raw_catalog(
                 dependency.referenced_owner.clone(),
                 dependency.referenced_name.clone(),
             )),
+            "MATERIALIZED VIEW" => materialized_views.contains(&(
+                dependency.referenced_owner.clone(),
+                dependency.referenced_name.clone(),
+            )),
             _ => false,
         };
         if !target_exists {
             return Err(CatalogError::UnsupportedMetadata(format!(
                 "Oracle dependency target is outside the covered object set: {}.{} ({})",
                 dependency.referenced_owner, dependency.referenced_name, dependency.referenced_type
+            )));
+        }
+    }
+    for view in &raw.materialized_views {
+        let storage_dependency_count = raw
+            .dependencies
+            .iter()
+            .filter(|dependency| {
+                dependency.object_type == "MATERIALIZED VIEW"
+                    && dependency.owner == view.owner
+                    && dependency.name == view.name
+                    && dependency.referenced_type == "TABLE"
+                    && dependency.referenced_owner == view.owner
+                    && dependency.referenced_name == view.container_name
+            })
+            .count();
+        if storage_dependency_count != 1 {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle materialized view {}.{} has {storage_dependency_count} storage-table dependency rows; expected exactly one",
+                view.owner, view.name
             )));
         }
     }
@@ -2771,6 +3015,14 @@ fn validate_raw_catalog(
         if !matches!(constraint.constraint_type.as_str(), "P" | "U" | "R" | "C") {
             return Err(CatalogError::UnsupportedMetadata(format!(
                 "Oracle constraint type '{}' is not covered for {}.{}",
+                constraint.constraint_type, constraint.owner, constraint.name
+            )));
+        }
+        if materialized_views.contains(&(constraint.owner.clone(), constraint.table.clone()))
+            && !matches!(constraint.constraint_type.as_str(), "P" | "U" | "C")
+        {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle materialized-view constraint type '{}' is not covered for {}.{}",
                 constraint.constraint_type, constraint.owner, constraint.name
             )));
         }
@@ -3116,9 +3368,148 @@ impl<'a> OracleSnapshotMapper<'a> {
             });
         }
 
+        let materialized_view_names = raw
+            .materialized_views
+            .iter()
+            .map(|view| (view.owner.clone(), view.name.clone()))
+            .collect::<BTreeSet<_>>();
+        let mut materialized_view_keys = BTreeMap::new();
+        for view in &raw.materialized_views {
+            let schema_key = required(
+                schema_keys.get(&view.owner),
+                format!(
+                    "schema key for Oracle materialized view {}.{}",
+                    view.owner, view.name
+                ),
+            )?;
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &view.owner,
+                ObjectKind::MaterializedView,
+                &view.name,
+                None,
+            );
+            materialized_view_keys.insert((view.owner.clone(), view.name.clone()), key.clone());
+            let inventory_object = required(
+                inventory.get(&(
+                    view.owner.clone(),
+                    "MATERIALIZED VIEW".to_owned(),
+                    view.name.clone(),
+                )),
+                format!(
+                    "inventory row for Oracle materialized view {}.{}",
+                    view.owner, view.name
+                ),
+            )?;
+            let mut properties = inventory_properties(inventory_object);
+            let storage_object = required(
+                inventory.get(&(
+                    view.owner.clone(),
+                    "TABLE".to_owned(),
+                    view.container_name.clone(),
+                )),
+                format!(
+                    "storage inventory row for Oracle materialized view {}.{}",
+                    view.owner, view.name
+                ),
+            )?;
+            insert_i64(
+                &mut properties,
+                "storage_object_id",
+                storage_object.object_id,
+            );
+            insert_optional_i64(
+                &mut properties,
+                "storage_data_object_id",
+                storage_object.data_object_id,
+            );
+            insert_string(
+                &mut properties,
+                "storage_object_status",
+                &storage_object.status,
+            );
+            insert_bool(
+                &mut properties,
+                "storage_generated",
+                storage_object.generated,
+            );
+            insert_string(&mut properties, "container_name", &view.container_name);
+            insert_optional_i64(&mut properties, "query_length", view.query_length);
+            insert_optional_string(&mut properties, "updatable", view.updatable.as_deref());
+            insert_optional_string(
+                &mut properties,
+                "rewrite_enabled",
+                view.rewrite_enabled.as_deref(),
+            );
+            insert_optional_string(
+                &mut properties,
+                "rewrite_capability",
+                view.rewrite_capability.as_deref(),
+            );
+            insert_optional_string(
+                &mut properties,
+                "refresh_mode",
+                view.refresh_mode.as_deref(),
+            );
+            insert_optional_string(
+                &mut properties,
+                "refresh_method",
+                view.refresh_method.as_deref(),
+            );
+            insert_optional_string(&mut properties, "build_mode", view.build_mode.as_deref());
+            insert_optional_string(
+                &mut properties,
+                "fast_refreshable",
+                view.fast_refreshable.as_deref(),
+            );
+            insert_optional_string(
+                &mut properties,
+                "compile_state",
+                view.compile_state.as_deref(),
+            );
+            insert_optional_string(
+                &mut properties,
+                "use_no_index",
+                view.use_no_index.as_deref(),
+            );
+            insert_optional_string(
+                &mut properties,
+                "segment_created",
+                view.segment_created.as_deref(),
+            );
+            insert_optional_string(
+                &mut properties,
+                "default_collation",
+                view.default_collation.as_deref(),
+            );
+            insert_optional_string(
+                &mut properties,
+                "on_query_computation",
+                view.on_query_computation.as_deref(),
+            );
+            insert_optional_string(&mut properties, "automatic", view.automatic.as_deref());
+            insert_optional_string(
+                &mut properties,
+                "concurrent_refresh",
+                view.concurrent_refresh.as_deref(),
+            );
+            metadata.objects.push(MetadataObject {
+                key,
+                parent_key: Some(schema_key.clone()),
+                name: view.name.clone(),
+                extension_kind: None,
+                definition: view.definition.clone(),
+                properties,
+            });
+        }
+
         let mut tables = Vec::new();
         let mut table_keys = BTreeMap::new();
         for table in &raw.tables {
+            if materialized_view_names.contains(&(table.owner.clone(), table.name.clone())) {
+                continue;
+            }
             let schema_key = required(
                 schema_keys.get(&table.owner),
                 format!("schema key for Oracle table {}.{}", table.owner, table.name),
@@ -3275,7 +3666,67 @@ impl<'a> OracleSnapshotMapper<'a> {
             });
         }
 
+        let mut materialized_view_column_keys = BTreeMap::new();
+        for column in raw.columns.iter().filter(|column| {
+            materialized_view_names.contains(&(column.owner.clone(), column.table.clone()))
+        }) {
+            let view_key = required(
+                materialized_view_keys.get(&(column.owner.clone(), column.table.clone())),
+                format!(
+                    "materialized-view key for Oracle output column {}.{}.{}",
+                    column.owner, column.table, column.name
+                ),
+            )?;
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &column.owner,
+                ObjectKind::ViewColumn,
+                &column.table,
+                Some(column.name.clone()),
+            );
+            materialized_view_column_keys.insert(
+                (
+                    column.owner.clone(),
+                    column.table.clone(),
+                    column.name.clone(),
+                ),
+                key.clone(),
+            );
+            let mut properties = oracle_column_properties(column);
+            insert_i64(
+                &mut properties,
+                "ordinal_position",
+                i64::from(positive_u32(
+                    column.internal_column_id,
+                    "Oracle materialized-view column ordinal",
+                )?),
+            );
+            insert_string(
+                &mut properties,
+                "data_type",
+                format_oracle_data_type(column),
+            );
+            insert_bool(&mut properties, "nullable", column.nullable);
+            insert_optional_string(
+                &mut properties,
+                "default_value",
+                column.default_value.as_deref(),
+            );
+            metadata.objects.push(MetadataObject {
+                key,
+                parent_key: Some(view_key.clone()),
+                name: column.name.clone(),
+                extension_kind: None,
+                definition: None,
+                properties,
+            });
+        }
+
         for dependency in &raw.dependencies {
+            if dependency.object_type != "VIEW" {
+                continue;
+            }
             let source_position = required(
                 view_positions.get(&(dependency.owner.clone(), dependency.name.clone())),
                 format!(
@@ -3284,16 +3735,22 @@ impl<'a> OracleSnapshotMapper<'a> {
                 ),
             )?;
             let target_key = match dependency.referenced_type.as_str() {
-                "TABLE" => required(
-                    table_keys.get(&(
-                        dependency.referenced_owner.clone(),
-                        dependency.referenced_name.clone(),
-                    )),
-                    format!(
-                        "table target for Oracle view dependency {}.{}",
-                        dependency.referenced_owner, dependency.referenced_name
-                    ),
-                )?,
+                "TABLE" => match materialized_view_keys.get(&(
+                    dependency.referenced_owner.clone(),
+                    dependency.referenced_name.clone(),
+                )) {
+                    Some(key) => key,
+                    None => required(
+                        table_keys.get(&(
+                            dependency.referenced_owner.clone(),
+                            dependency.referenced_name.clone(),
+                        )),
+                        format!(
+                            "table target for Oracle view dependency {}.{}",
+                            dependency.referenced_owner, dependency.referenced_name
+                        ),
+                    )?,
+                },
                 "VIEW" => required(
                     view_keys.get(&(
                         dependency.referenced_owner.clone(),
@@ -3304,6 +3761,16 @@ impl<'a> OracleSnapshotMapper<'a> {
                         dependency.referenced_owner, dependency.referenced_name
                     ),
                 )?,
+                "MATERIALIZED VIEW" => required(
+                    materialized_view_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )),
+                    format!(
+                        "materialized-view target for Oracle view dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
                 other => {
                     return Err(CatalogError::Mapping(format!(
                         "unmapped Oracle view dependency target type '{other}'"
@@ -3311,6 +3778,91 @@ impl<'a> OracleSnapshotMapper<'a> {
                 }
             };
             views[*source_position].depends_on.push(target_key.clone());
+        }
+
+        for dependency in raw
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.object_type == "MATERIALIZED VIEW")
+        {
+            if dependency.referenced_type == "TABLE"
+                && dependency.owner == dependency.referenced_owner
+                && dependency.name == dependency.referenced_name
+            {
+                continue;
+            }
+            let source_key = required(
+                materialized_view_keys.get(&(dependency.owner.clone(), dependency.name.clone())),
+                format!(
+                    "source key for Oracle materialized-view dependency {}.{}",
+                    dependency.owner, dependency.name
+                ),
+            )?;
+            let (target_key, relationship_kind) = match dependency.referenced_type.as_str() {
+                "TABLE" => match materialized_view_keys.get(&(
+                    dependency.referenced_owner.clone(),
+                    dependency.referenced_name.clone(),
+                )) {
+                    Some(key) => (key, MetadataRelationshipKind::DependsOn),
+                    None => (
+                        required(
+                            table_keys.get(&(
+                                dependency.referenced_owner.clone(),
+                                dependency.referenced_name.clone(),
+                            )),
+                            format!(
+                                "table target for Oracle materialized-view dependency {}.{}",
+                                dependency.referenced_owner, dependency.referenced_name
+                            ),
+                        )?,
+                        MetadataRelationshipKind::Materializes,
+                    ),
+                },
+                "VIEW" => (
+                    required(
+                        view_keys.get(&(
+                            dependency.referenced_owner.clone(),
+                            dependency.referenced_name.clone(),
+                        )),
+                        format!(
+                            "view target for Oracle materialized-view dependency {}.{}",
+                            dependency.referenced_owner, dependency.referenced_name
+                        ),
+                    )?,
+                    MetadataRelationshipKind::Materializes,
+                ),
+                "MATERIALIZED VIEW" => (
+                    required(
+                        materialized_view_keys.get(&(
+                            dependency.referenced_owner.clone(),
+                            dependency.referenced_name.clone(),
+                        )),
+                        format!(
+                            "materialized-view target for Oracle dependency {}.{}",
+                            dependency.referenced_owner, dependency.referenced_name
+                        ),
+                    )?,
+                    MetadataRelationshipKind::DependsOn,
+                ),
+                other => {
+                    return Err(CatalogError::Mapping(format!(
+                        "unmapped Oracle materialized-view dependency target type '{other}'"
+                    )));
+                }
+            };
+            let mut properties = BTreeMap::new();
+            insert_string(
+                &mut properties,
+                "oracle_dependency_type",
+                &dependency.dependency_type,
+            );
+            metadata.relationships.push(MetadataRelationship {
+                kind: relationship_kind,
+                from_key: source_key.clone(),
+                to_key: target_key.clone(),
+                ordinal: None,
+                properties,
+            });
         }
 
         let identities = raw
@@ -3330,6 +3882,9 @@ impl<'a> OracleSnapshotMapper<'a> {
         let mut columns = Vec::new();
         let mut column_keys = BTreeMap::new();
         for column in &raw.columns {
+            if materialized_view_names.contains(&(column.owner.clone(), column.table.clone())) {
+                continue;
+            }
             let table_key = required(
                 table_keys.get(&(column.owner.clone(), column.table.clone())),
                 format!(
@@ -3430,6 +3985,67 @@ impl<'a> OracleSnapshotMapper<'a> {
             .collect::<BTreeMap<_, _>>();
         let mut constraints = Vec::new();
         for constraint in &raw.constraints {
+            if let Some(materialized_view_key) =
+                materialized_view_keys.get(&(constraint.owner.clone(), constraint.table.clone()))
+            {
+                let object_kind = match constraint.constraint_type.as_str() {
+                    "P" => ObjectKind::PrimaryKey,
+                    "U" => ObjectKind::UniqueConstraint,
+                    "C" => ObjectKind::CheckConstraint,
+                    other => {
+                        return Err(CatalogError::Mapping(format!(
+                            "unmapped Oracle materialized-view constraint type '{other}'"
+                        )));
+                    }
+                };
+                let key = oracle_key(
+                    self.connection_alias,
+                    &database_name,
+                    &constraint.owner,
+                    object_kind,
+                    &constraint.table,
+                    Some(constraint.name.clone()),
+                );
+                metadata.objects.push(MetadataObject {
+                    key: key.clone(),
+                    parent_key: Some(materialized_view_key.clone()),
+                    name: constraint.name.clone(),
+                    extension_kind: None,
+                    definition: constraint.search_condition.clone(),
+                    properties: constraint_properties(constraint),
+                });
+                for column in &constraint.columns {
+                    let column_key = required(
+                        materialized_view_column_keys.get(&(
+                            constraint.owner.clone(),
+                            constraint.table.clone(),
+                            column.name.clone(),
+                        )),
+                        format!(
+                            "column {} for Oracle materialized-view constraint {}.{}",
+                            column.name, constraint.owner, constraint.name
+                        ),
+                    )?;
+                    metadata.relationships.push(MetadataRelationship {
+                        kind: MetadataRelationshipKind::Extension(
+                            "oracle_constraint_column".to_owned(),
+                        ),
+                        from_key: key.clone(),
+                        to_key: column_key.clone(),
+                        ordinal: column
+                            .position
+                            .map(|position| {
+                                positive_u32(
+                                    position,
+                                    "Oracle materialized-view constraint ordinal",
+                                )
+                            })
+                            .transpose()?,
+                        properties: BTreeMap::new(),
+                    });
+                }
+                continue;
+            }
             let table_key = required(
                 table_keys.get(&(constraint.owner.clone(), constraint.table.clone())),
                 format!(
@@ -3536,6 +4152,61 @@ impl<'a> OracleSnapshotMapper<'a> {
             .collect::<BTreeSet<_>>();
         let mut indexes = Vec::new();
         for index in &raw.indexes {
+            let inventory_object = required(
+                inventory.get(&(index.owner.clone(), "INDEX".to_owned(), index.name.clone())),
+                format!(
+                    "inventory row for Oracle index {}.{}",
+                    index.owner, index.name
+                ),
+            )?;
+            let properties = oracle_index_properties(index, inventory_object);
+            if let Some(materialized_view_key) =
+                materialized_view_keys.get(&(index.table_owner.clone(), index.table.clone()))
+            {
+                let key = oracle_key(
+                    self.connection_alias,
+                    &database_name,
+                    &index.table_owner,
+                    ObjectKind::Index,
+                    &index.table,
+                    Some(index.name.clone()),
+                );
+                metadata.objects.push(MetadataObject {
+                    key: key.clone(),
+                    parent_key: Some(materialized_view_key.clone()),
+                    name: index.name.clone(),
+                    extension_kind: None,
+                    definition: None,
+                    properties,
+                });
+                for column in &index.columns {
+                    let column_key = required(
+                        materialized_view_column_keys.get(&(
+                            index.table_owner.clone(),
+                            index.table.clone(),
+                            column.name.clone(),
+                        )),
+                        format!(
+                            "column {} for Oracle materialized-view index {}.{}",
+                            column.name, index.owner, index.name
+                        ),
+                    )?;
+                    metadata.relationships.push(MetadataRelationship {
+                        kind: MetadataRelationshipKind::IncludesColumn,
+                        from_key: key.clone(),
+                        to_key: column_key.clone(),
+                        ordinal: Some(positive_u32(
+                            column.position,
+                            "Oracle materialized-view index ordinal",
+                        )?),
+                        properties: BTreeMap::from([(
+                            "descending".to_owned(),
+                            MetadataValue::Boolean(column.descending),
+                        )]),
+                    });
+                }
+                continue;
+            }
             let table_key = required(
                 table_keys.get(&(index.table_owner.clone(), index.table.clone())),
                 format!("table key for Oracle index {}.{}", index.owner, index.name),
@@ -3565,36 +4236,6 @@ impl<'a> OracleSnapshotMapper<'a> {
                 predicate: None,
                 expression: None,
             });
-            let inventory_object = required(
-                inventory.get(&(index.owner.clone(), "INDEX".to_owned(), index.name.clone())),
-                format!(
-                    "inventory row for Oracle index {}.{}",
-                    index.owner, index.name
-                ),
-            )?;
-            let mut properties = inventory_properties(inventory_object);
-            insert_string(&mut properties, "index_type", &index.index_type);
-            insert_string(&mut properties, "index_status", &index.status);
-            insert_bool(&mut properties, "temporary", index.temporary);
-            insert_bool(&mut properties, "generated", index.generated);
-            insert_string(&mut properties, "visibility", &index.visibility);
-            insert_optional_string(
-                &mut properties,
-                "function_status",
-                index.function_status.as_deref(),
-            );
-            insert_bool(&mut properties, "constraint_index", index.constraint_index);
-            properties.insert(
-                "descending_columns".to_owned(),
-                MetadataValue::StringList(
-                    index
-                        .columns
-                        .iter()
-                        .filter(|column| column.descending)
-                        .map(|column| column.name.clone())
-                        .collect(),
-                ),
-            );
             metadata.annotations.push(ObjectAnnotation {
                 object_key: key,
                 definition: None,
@@ -3669,7 +4310,7 @@ impl<'a> OracleSnapshotMapper<'a> {
                 CapabilityCheck {
                     name: "independent_inventory_reconciliation".to_owned(),
                     evidence: format!(
-                        "{} non-secondary USER/DBA_OBJECTS rows reconciled against table and index detail catalogs",
+                        "{} non-secondary USER/DBA_OBJECTS rows reconciled against table, index, sequence, view, and materialized-view detail catalogs",
                         raw.inventory.iter().filter(|object| !object.secondary).count()
                     ),
                 },
@@ -3798,6 +4439,36 @@ fn oracle_column_properties(column: &RawColumn) -> BTreeMap<String, MetadataValu
     properties
 }
 
+fn oracle_index_properties(
+    index: &RawIndex,
+    inventory_object: &RawInventoryObject,
+) -> BTreeMap<String, MetadataValue> {
+    let mut properties = inventory_properties(inventory_object);
+    insert_string(&mut properties, "index_type", &index.index_type);
+    insert_string(&mut properties, "index_status", &index.status);
+    insert_bool(&mut properties, "temporary", index.temporary);
+    insert_bool(&mut properties, "generated", index.generated);
+    insert_string(&mut properties, "visibility", &index.visibility);
+    insert_optional_string(
+        &mut properties,
+        "function_status",
+        index.function_status.as_deref(),
+    );
+    insert_bool(&mut properties, "constraint_index", index.constraint_index);
+    properties.insert(
+        "descending_columns".to_owned(),
+        MetadataValue::StringList(
+            index
+                .columns
+                .iter()
+                .filter(|column| column.descending)
+                .map(|column| column.name.clone())
+                .collect(),
+        ),
+    );
+    properties
+}
+
 fn constraint_properties(constraint: &RawConstraint) -> BTreeMap<String, MetadataValue> {
     let mut properties = BTreeMap::new();
     insert_string(&mut properties, "status", &constraint.status);
@@ -3914,18 +4585,70 @@ fn discovery_counts_from_catalog(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let materialized_view_names = raw
+        .materialized_views
+        .iter()
+        .map(|view| (view.owner.as_str(), view.name.as_str()))
+        .collect::<BTreeSet<_>>();
+    let base_table_count = raw
+        .tables
+        .iter()
+        .filter(|table| {
+            !materialized_view_names.contains(&(table.owner.as_str(), table.name.as_str()))
+        })
+        .count();
+    let base_column_count = raw
+        .columns
+        .iter()
+        .filter(|column| {
+            !materialized_view_names.contains(&(column.owner.as_str(), column.table.as_str()))
+        })
+        .count();
+    let materialized_view_column_count = raw.columns.len() - base_column_count;
+    let base_constraint_count = raw
+        .constraints
+        .iter()
+        .filter(|constraint| {
+            !materialized_view_names
+                .contains(&(constraint.owner.as_str(), constraint.table.as_str()))
+        })
+        .count();
+    let materialized_view_constraint_count = raw.constraints.len() - base_constraint_count;
+    let base_index_count = raw
+        .indexes
+        .iter()
+        .filter(|index| {
+            !materialized_view_names.contains(&(index.table_owner.as_str(), index.table.as_str()))
+        })
+        .count();
+    let materialized_view_index_count = raw.indexes.len() - base_index_count;
+    let materialized_view_dependency_count = raw
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.object_type == "MATERIALIZED VIEW")
+        .filter(|dependency| {
+            !(dependency.referenced_type == "TABLE"
+                && dependency.owner == dependency.referenced_owner
+                && dependency.name == dependency.referenced_name)
+        })
+        .count();
 
     set_object_count(&mut objects, ObjectCategory::Database, 1);
     set_object_count(&mut objects, ObjectCategory::Schema, scope.owners.len());
-    set_object_count(&mut objects, ObjectCategory::Table, raw.tables.len());
-    set_object_count(&mut objects, ObjectCategory::Column, raw.columns.len());
+    set_object_count(&mut objects, ObjectCategory::Table, base_table_count);
+    set_object_count(&mut objects, ObjectCategory::Column, base_column_count);
     set_object_count(&mut objects, ObjectCategory::Index, raw.indexes.len());
     set_object_count(&mut objects, ObjectCategory::Sequence, raw.sequences.len());
     set_object_count(&mut objects, ObjectCategory::View, raw.views.len());
     set_object_count(
         &mut objects,
         ObjectCategory::ViewColumn,
-        raw.view_columns.len(),
+        raw.view_columns.len() + materialized_view_column_count,
+    );
+    set_object_count(
+        &mut objects,
+        ObjectCategory::MaterializedView,
+        raw.materialized_views.len(),
     );
     set_object_count(
         &mut objects,
@@ -3951,23 +4674,27 @@ fn discovery_counts_from_catalog(
     set_relationship_count(
         &mut relationships,
         RelationshipCategory::SchemaHasTable,
-        raw.tables.len(),
+        base_table_count,
     );
     set_relationship_count(
         &mut relationships,
         RelationshipCategory::TableHasColumn,
-        raw.columns.len(),
+        base_column_count,
     );
     set_relationship_count(
         &mut relationships,
         RelationshipCategory::TableHasConstraint,
-        raw.constraints.len(),
+        base_constraint_count,
     );
     set_relationship_count(
         &mut relationships,
         RelationshipCategory::ConstraintColumn,
         raw.constraints
             .iter()
+            .filter(|constraint| {
+                !materialized_view_names
+                    .contains(&(constraint.owner.as_str(), constraint.table.as_str()))
+            })
             .filter(|constraint| constraint.constraint_type != "R")
             .map(|constraint| constraint.columns.len())
             .sum(),
@@ -3977,6 +4704,10 @@ fn discovery_counts_from_catalog(
         RelationshipCategory::ForeignKeyColumnPair,
         raw.constraints
             .iter()
+            .filter(|constraint| {
+                !materialized_view_names
+                    .contains(&(constraint.owner.as_str(), constraint.table.as_str()))
+            })
             .filter(|constraint| constraint.constraint_type == "R")
             .map(|constraint| constraint.columns.len())
             .sum(),
@@ -3984,12 +4715,19 @@ fn discovery_counts_from_catalog(
     set_relationship_count(
         &mut relationships,
         RelationshipCategory::TableHasIndex,
-        raw.indexes.len(),
+        base_index_count,
     );
     set_relationship_count(
         &mut relationships,
         RelationshipCategory::IndexColumn,
-        raw.indexes.iter().map(|index| index.columns.len()).sum(),
+        raw.indexes
+            .iter()
+            .filter(|index| {
+                !materialized_view_names
+                    .contains(&(index.table_owner.as_str(), index.table.as_str()))
+            })
+            .map(|index| index.columns.len())
+            .sum(),
     );
     set_relationship_count(
         &mut relationships,
@@ -3999,17 +4737,45 @@ fn discovery_counts_from_catalog(
     set_relationship_count(
         &mut relationships,
         RelationshipCategory::ViewDependency,
-        raw.dependencies.len(),
+        raw.dependencies
+            .iter()
+            .filter(|dependency| dependency.object_type == "VIEW")
+            .count(),
     );
     set_relationship_count(
         &mut relationships,
         RelationshipCategory::MetadataParent,
-        scope.principals.len() + raw.sequences.len() + raw.view_columns.len(),
+        scope.principals.len()
+            + raw.sequences.len()
+            + raw.view_columns.len()
+            + raw.materialized_views.len()
+            + materialized_view_column_count
+            + materialized_view_constraint_count
+            + materialized_view_index_count,
     );
     set_relationship_count(
         &mut relationships,
         RelationshipCategory::MetadataRelationship,
-        raw.identity_columns.len(),
+        raw.identity_columns.len()
+            + materialized_view_dependency_count
+            + raw
+                .constraints
+                .iter()
+                .filter(|constraint| {
+                    materialized_view_names
+                        .contains(&(constraint.owner.as_str(), constraint.table.as_str()))
+                })
+                .map(|constraint| constraint.columns.len())
+                .sum::<usize>()
+            + raw
+                .indexes
+                .iter()
+                .filter(|index| {
+                    materialized_view_names
+                        .contains(&(index.table_owner.as_str(), index.table.as_str()))
+                })
+                .map(|index| index.columns.len())
+                .sum::<usize>(),
     );
 
     DiscoveryCounts {
@@ -4211,7 +4977,7 @@ mod tests {
             .admin
             .execute(
                 &format!(
-                    "GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW, CREATE MATERIALIZED VIEW TO {}",
+                    "GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW, CREATE MATERIALIZED VIEW, CREATE TRIGGER TO {}",
                     cleanup.username
                 ),
                 &[],
@@ -4310,7 +5076,77 @@ mod tests {
             .expect("reconnect as isolated Oracle test user");
         setup
             .execute(
-                "CREATE MATERIALIZED VIEW UNSUPPORTED_MV BUILD IMMEDIATE REFRESH COMPLETE ON DEMAND AS SELECT ID, CODE FROM PARENT_ENTITY",
+                "CREATE MATERIALIZED VIEW PARENT_SUMMARY_MV BUILD IMMEDIATE REFRESH COMPLETE ON DEMAND AS SELECT ID, CODE FROM PARENT_ENTITY",
+                &[],
+            )
+            .expect("create materialized view");
+        drop(setup);
+
+        let complete = analyze_oracle(&user_url, "oracle-live", Vec::new(), Vec::new(), 30_000);
+        assert_eq!(
+            complete.status(),
+            AnalysisStatus::Complete,
+            "Oracle materialized-view analysis failed: {:?}",
+            complete.failure()
+        );
+        let certified = complete
+            .certified_snapshot()
+            .expect("Oracle materialized-view schema must be certified");
+        assert_eq!(certified.snapshot.schema.tables.len(), 2);
+        assert!(certified
+            .snapshot
+            .schema
+            .tables
+            .iter()
+            .all(|table| table.name != "PARENT_SUMMARY_MV"));
+        let materialized_view = certified
+            .snapshot
+            .metadata
+            .objects
+            .iter()
+            .find(|object| {
+                object.key.object_kind == ObjectKind::MaterializedView
+                    && object.name == "PARENT_SUMMARY_MV"
+            })
+            .expect("materialized view is mapped");
+        assert_eq!(
+            certified
+                .snapshot
+                .metadata
+                .objects
+                .iter()
+                .filter(|object| {
+                    object.key.object_kind == ObjectKind::ViewColumn
+                        && object.parent_key.as_ref() == Some(&materialized_view.key)
+                })
+                .count(),
+            2
+        );
+        assert!(certified.snapshot.metadata.objects.iter().any(|object| {
+            object.key.object_kind == ObjectKind::Index
+                && object.parent_key.as_ref() == Some(&materialized_view.key)
+        }));
+        assert!(certified.snapshot.metadata.objects.iter().any(|object| {
+            object.key.object_kind == ObjectKind::PrimaryKey
+                && object.parent_key.as_ref() == Some(&materialized_view.key)
+        }));
+        assert!(certified
+            .snapshot
+            .metadata
+            .relationships
+            .iter()
+            .any(|relationship| {
+                relationship.kind == MetadataRelationshipKind::Materializes
+                    && relationship.from_key == materialized_view.key
+                    && relationship.to_key.object_kind == ObjectKind::Table
+                    && relationship.to_key.object_name == "PARENT_ENTITY"
+            }));
+
+        let setup = Connection::connect(&cleanup.username, password, &connect_string)
+            .expect("reconnect as isolated Oracle test user");
+        setup
+            .execute(
+                "CREATE OR REPLACE TRIGGER UNSUPPORTED_TRIGGER BEFORE INSERT ON CHILD_ENTITY FOR EACH ROW BEGIN NULL; END;",
                 &[],
             )
             .expect("create fail-closed fixture");
