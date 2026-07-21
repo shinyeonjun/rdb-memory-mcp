@@ -142,9 +142,35 @@ impl GraphStore {
                 ON graph_edges (edge_to);
             CREATE INDEX IF NOT EXISTS idx_graph_edges_type
                 ON graph_edges (edge_type);
+            CREATE INDEX IF NOT EXISTS idx_graph_edges_from_type_key
+                ON graph_edges (snapshot_key, edge_from, edge_type, edge_key);
+            CREATE INDEX IF NOT EXISTS idx_graph_edges_to_type_key
+                ON graph_edges (snapshot_key, edge_to, edge_type, edge_key);
+            CREATE INDEX IF NOT EXISTS idx_graph_edges_type_key
+                ON graph_edges (snapshot_key, edge_type, edge_key);
             ",
         )?;
         Ok(())
+    }
+
+    pub fn with_transaction<T>(
+        &self,
+        operation: impl FnOnce(&Self) -> GraphStoreResult<T>,
+    ) -> GraphStoreResult<T> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match operation(self) {
+            Ok(value) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(value),
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(error.into())
+                }
+            },
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     pub fn insert_snapshot(&self, snapshot: &GraphSnapshotRecord) -> GraphStoreResult<()> {
@@ -378,6 +404,19 @@ impl GraphStore {
             .map_err(GraphStoreError::from)
     }
 
+    pub fn edges_for_snapshot(&self, snapshot_key: &str) -> GraphStoreResult<Vec<GraphEdgeRecord>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT snapshot_key, edge_key, edge_from, edge_to, edge_type, payload_json
+            FROM graph_edges
+            WHERE snapshot_key = ?1
+            ORDER BY edge_key
+            ",
+        )?;
+        let rows = stmt.query_map(params![snapshot_key], map_edge)?;
+        collect_edges(rows)
+    }
+
     pub fn edges_from(
         &self,
         snapshot_key: &str,
@@ -406,12 +445,47 @@ impl GraphStore {
             SELECT snapshot_key, edge_key, edge_from, edge_to, edge_type, payload_json
             FROM graph_edges
             WHERE snapshot_key = ?1 AND edge_from = ?2
-            ORDER BY edge_key
+            ORDER BY
+                CASE
+                    WHEN edge_type IN (
+                        'DATABASE_HAS_SCHEMA',
+                        'SCHEMA_HAS_TABLE',
+                        'SCHEMA_HAS_VIEW',
+                        'SCHEMA_HAS_ROUTINE',
+                        'TABLE_HAS_COLUMN'
+                    ) THEN 2
+                    WHEN edge_type = 'TABLE_HAS_INDEX' THEN 1
+                    ELSE 0
+                END,
+                edge_key
             LIMIT ?3
             ",
         )?;
         let rows = stmt.query_map(
             params![snapshot_key, edge_from, sqlite_limit(limit)],
+            map_edge,
+        )?;
+        collect_edges(rows)
+    }
+
+    pub fn edges_from_by_type_limited(
+        &self,
+        snapshot_key: &str,
+        edge_from: &str,
+        edge_type: &str,
+        limit: usize,
+    ) -> GraphStoreResult<Vec<GraphEdgeRecord>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT snapshot_key, edge_key, edge_from, edge_to, edge_type, payload_json
+            FROM graph_edges
+            WHERE snapshot_key = ?1 AND edge_from = ?2 AND edge_type = ?3
+            ORDER BY edge_key
+            LIMIT ?4
+            ",
+        )?;
+        let rows = stmt.query_map(
+            params![snapshot_key, edge_from, edge_type, sqlite_limit(limit)],
             map_edge,
         )?;
         collect_edges(rows)
@@ -445,12 +519,47 @@ impl GraphStore {
             SELECT snapshot_key, edge_key, edge_from, edge_to, edge_type, payload_json
             FROM graph_edges
             WHERE snapshot_key = ?1 AND edge_to = ?2
-            ORDER BY edge_key
+            ORDER BY
+                CASE
+                    WHEN edge_type IN (
+                        'DATABASE_HAS_SCHEMA',
+                        'SCHEMA_HAS_TABLE',
+                        'SCHEMA_HAS_VIEW',
+                        'SCHEMA_HAS_ROUTINE',
+                        'TABLE_HAS_COLUMN'
+                    ) THEN 2
+                    WHEN edge_type = 'TABLE_HAS_INDEX' THEN 1
+                    ELSE 0
+                END,
+                edge_key
             LIMIT ?3
             ",
         )?;
         let rows = stmt.query_map(
             params![snapshot_key, edge_to, sqlite_limit(limit)],
+            map_edge,
+        )?;
+        collect_edges(rows)
+    }
+
+    pub fn edges_to_by_type_limited(
+        &self,
+        snapshot_key: &str,
+        edge_to: &str,
+        edge_type: &str,
+        limit: usize,
+    ) -> GraphStoreResult<Vec<GraphEdgeRecord>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT snapshot_key, edge_key, edge_from, edge_to, edge_type, payload_json
+            FROM graph_edges
+            WHERE snapshot_key = ?1 AND edge_to = ?2 AND edge_type = ?3
+            ORDER BY edge_key
+            LIMIT ?4
+            ",
+        )?;
+        let rows = stmt.query_map(
+            params![snapshot_key, edge_to, edge_type, sqlite_limit(limit)],
             map_edge,
         )?;
         collect_edges(rows)
@@ -470,6 +579,28 @@ impl GraphStore {
             ",
         )?;
         let rows = stmt.query_map(params![snapshot_key, edge_type], map_edge)?;
+        collect_edges(rows)
+    }
+
+    pub fn edges_by_type_limited(
+        &self,
+        snapshot_key: &str,
+        edge_type: &str,
+        limit: usize,
+    ) -> GraphStoreResult<Vec<GraphEdgeRecord>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT snapshot_key, edge_key, edge_from, edge_to, edge_type, payload_json
+            FROM graph_edges
+            WHERE snapshot_key = ?1 AND edge_type = ?2
+            ORDER BY edge_key
+            LIMIT ?3
+            ",
+        )?;
+        let rows = stmt.query_map(
+            params![snapshot_key, edge_type, sqlite_limit(limit)],
+            map_edge,
+        )?;
         collect_edges(rows)
     }
 

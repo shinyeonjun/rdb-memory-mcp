@@ -664,6 +664,7 @@ fn sqlserver_capabilities() -> AdapterCapabilities {
         triggers: CapabilitySupport::Unsupported,
         routines: CapabilitySupport::Unsupported,
         dependencies: CapabilitySupport::Unsupported,
+        limitations: vec![],
         notes: vec![
             "Reads SQL Server sys catalog metadata only; no user table rows are read.".to_owned(),
             "Level 1 extracts schemas, base tables, columns, primary keys, foreign keys, unique constraints, and indexes.".to_owned(),

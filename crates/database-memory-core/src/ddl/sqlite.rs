@@ -3,6 +3,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::Connection;
 
 use crate::adapters::sqlite::{introspect_sqlite_ddl_connection, SqliteAdapterError};
@@ -68,6 +69,7 @@ pub fn introspect_sqlite_ddl(
         path: PathBuf::from(":memory:"),
         source,
     })?;
+    conn.authorizer(Some(authorize_ddl));
 
     for file in sql_files(path)? {
         let sql = fs::read_to_string(&file).map_err(|source| SqliteDdlSourceError::Io {
@@ -77,8 +79,23 @@ pub fn introspect_sqlite_ddl(
         conn.execute_batch(&sql)
             .map_err(|source| SqliteDdlSourceError::Apply { path: file, source })?;
     }
+    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
     introspect_sqlite_ddl_connection(&conn, connection_alias).map_err(SqliteDdlSourceError::from)
+}
+
+fn authorize_ddl(context: AuthContext<'_>) -> Authorization {
+    match context.action {
+        AuthAction::Attach { .. } | AuthAction::Detach { .. } | AuthAction::Unknown { .. } => {
+            Authorization::Deny
+        }
+        AuthAction::Function { function_name }
+            if function_name.eq_ignore_ascii_case("load_extension") =>
+        {
+            Authorization::Deny
+        }
+        _ => Authorization::Allow,
+    }
 }
 
 fn sql_files(path: &Path) -> SqliteDdlSourceResult<Vec<PathBuf>> {
@@ -179,6 +196,27 @@ mod ddl_source_tests {
 
         let _ = fs::remove_dir_all(dir);
         let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn sqlite_ddl_rejects_external_database_attachment() {
+        let dir = sample_dir("attach-denied");
+        fs::create_dir_all(&dir).unwrap();
+        let attached = dir.join("outside.sqlite");
+        fs::write(
+            dir.join("001_schema.sql"),
+            format!(
+                "ATTACH DATABASE '{}' AS outside; CREATE TABLE outside.users(id INTEGER);",
+                attached.display().to_string().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+
+        let error = introspect_sqlite_ddl(&dir, "app").unwrap_err();
+
+        assert!(matches!(error, SqliteDdlSourceError::Apply { .. }));
+        assert!(!attached.exists());
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn write_migrations(dir: &Path) {

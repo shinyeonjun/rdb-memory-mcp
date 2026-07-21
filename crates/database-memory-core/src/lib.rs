@@ -11,7 +11,7 @@ pub mod redact;
 pub mod relationship_trace;
 pub mod schema_diff;
 
-use std::fmt;
+use std::fmt::{self, Write};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -115,44 +115,109 @@ impl ObjectKey {
 
 impl fmt::Display for ObjectKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}:{}:{}:{}:{}:{}",
-            self.source_kind,
-            self.connection_alias,
-            self.database,
-            self.schema,
-            self.object_kind,
-            self.object_name
-        )?;
+        let object_kind = self.object_kind.to_string();
+        let mut parts = vec![
+            self.source_kind.as_str(),
+            self.connection_alias.as_str(),
+            self.database.as_str(),
+            self.schema.as_str(),
+            object_kind.as_str(),
+            self.object_name.as_str(),
+        ];
+        if let Some(sub_object) = self.sub_object.as_deref() {
+            parts.push(sub_object);
+        }
 
-        if let Some(sub_object) = &self.sub_object {
-            write!(f, ":{sub_object}")?;
+        let versioned = parts
+            .iter()
+            .any(|part| part.contains(':') || part.contains('%'));
+        if versioned {
+            f.write_str("v2:")?;
+        }
+        for (index, part) in parts.into_iter().enumerate() {
+            if index > 0 {
+                f.write_str(":")?;
+            }
+            if versioned {
+                write_object_key_part(f, part)?;
+            } else {
+                f.write_str(part)?;
+            }
         }
 
         Ok(())
     }
 }
 
+fn write_object_key_part(f: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
+    for character in value.chars() {
+        match character {
+            '%' => f.write_str("%25")?,
+            ':' => f.write_str("%3A")?,
+            character => f.write_char(character)?,
+        }
+    }
+    Ok(())
+}
+
 impl FromStr for ObjectKey {
     type Err = ObjectKeyParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let parts = value.split(':').collect::<Vec<_>>();
-        if !(parts.len() == 6 || parts.len() == 7) || parts.iter().any(|part| part.is_empty()) {
-            return Err(ObjectKeyParseError);
+        match value.strip_prefix("v2:") {
+            Some(value) => parse_object_key_parts(value, true),
+            None => parse_object_key_parts(value, false),
         }
-
-        Ok(Self {
-            source_kind: parts[0].to_owned(),
-            connection_alias: parts[1].to_owned(),
-            database: parts[2].to_owned(),
-            schema: parts[3].to_owned(),
-            object_kind: parts[4].parse()?,
-            object_name: parts[5].to_owned(),
-            sub_object: parts.get(6).map(|part| (*part).to_owned()),
-        })
     }
+}
+
+fn parse_object_key_parts(value: &str, encoded: bool) -> Result<ObjectKey, ObjectKeyParseError> {
+    let raw_parts = value.split(':').collect::<Vec<_>>();
+    if !(raw_parts.len() == 6 || raw_parts.len() == 7)
+        || raw_parts.iter().any(|part| part.is_empty())
+    {
+        return Err(ObjectKeyParseError);
+    }
+    let parts = raw_parts
+        .into_iter()
+        .map(|part| {
+            if encoded {
+                decode_object_key_part(part)
+            } else {
+                Ok(part.to_owned())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if parts.iter().any(String::is_empty) {
+        return Err(ObjectKeyParseError);
+    }
+
+    Ok(ObjectKey {
+        source_kind: parts[0].clone(),
+        connection_alias: parts[1].clone(),
+        database: parts[2].clone(),
+        schema: parts[3].clone(),
+        object_kind: parts[4].parse()?,
+        object_name: parts[5].clone(),
+        sub_object: parts.get(6).cloned(),
+    })
+}
+
+fn decode_object_key_part(value: &str) -> Result<String, ObjectKeyParseError> {
+    let mut decoded = String::with_capacity(value.len());
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            decoded.push(character);
+            continue;
+        }
+        match (characters.next(), characters.next()) {
+            (Some('2'), Some('5')) => decoded.push('%'),
+            (Some('3'), Some('A' | 'a')) => decoded.push(':'),
+            _ => return Err(ObjectKeyParseError),
+        }
+    }
+    Ok(decoded)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -348,6 +413,8 @@ pub struct AdapterCapabilities {
     pub triggers: CapabilitySupport,
     pub routines: CapabilitySupport,
     pub dependencies: CapabilitySupport,
+    #[serde(default)]
+    pub limitations: Vec<String>,
     pub notes: Vec<String>,
 }
 
@@ -386,6 +453,7 @@ pub fn capability_warnings(capabilities: &AdapterCapabilities) -> Vec<String> {
         "cross-object dependency metadata",
         capabilities.dependencies,
     );
+    warnings.extend(capabilities.limitations.iter().cloned());
     warnings
 }
 
@@ -416,6 +484,33 @@ mod tests {
     #[test]
     fn product_boundary_stays_rdb_first() {
         assert_eq!("RDB schema graph memory", product_boundary());
+    }
+
+    #[test]
+    fn adapter_limitations_are_backward_compatible_and_surface_as_warnings() {
+        let old_payload = serde_json::json!({
+            "source_kind": "sqlite",
+            "metadata_only": true,
+            "schemas": true,
+            "tables": true,
+            "columns": true,
+            "constraints": true,
+            "indexes": true,
+            "views": "unsupported",
+            "triggers": "unsupported",
+            "routines": "unsupported",
+            "dependencies": "unsupported",
+            "notes": []
+        });
+        let mut capabilities: AdapterCapabilities = serde_json::from_value(old_payload).unwrap();
+        assert!(capabilities.limitations.is_empty());
+
+        capabilities
+            .limitations
+            .push("known adapter metadata gap".to_owned());
+        assert!(capability_warnings(&capabilities)
+            .iter()
+            .any(|warning| warning == "known adapter metadata gap"));
     }
 
     #[test]
@@ -470,6 +565,36 @@ mod tests {
         assert_eq!("postgres:prod:app:public:column:users:id", formatted);
         assert_eq!(key, formatted.parse::<ObjectKey>().unwrap());
         assert!("postgres:prod:app:public:unknown:users"
+            .parse::<ObjectKey>()
+            .is_err());
+    }
+
+    #[test]
+    fn stable_object_key_round_trips_reserved_identifier_characters() {
+        let key = ObjectKey::new(
+            "postgres",
+            "prod:west",
+            "app%main",
+            "audit:2026",
+            ObjectKind::Column,
+            "order:events",
+            Some("id%raw".to_owned()),
+        );
+
+        let formatted = key.to_string();
+        assert_eq!(
+            "v2:postgres:prod%3Awest:app%25main:audit%3A2026:column:order%3Aevents:id%25raw",
+            formatted
+        );
+        assert_eq!(key, formatted.parse::<ObjectKey>().unwrap());
+    }
+
+    #[test]
+    fn stable_object_key_v2_rejects_malformed_escapes() {
+        assert!("v2:postgres:prod:app:public:table:orders%2Farchive"
+            .parse::<ObjectKey>()
+            .is_err());
+        assert!("v2:postgres:prod:app:public:table:orders%"
             .parse::<ObjectKey>()
             .is_err());
     }

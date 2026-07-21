@@ -11,6 +11,17 @@ pub fn insert_schema_snapshot_graph(
     captured_at_unix_ms: i64,
     snapshot: &SchemaSnapshot,
 ) -> GraphStoreResult<()> {
+    store.with_transaction(|store| {
+        insert_schema_snapshot_graph_inner(store, snapshot_key, captured_at_unix_ms, snapshot)
+    })
+}
+
+fn insert_schema_snapshot_graph_inner(
+    store: &GraphStore,
+    snapshot_key: &str,
+    captured_at_unix_ms: i64,
+    snapshot: &SchemaSnapshot,
+) -> GraphStoreResult<()> {
     store.delete_snapshot(snapshot_key)?;
     store.insert_snapshot(&GraphSnapshotRecord {
         snapshot_key: snapshot_key.to_owned(),
@@ -140,6 +151,13 @@ pub fn insert_schema_snapshot_graph(
         }
     }
     for view in sorted_by_key(&snapshot.views, |view| &view.key) {
+        insert_edge(
+            store,
+            snapshot_key,
+            "SCHEMA_HAS_VIEW",
+            &view.schema_key,
+            &view.key,
+        )?;
         for dependency in sorted_keys(&view.depends_on) {
             match dependency.object_kind {
                 crate::ObjectKind::Table => insert_edge(
@@ -156,22 +174,35 @@ pub fn insert_schema_snapshot_graph(
                     &view.key,
                     dependency,
                 )?,
+                crate::ObjectKind::View => insert_edge(
+                    store,
+                    snapshot_key,
+                    "VIEW_DEPENDS_ON_VIEW",
+                    &view.key,
+                    dependency,
+                )?,
                 _ => {}
             }
         }
     }
     for trigger in sorted_by_key(&snapshot.triggers, |trigger| &trigger.key) {
+        let (owner_edge, target_edge) = if trigger.table_key.object_kind == crate::ObjectKind::View
+        {
+            ("VIEW_HAS_TRIGGER", "TRIGGER_ON_VIEW")
+        } else {
+            ("TABLE_HAS_TRIGGER", "TRIGGER_ON_TABLE")
+        };
         insert_edge(
             store,
             snapshot_key,
-            "TABLE_HAS_TRIGGER",
+            owner_edge,
             &trigger.table_key,
             &trigger.key,
         )?;
         insert_edge(
             store,
             snapshot_key,
-            "TRIGGER_ON_TABLE",
+            target_edge,
             &trigger.key,
             &trigger.table_key,
         )?;
@@ -186,6 +217,13 @@ pub fn insert_schema_snapshot_graph(
         }
     }
     for routine in sorted_by_key(&snapshot.routines, |routine| &routine.key) {
+        insert_edge(
+            store,
+            snapshot_key,
+            "SCHEMA_HAS_ROUTINE",
+            &routine.schema_key,
+            &routine.key,
+        )?;
         for dependency in sorted_keys(&routine.depends_on) {
             match dependency.object_kind {
                 crate::ObjectKind::Table => insert_edge(
@@ -377,6 +415,17 @@ mod graph_builder_tests {
     }
 
     #[test]
+    fn graph_builder_writes_schema_ownership_for_views_and_routines() {
+        let store = built_store();
+        let schema = key(ObjectKind::Schema, "main", None);
+        let view = key(ObjectKind::View, "order_users", None);
+        let routine = key(ObjectKind::Routine, "orders_touch", None);
+
+        assert_edge(&store, "SCHEMA_HAS_VIEW", &schema, &view);
+        assert_edge(&store, "SCHEMA_HAS_ROUTINE", &schema, &routine);
+    }
+
+    #[test]
     fn graph_builder_writes_primary_key_edges() {
         let store = built_store();
         let users_id = key(ObjectKind::Column, "users", Some("id"));
@@ -472,6 +521,26 @@ mod graph_builder_tests {
             "ROUTINE_DEPENDS_ON_COLUMN",
             &routine,
             &orders_user_id,
+        );
+    }
+
+    #[test]
+    fn graph_builder_keeps_previous_snapshot_when_replacement_fails() {
+        let store = built_store();
+        let before = store
+            .get_node(
+                SNAPSHOT,
+                &key(ObjectKind::Column, "users", Some("id")).to_string(),
+            )
+            .unwrap()
+            .unwrap();
+        let mut invalid = snapshot();
+        invalid.columns[0].table_key = key(ObjectKind::Table, "missing", None);
+
+        assert!(insert_schema_snapshot_graph(&store, SNAPSHOT, 1, &invalid).is_err());
+        assert_eq!(
+            store.get_node(SNAPSHOT, &before.node_key).unwrap().unwrap(),
+            before
         );
     }
 
@@ -589,6 +658,7 @@ mod graph_builder_tests {
                 triggers: CapabilitySupport::Unsupported,
                 routines: CapabilitySupport::Unsupported,
                 dependencies: CapabilitySupport::Unsupported,
+                limitations: vec![],
                 notes: vec![],
             },
         }

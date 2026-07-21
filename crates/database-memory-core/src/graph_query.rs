@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::graph_store::{GraphEdgeRecord, GraphNodeRecord, GraphStore, GraphStoreResult};
-use crate::impact_analysis::{next_edges, Direction};
+use crate::impact_analysis::{merge_bounded_edges, next_edges_bounded, Direction};
 
 pub const GRAPH_QUERY_MAX_LIMIT: usize = 500;
 pub const GRAPH_QUERY_MAX_DEPTH: u32 = 8;
@@ -39,7 +39,12 @@ pub struct GraphQueryResult {
     pub snapshot_key: String,
     pub limit_requested: usize,
     pub limit_applied: usize,
+    pub limit_clamped: bool,
+    pub max_depth_requested: Option<u32>,
     pub max_depth_applied: Option<u32>,
+    pub max_depth_clamped: bool,
+    pub result_count: usize,
+    pub truncated: bool,
     pub nodes: Vec<GraphQueryNode>,
     pub edges: Vec<GraphQueryEdge>,
     pub traversal: Vec<GraphQueryTraversalHit>,
@@ -78,50 +83,60 @@ pub fn query_graph(store: &GraphStore, query: &GraphQuery) -> GraphStoreResult<G
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let mut traversal = Vec::new();
+    let mut truncated = false;
 
-    if remaining > 0 && wants_nodes(query) {
-        for node in matching_nodes(store, query)? {
-            if remaining == 0 {
-                break;
-            }
-            nodes.push(query_node(node));
-            remaining -= 1;
-        }
+    if wants_nodes(query) {
+        let matches = matching_nodes(store, query)?;
+        truncated |= matches.len() > remaining;
+        nodes.extend(matches.into_iter().take(remaining).map(query_node));
+        remaining -= nodes.len();
     }
 
-    if remaining > 0 && query.traversal.is_none() {
+    if query.traversal.is_none() {
         if let Some(edge_type) = &query.edge_type {
-            for edge in store.edges_by_type(&query.snapshot_key, edge_type)? {
-                if remaining == 0 {
-                    break;
-                }
-                edges.push(query_edge(edge));
-                remaining -= 1;
-            }
+            let mut matches = store.edges_by_type_limited(
+                &query.snapshot_key,
+                edge_type,
+                remaining.saturating_add(1),
+            )?;
+            truncated |= matches.len() > remaining;
+            matches.truncate(remaining);
+            edges.extend(matches.into_iter().map(query_edge));
+            remaining -= edges.len();
         }
     }
 
+    let max_depth_requested = query
+        .traversal
+        .as_ref()
+        .map(|traversal| traversal.max_depth);
     let max_depth_applied = query
         .traversal
         .as_ref()
         .map(|traversal| traversal.max_depth.min(GRAPH_QUERY_MAX_DEPTH));
-    if remaining > 0 {
-        if let Some(traversal_query) = &query.traversal {
-            traversal = bounded_traversal(
-                store,
-                query,
-                traversal_query,
-                max_depth_applied.unwrap_or(0),
-                remaining,
-            )?;
-        }
+    if let Some(traversal_query) = &query.traversal {
+        let bounded = bounded_traversal(
+            store,
+            query,
+            traversal_query,
+            max_depth_applied.unwrap_or(0),
+            remaining,
+        )?;
+        traversal = bounded.hits;
+        truncated |= bounded.truncated;
     }
+    let result_count = nodes.len() + edges.len() + traversal.len();
 
     Ok(GraphQueryResult {
         snapshot_key: query.snapshot_key.clone(),
         limit_requested: query.limit,
         limit_applied,
+        limit_clamped: query.limit != limit_applied,
+        max_depth_requested,
         max_depth_applied,
+        max_depth_clamped: max_depth_requested != max_depth_applied,
+        result_count,
+        truncated,
         nodes,
         edges,
         traversal,
@@ -174,43 +189,49 @@ fn node_matches(node: &GraphNodeRecord, query: &GraphQuery) -> bool {
             .unwrap_or(true)
 }
 
+struct BoundedTraversal {
+    hits: Vec<GraphQueryTraversalHit>,
+    truncated: bool,
+}
+
 fn bounded_traversal(
     store: &GraphStore,
     query: &GraphQuery,
     traversal: &GraphQueryTraversal,
     max_depth: u32,
     limit: usize,
-) -> GraphStoreResult<Vec<GraphQueryTraversalHit>> {
+) -> GraphStoreResult<BoundedTraversal> {
     let mut hits = Vec::new();
+    let mut truncated = false;
     if max_depth == 0
         || store
             .get_node(&query.snapshot_key, &traversal.start_node_key)?
             .is_none()
     {
-        return Ok(hits);
+        return Ok(BoundedTraversal { hits, truncated });
     }
 
     let mut visited = HashSet::from([traversal.start_node_key.clone()]);
     let mut queue = VecDeque::from([(traversal.start_node_key.clone(), 0)]);
     while let Some((node_key, depth)) = queue.pop_front() {
-        if depth == max_depth || hits.len() == limit {
+        if depth == max_depth {
             continue;
         }
+        if hits.len() == limit {
+            truncated = true;
+            break;
+        }
 
-        for (edge, next_key) in
-            next_edges(store, &query.snapshot_key, &node_key, traversal.direction)?
-        {
-            if hits.len() == limit {
-                break;
-            }
-            if query
-                .edge_type
-                .as_ref()
-                .map(|edge_type| &edge.edge_type != edge_type)
-                .unwrap_or(false)
-            {
-                continue;
-            }
+        let (edges, has_more_edges) = next_query_edges_bounded(
+            store,
+            &query.snapshot_key,
+            &node_key,
+            traversal.direction,
+            query.edge_type.as_deref(),
+            limit - hits.len(),
+        )?;
+        truncated |= has_more_edges;
+        for (edge, next_key) in edges {
             if !visited.insert(next_key.clone()) {
                 continue;
             }
@@ -229,8 +250,49 @@ fn bounded_traversal(
                 }
             }
         }
+        if has_more_edges {
+            break;
+        }
     }
-    Ok(hits)
+    Ok(BoundedTraversal { hits, truncated })
+}
+
+fn next_query_edges_bounded(
+    store: &GraphStore,
+    snapshot_key: &str,
+    node_key: &str,
+    direction: Direction,
+    edge_type: Option<&str>,
+    max_edges: usize,
+) -> GraphStoreResult<(Vec<(GraphEdgeRecord, String)>, bool)> {
+    let Some(edge_type) = edge_type else {
+        return next_edges_bounded(store, snapshot_key, node_key, direction, max_edges);
+    };
+
+    let mut edges = Vec::new();
+    let fetch_limit = max_edges.saturating_add(1);
+    let mut source_truncated = false;
+    if matches!(direction, Direction::Outbound | Direction::Both) {
+        let outbound =
+            store.edges_from_by_type_limited(snapshot_key, node_key, edge_type, fetch_limit)?;
+        source_truncated |= outbound.len() > max_edges;
+        edges.extend(outbound.into_iter().map(|edge| {
+            let next = edge.edge_to.clone();
+            (edge, next)
+        }));
+    }
+
+    if matches!(direction, Direction::Inbound | Direction::Both) {
+        let inbound =
+            store.edges_to_by_type_limited(snapshot_key, node_key, edge_type, fetch_limit)?;
+        source_truncated |= inbound.len() > max_edges;
+        edges.extend(inbound.into_iter().map(|edge| {
+            let next = edge.edge_from.clone();
+            (edge, next)
+        }));
+    }
+
+    Ok(merge_bounded_edges(edges, max_edges, source_truncated))
 }
 
 fn contains_ignore_case(value: &str, needle: &str) -> bool {
@@ -347,8 +409,8 @@ mod graph_query_tests {
                 .map(|hit| hit.node_key.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "column:orders.id",
                 "index:orders.user_id",
+                "column:orders.id",
                 "column:orders.user_id"
             ]
         );
@@ -373,7 +435,106 @@ mod graph_query_tests {
         .unwrap();
 
         assert_eq!(result.limit_applied, GRAPH_QUERY_MAX_LIMIT);
+        assert!(result.limit_clamped);
         assert!(result.nodes.len() < GRAPH_QUERY_MAX_LIMIT);
+    }
+
+    #[test]
+    fn graph_query_filters_edges_before_bounding_high_degree_traversal() {
+        let store = seeded_store();
+        node(&store, "table:root", "Table", "root", "{}");
+        for index in 0..256 {
+            let key = format!("column:noise.{index:03}");
+            node(&store, &key, "Column", &key, "{}");
+            edge(
+                &store,
+                &format!("noise-{index:03}"),
+                "table:root",
+                &key,
+                "NOISE",
+            );
+        }
+        for index in 0..3 {
+            let key = format!("column:wanted.{index:03}");
+            node(&store, &key, "Column", &key, "{}");
+            edge(
+                &store,
+                &format!("wanted-{index:03}"),
+                "table:root",
+                &key,
+                "WANTED",
+            );
+        }
+
+        let result = query_graph(
+            &store,
+            &GraphQuery {
+                snapshot_key: SNAPSHOT.to_owned(),
+                node_label: None,
+                node_key_contains: None,
+                name_contains: None,
+                edge_type: Some("WANTED".to_owned()),
+                payload_array_min_len: None,
+                traversal: Some(GraphQueryTraversal {
+                    start_node_key: "table:root".to_owned(),
+                    direction: Direction::Outbound,
+                    max_depth: 1,
+                }),
+                limit: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.traversal.len(), 2);
+        assert!(result.traversal.iter().all(|hit| hit.edge_type == "WANTED"));
+        assert!(result.truncated);
+        assert_eq!(result.result_count, 2);
+    }
+
+    #[test]
+    fn filtered_both_direction_traversal_does_not_starve_inbound_edges() {
+        let store = seeded_store();
+        node(&store, "table:root", "Table", "root", "{}");
+        node(&store, "table:caller", "Table", "caller", "{}");
+        edge(&store, "a-inbound", "table:caller", "table:root", "RELATED");
+        for index in 0..3 {
+            let key = format!("table:outbound:{index}");
+            node(&store, &key, "Table", &key, "{}");
+            edge(
+                &store,
+                &format!("z-outbound-{index}"),
+                "table:root",
+                &key,
+                "RELATED",
+            );
+        }
+
+        let result = query_graph(
+            &store,
+            &GraphQuery {
+                snapshot_key: SNAPSHOT.to_owned(),
+                node_label: None,
+                node_key_contains: None,
+                name_contains: None,
+                edge_type: Some("RELATED".to_owned()),
+                payload_array_min_len: None,
+                traversal: Some(GraphQueryTraversal {
+                    start_node_key: "table:root".to_owned(),
+                    direction: Direction::Both,
+                    max_depth: 1,
+                }),
+                limit: 2,
+            },
+        )
+        .unwrap();
+
+        assert!(result.truncated);
+        assert_eq!(result.result_count, 2);
+        assert_eq!(result.traversal[0].node_key, "table:caller");
+        assert!(result
+            .traversal
+            .iter()
+            .any(|hit| hit.node_key.starts_with("table:outbound:")));
     }
 
     #[test]

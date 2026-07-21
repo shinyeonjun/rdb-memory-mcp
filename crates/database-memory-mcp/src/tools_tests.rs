@@ -10,6 +10,7 @@ use database_memory_core::{
     TableObject,
 };
 use rmcp::handler::server::wrapper::Parameters;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::*;
@@ -35,9 +36,11 @@ fn graph_stats_counts_indexed_snapshots() {
     assert_eq!(stats.error, None);
 
     let server = DatabaseMemoryMcp::new();
-    let body = server.graph_stats(Parameters(GraphStatsRequest {
-        cache_path: Some(path.display().to_string()),
-    }));
+    let body = server
+        .graph_stats(Parameters(GraphStatsRequest {
+            cache_path: Some(path.display().to_string()),
+        }))
+        .unwrap();
     let tool_stats: GraphStatsResult = serde_json::from_str(&body).unwrap();
     assert_eq!(tool_stats.indexed_snapshots, 1);
 
@@ -61,29 +64,40 @@ fn mcp_lists_finds_and_describes_graph_metadata() {
     let server = DatabaseMemoryMcp::new();
 
     let databases: ListDatabasesResult =
-        serde_json::from_str(&server.list_databases(Parameters(ListDatabasesRequest {
+        parse_tool(server.list_databases(Parameters(ListDatabasesRequest {
             cache_path: Some(path.display().to_string()),
-        })))
-        .unwrap();
+        })));
     assert_eq!(databases.snapshots[0].alias, "sample");
 
-    let tables: ListTablesResult =
-        serde_json::from_str(&server.list_tables(Parameters(ListTablesRequest {
-            alias: "sample".to_owned(),
-            cache_path: Some(path.display().to_string()),
-            name_filter: Some("ord".to_owned()),
-        })))
-        .unwrap();
+    let tables: ListTablesResult = parse_tool(server.list_tables(Parameters(ListTablesRequest {
+        alias: "sample".to_owned(),
+        cache_path: Some(path.display().to_string()),
+        name_filter: Some("ord".to_owned()),
+        offset: None,
+        limit: None,
+    })));
     assert_eq!(tables.tables, vec!["orders"]);
 
     let description: TableDescription =
-        serde_json::from_str(&server.describe_table(Parameters(DescribeTableRequest {
+        parse_tool(server.describe_table(Parameters(DescribeTableRequest {
             alias: "sample".to_owned(),
             table_name: "orders".to_owned(),
             cache_path: Some(path.display().to_string()),
-        })))
-        .unwrap();
+        })));
     assert_eq!(description.primary_key, vec!["id"]);
+    assert_eq!(
+        description.object_key,
+        key("sample", ObjectKind::Table, "orders", None).to_string()
+    );
+    assert_eq!(description.schema, "main");
+    assert!(description
+        .columns
+        .iter()
+        .all(|column| column.object_key.starts_with("sqlite:sample:")));
+    assert!(description
+        .constraints
+        .iter()
+        .any(|constraint| constraint.kind == "foreign_key"));
     assert_eq!(
         description.foreign_keys.outbound[0].referenced_table,
         "users"
@@ -94,13 +108,13 @@ fn mcp_lists_finds_and_describes_graph_metadata() {
         .iter()
         .any(|warning| warning.contains("view dependency metadata is not tracked")));
 
-    let columns: FindColumnResult =
-        serde_json::from_str(&server.find_column(Parameters(FindColumnRequest {
-            alias: "sample".to_owned(),
-            query: "USER".to_owned(),
-            cache_path: Some(path.display().to_string()),
-        })))
-        .unwrap();
+    let columns: FindColumnResult = parse_tool(server.find_column(Parameters(FindColumnRequest {
+        alias: "sample".to_owned(),
+        query: "USER".to_owned(),
+        cache_path: Some(path.display().to_string()),
+        offset: None,
+        limit: None,
+    })));
     assert_eq!(columns.columns[0].table, "orders");
     assert_eq!(columns.columns[0].column, "user_id");
 
@@ -110,24 +124,23 @@ fn mcp_lists_finds_and_describes_graph_metadata() {
 #[test]
 fn mcp_runs_impact_trace_and_schema_diff() {
     let path = temp_cache_path();
-    write_snapshot(&path, "sqlite:from", &snapshot("sample", false, false));
-    write_snapshot(&path, "sqlite:to", &snapshot("sample", true, true));
+    write_snapshot(&path, "sqlite:from", &snapshot("from", false, false));
+    write_snapshot(&path, "sqlite:to", &snapshot("to", true, true));
     let server = DatabaseMemoryMcp::new();
 
-    let impact: Value =
-        serde_json::from_str(&server.impact_analysis(Parameters(ImpactAnalysisRequest {
-            alias: "to".to_owned(),
-            object_key: None,
-            table: Some("orders".to_owned()),
-            column: Some("user_id".to_owned()),
-            direction: "outbound".to_owned(),
-            max_depth: Some(2),
-            cache_path: Some(path.display().to_string()),
-        })))
-        .unwrap();
+    let impact: Value = parse_tool(server.impact_analysis(Parameters(ImpactAnalysisRequest {
+        alias: "to".to_owned(),
+        object_key: None,
+        table: Some("orders".to_owned()),
+        column: Some("user_id".to_owned()),
+        direction: "outbound".to_owned(),
+        max_depth: Some(2),
+        result_limit: None,
+        cache_path: Some(path.display().to_string()),
+    })));
     assert_eq!(
         impact["object_key"].as_str().unwrap(),
-        key("sample", ObjectKind::Column, "orders", Some("user_id")).to_string()
+        key("to", ObjectKind::Column, "orders", Some("user_id")).to_string()
     );
     assert!(impact["groups"]
         .as_array()
@@ -138,34 +151,77 @@ fn mcp_runs_impact_trace_and_schema_diff() {
         .iter()
         .any(|warning| warning.contains("routine dependency metadata is not tracked")));
 
-    let trace: Value = serde_json::from_str(&server.trace_relationships(Parameters(
+    let trace: Value = parse_tool(server.trace_relationships(Parameters(
         TraceRelationshipsRequest {
             alias: "to".to_owned(),
-            start_object_key:
-                key("sample", ObjectKind::Column, "orders", Some("user_id")).to_string(),
+            start_object_key: key("to", ObjectKind::Column, "orders", Some("user_id")).to_string(),
             direction: "outbound".to_owned(),
             max_depth: Some(2),
+            result_limit: None,
             cache_path: Some(path.display().to_string()),
         },
-    )))
-    .unwrap();
+    )));
     assert!(!trace["paths"].as_array().unwrap().is_empty());
     assert!(json_string_array(&trace["capability_warnings"])
         .iter()
         .any(|warning| warning.contains("trigger dependency metadata is not tracked")));
 
-    let diff: Value = serde_json::from_str(&server.schema_diff(Parameters(SchemaDiffRequest {
+    let diff: Value = parse_tool(server.schema_diff(Parameters(SchemaDiffRequest {
         cache_path: Some(path.display().to_string()),
         from_alias: "from".to_owned(),
         to_alias: "to".to_owned(),
-    })))
-    .unwrap();
-    let added_user_id = key("sample", ObjectKind::Column, "orders", Some("user_id")).to_string();
+        result_limit: None,
+    })));
+    let added_user_id = key("to", ObjectKind::Column, "orders", Some("user_id")).to_string();
     assert!(diff["added_nodes"]
         .as_array()
         .unwrap()
         .iter()
         .any(|node| { node["node_key"].as_str() == Some(added_user_id.as_str()) }));
+    assert!(diff["removed_nodes"].as_array().unwrap().is_empty());
+    assert!(diff["changed_nodes"].as_array().unwrap().is_empty());
+    assert_eq!(diff["result_limit_applied"], 100);
+    assert_eq!(diff["truncated"], false);
+
+    let limited: Value = parse_tool(server.schema_diff(Parameters(SchemaDiffRequest {
+        cache_path: Some(path.display().to_string()),
+        from_alias: "from".to_owned(),
+        to_alias: "to".to_owned(),
+        result_limit: Some(1),
+    })));
+    let limited_impact_nodes = limited["impacted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|impact| impact["impact"]["groups"].as_array().unwrap())
+        .map(|group| group["nodes"].as_array().unwrap().len())
+        .sum::<usize>();
+    assert_eq!(limited["result_limit_applied"], 1);
+    assert_eq!(limited["truncated"], true);
+    assert!(limited["counts"]["added_nodes"].as_u64().unwrap() > 1);
+    assert!(limited["added_nodes"].as_array().unwrap().len() <= 1);
+    assert!(limited["added_edges"].as_array().unwrap().len() <= 1);
+    assert!(limited["impacted"].as_array().unwrap().len() <= 1);
+    assert!(limited_impact_nodes <= 1);
+
+    let clamped: Value = parse_tool(server.schema_diff(Parameters(SchemaDiffRequest {
+        cache_path: Some(path.display().to_string()),
+        from_alias: "from".to_owned(),
+        to_alias: "to".to_owned(),
+        result_limit: Some(999),
+    })));
+    assert_eq!(clamped["result_limit_applied"], 200);
+    assert_eq!(clamped["result_limit_clamped"], true);
+
+    let zero_limit = server
+        .schema_diff(Parameters(SchemaDiffRequest {
+            cache_path: Some(path.display().to_string()),
+            from_alias: "from".to_owned(),
+            to_alias: "to".to_owned(),
+            result_limit: Some(0),
+        }))
+        .unwrap_err();
+    assert!(zero_limit.contains("result_limit must be greater than zero"));
 
     let _ = std::fs::remove_file(path);
 }
@@ -176,20 +232,18 @@ fn mcp_runs_query_graph() {
     write_snapshot(&path, SNAPSHOT, &snapshot("sample", true, true));
     let server = DatabaseMemoryMcp::new();
 
-    let result: GraphQueryResult =
-        serde_json::from_str(&server.query_graph(Parameters(QueryGraphRequest {
-            cache_path: Some(path.display().to_string()),
-            alias: Some("sample".to_owned()),
-            snapshot_key: None,
-            node_label: Some("Index".to_owned()),
-            node_key_contains: None,
-            name_contains: Some("user".to_owned()),
-            edge_type: None,
-            payload_array_min_len: None,
-            traversal: None,
-            limit: 10,
-        })))
-        .unwrap();
+    let result: GraphQueryResult = parse_tool(server.query_graph(Parameters(QueryGraphRequest {
+        cache_path: Some(path.display().to_string()),
+        alias: Some("sample".to_owned()),
+        snapshot_key: None,
+        node_label: Some("Index".to_owned()),
+        node_key_contains: None,
+        name_contains: Some("user".to_owned()),
+        edge_type: None,
+        payload_array_min_len: None,
+        traversal: None,
+        limit: 10,
+    })));
 
     assert_eq!(result.nodes.len(), 1);
     assert_eq!(
@@ -211,12 +265,11 @@ fn mysql_tool_response_reports_unsupported_relationship_capabilities() {
     let server = DatabaseMemoryMcp::new();
 
     let description: TableDescription =
-        serde_json::from_str(&server.describe_table(Parameters(DescribeTableRequest {
+        parse_tool(server.describe_table(Parameters(DescribeTableRequest {
             alias: "mysql:my".to_owned(),
             table_name: "orders".to_owned(),
             cache_path: Some(path.display().to_string()),
-        })))
-        .unwrap();
+        })));
 
     assert!(description
         .capability_warnings
@@ -240,17 +293,16 @@ fn postgres_tool_response_does_not_warn_view_trigger_routine_support() {
     );
     let server = DatabaseMemoryMcp::new();
 
-    let impact: Value =
-        serde_json::from_str(&server.impact_analysis(Parameters(ImpactAnalysisRequest {
-            alias: "postgres:pg".to_owned(),
-            object_key: None,
-            table: Some("orders".to_owned()),
-            column: Some("user_id".to_owned()),
-            direction: "outbound".to_owned(),
-            max_depth: Some(2),
-            cache_path: Some(path.display().to_string()),
-        })))
-        .unwrap();
+    let impact: Value = parse_tool(server.impact_analysis(Parameters(ImpactAnalysisRequest {
+        alias: "postgres:pg".to_owned(),
+        object_key: None,
+        table: Some("orders".to_owned()),
+        column: Some("user_id".to_owned()),
+        direction: "outbound".to_owned(),
+        max_depth: Some(2),
+        result_limit: None,
+        cache_path: Some(path.display().to_string()),
+    })));
     let warnings = json_string_array(&impact["capability_warnings"]);
 
     assert!(!warnings.iter().any(|warning| {
@@ -265,19 +317,233 @@ fn postgres_tool_response_does_not_warn_view_trigger_routine_support() {
     let _ = std::fs::remove_file(path);
 }
 
+#[test]
+fn non_sqlite_alias_from_list_databases_round_trips_into_other_tools() {
+    let path = temp_cache_path();
+    write_snapshot(
+        &path,
+        "postgres:pg",
+        &snapshot_with_capabilities("pg", postgres_capabilities()),
+    );
+    let server = DatabaseMemoryMcp::new();
+
+    let databases: ListDatabasesResult =
+        parse_tool(server.list_databases(Parameters(ListDatabasesRequest {
+            cache_path: Some(path.display().to_string()),
+        })));
+    assert_eq!(databases.snapshots[0].alias, "pg");
+
+    let tables: ListTablesResult = parse_tool(server.list_tables(Parameters(ListTablesRequest {
+        alias: databases.snapshots[0].alias.clone(),
+        cache_path: Some(path.display().to_string()),
+        name_filter: Some("orders".to_owned()),
+        offset: None,
+        limit: None,
+    })));
+    assert_eq!(tables.snapshot_key, "postgres:pg");
+    assert_eq!(tables.tables, vec!["orders"]);
+
+    let columns: FindColumnResult = parse_tool(server.find_column(Parameters(FindColumnRequest {
+        alias: "pg".to_owned(),
+        query: "user_id".to_owned(),
+        cache_path: Some(path.display().to_string()),
+        offset: None,
+        limit: None,
+    })));
+    assert!(columns.columns[0].object_key.starts_with("postgres:pg:"));
+    assert!(columns.columns[0].table_key.starts_with("postgres:pg:"));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn ambiguous_alias_requires_an_explicit_snapshot_key() {
+    let path = temp_cache_path();
+    write_snapshot(
+        &path,
+        "postgres:shared",
+        &snapshot_with_capabilities("shared", postgres_capabilities()),
+    );
+    write_snapshot(
+        &path,
+        "mysql:shared",
+        &snapshot_with_capabilities("shared", unsupported_capabilities("mysql")),
+    );
+    let server = DatabaseMemoryMcp::new();
+
+    let ambiguous = server
+        .list_tables(Parameters(ListTablesRequest {
+            alias: "shared".to_owned(),
+            cache_path: Some(path.display().to_string()),
+            name_filter: None,
+            offset: None,
+            limit: None,
+        }))
+        .unwrap_err();
+    assert!(ambiguous.contains("alias 'shared' is ambiguous"));
+
+    let explicit: ListTablesResult =
+        parse_tool(server.list_tables(Parameters(ListTablesRequest {
+            alias: "postgres:shared".to_owned(),
+            cache_path: Some(path.display().to_string()),
+            name_filter: None,
+            offset: None,
+            limit: None,
+        })));
+    assert_eq!(explicit.snapshot_key, "postgres:shared");
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn multi_schema_table_results_expose_stable_keys_and_reject_ambiguous_names() {
+    let path = temp_cache_path();
+    let mut multi_schema = snapshot_with_capabilities("pg", postgres_capabilities());
+    let audit_schema = ObjectKey::new(
+        "postgres",
+        "pg",
+        "main",
+        "audit",
+        ObjectKind::Schema,
+        "audit",
+        None,
+    );
+    let audit_users = ObjectKey::new(
+        "postgres",
+        "pg",
+        "main",
+        "audit",
+        ObjectKind::Table,
+        "users",
+        None,
+    );
+    multi_schema.schemas.push(SchemaObject {
+        key: audit_schema.clone(),
+        database_key: multi_schema.database.key.clone(),
+        name: "audit".to_owned(),
+    });
+    multi_schema.tables.push(TableObject {
+        key: audit_users.clone(),
+        schema_key: audit_schema,
+        name: "users".to_owned(),
+        kind: TableKind::BaseTable,
+    });
+    write_snapshot(&path, "postgres:pg", &multi_schema);
+    let server = DatabaseMemoryMcp::new();
+
+    let tables: ListTablesResult = parse_tool(server.list_tables(Parameters(ListTablesRequest {
+        alias: "pg".to_owned(),
+        cache_path: Some(path.display().to_string()),
+        name_filter: Some("users".to_owned()),
+        offset: None,
+        limit: None,
+    })));
+    assert_eq!(tables.tables, vec!["users", "users"]);
+    assert_eq!(tables.table_matches[0].schema, "audit");
+    assert_eq!(tables.table_matches[0].object_key, audit_users.to_string());
+    assert_eq!(tables.table_matches[1].schema, "main");
+
+    let ambiguous = server
+        .describe_table(Parameters(DescribeTableRequest {
+            alias: "pg".to_owned(),
+            table_name: "users".to_owned(),
+            cache_path: Some(path.display().to_string()),
+        }))
+        .unwrap_err();
+    assert!(ambiguous.contains("table 'users' is ambiguous"));
+
+    let explicit: TableDescription =
+        parse_tool(server.describe_table(Parameters(DescribeTableRequest {
+            alias: "pg".to_owned(),
+            table_name: audit_users.to_string(),
+            cache_path: Some(path.display().to_string()),
+        })));
+    assert_eq!(explicit.table, "users");
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn mcp_pages_inventory_clamps_traversals_and_rejects_missing_start_nodes() {
+    let path = temp_cache_path();
+    write_snapshot(&path, SNAPSHOT, &snapshot("sample", true, true));
+    let server = DatabaseMemoryMcp::new();
+
+    let tables: ListTablesResult = parse_tool(server.list_tables(Parameters(ListTablesRequest {
+        alias: "sample".to_owned(),
+        cache_path: Some(path.display().to_string()),
+        name_filter: None,
+        offset: Some(1),
+        limit: Some(1),
+    })));
+    assert_eq!(tables.tables, vec!["users"]);
+    assert_eq!(tables.page.total, 2);
+    assert_eq!(tables.page.offset, 1);
+    assert_eq!(tables.page.limit_applied, 1);
+    assert!(!tables.page.has_more);
+
+    let impact: Value = parse_tool(server.impact_analysis(Parameters(ImpactAnalysisRequest {
+        alias: "sample".to_owned(),
+        object_key: Some(key("sample", ObjectKind::Table, "orders", None).to_string()),
+        table: None,
+        column: None,
+        direction: "both".to_owned(),
+        max_depth: Some(99),
+        result_limit: Some(999),
+        cache_path: Some(path.display().to_string()),
+    })));
+    assert_eq!(impact["max_depth_applied"], 8);
+    assert_eq!(impact["result_limit_applied"], 200);
+    assert_eq!(impact["max_depth_clamped"], true);
+    assert_eq!(impact["result_limit_clamped"], true);
+
+    let missing = server
+        .trace_relationships(Parameters(TraceRelationshipsRequest {
+            alias: "sample".to_owned(),
+            start_object_key: "missing-node".to_owned(),
+            direction: "outbound".to_owned(),
+            max_depth: None,
+            result_limit: None,
+            cache_path: Some(path.display().to_string()),
+        }))
+        .unwrap_err();
+    assert!(missing.contains("graph node 'missing-node' not found"));
+
+    let _ = std::fs::remove_file(path);
+}
+
 fn write_snapshot(path: &Path, snapshot_key: &str, snapshot: &SchemaSnapshot) {
     let store = GraphStore::open(path).unwrap();
     insert_schema_snapshot_graph(&store, snapshot_key, 0, snapshot).unwrap();
 }
 
+fn parse_tool<T: DeserializeOwned>(result: Result<String, String>) -> T {
+    serde_json::from_str(&result.unwrap()).unwrap()
+}
+
 fn snapshot(alias: &str, include_orders: bool, include_fk: bool) -> SchemaSnapshot {
-    let database = key(alias, ObjectKind::Database, "main", None);
-    let schema = key(alias, ObjectKind::Schema, "main", None);
-    let users = key(alias, ObjectKind::Table, "users", None);
-    let orders = key(alias, ObjectKind::Table, "orders", None);
-    let users_id = key(alias, ObjectKind::Column, "users", Some("id"));
-    let orders_id = key(alias, ObjectKind::Column, "orders", Some("id"));
-    let orders_user_id = key(alias, ObjectKind::Column, "orders", Some("user_id"));
+    snapshot_for("sqlite", alias, include_orders, include_fk)
+}
+
+fn snapshot_for(
+    source_kind: &str,
+    alias: &str,
+    include_orders: bool,
+    include_fk: bool,
+) -> SchemaSnapshot {
+    let database = key_for(source_kind, alias, ObjectKind::Database, "main", None);
+    let schema = key_for(source_kind, alias, ObjectKind::Schema, "main", None);
+    let users = key_for(source_kind, alias, ObjectKind::Table, "users", None);
+    let orders = key_for(source_kind, alias, ObjectKind::Table, "orders", None);
+    let users_id = key_for(source_kind, alias, ObjectKind::Column, "users", Some("id"));
+    let orders_id = key_for(source_kind, alias, ObjectKind::Column, "orders", Some("id"));
+    let orders_user_id = key_for(
+        source_kind,
+        alias,
+        ObjectKind::Column,
+        "orders",
+        Some("user_id"),
+    );
 
     let mut tables = vec![TableObject {
         key: users.clone(),
@@ -287,7 +553,13 @@ fn snapshot(alias: &str, include_orders: bool, include_fk: bool) -> SchemaSnapsh
     }];
     let mut columns = vec![column(users_id.clone(), users.clone(), "id", 1)];
     let mut constraints = vec![ConstraintObject {
-        key: key(alias, ObjectKind::PrimaryKey, "users", Some("pk_users")),
+        key: key_for(
+            source_kind,
+            alias,
+            ObjectKind::PrimaryKey,
+            "users",
+            Some("pk_users"),
+        ),
         table_key: users.clone(),
         name: "pk_users".to_owned(),
         kind: ConstraintKind::PrimaryKey,
@@ -308,7 +580,13 @@ fn snapshot(alias: &str, include_orders: bool, include_fk: bool) -> SchemaSnapsh
         columns.push(column(orders_id.clone(), orders.clone(), "id", 1));
         columns.push(column(orders_user_id.clone(), orders.clone(), "user_id", 2));
         constraints.push(ConstraintObject {
-            key: key(alias, ObjectKind::PrimaryKey, "orders", Some("pk_orders")),
+            key: key_for(
+                source_kind,
+                alias,
+                ObjectKind::PrimaryKey,
+                "orders",
+                Some("pk_orders"),
+            ),
             table_key: orders.clone(),
             name: "pk_orders".to_owned(),
             kind: ConstraintKind::PrimaryKey,
@@ -318,7 +596,8 @@ fn snapshot(alias: &str, include_orders: bool, include_fk: bool) -> SchemaSnapsh
             expression: None,
         });
         indexes.push(IndexObject {
-            key: key(
+            key: key_for(
+                source_kind,
                 alias,
                 ObjectKind::Index,
                 "orders",
@@ -336,7 +615,8 @@ fn snapshot(alias: &str, include_orders: bool, include_fk: bool) -> SchemaSnapsh
 
     if include_fk {
         constraints.push(ConstraintObject {
-            key: key(
+            key: key_for(
+                source_kind,
                 alias,
                 ObjectKind::ForeignKey,
                 "orders",
@@ -353,7 +633,7 @@ fn snapshot(alias: &str, include_orders: bool, include_fk: bool) -> SchemaSnapsh
     }
 
     SchemaSnapshot {
-        source_kind: "sqlite".to_owned(),
+        source_kind: source_kind.to_owned(),
         connection_alias: alias.to_owned(),
         database: DatabaseObject {
             key: database.clone(),
@@ -383,14 +663,14 @@ fn snapshot(alias: &str, include_orders: bool, include_fk: bool) -> SchemaSnapsh
             triggers: CapabilitySupport::Unsupported,
             routines: CapabilitySupport::Unsupported,
             dependencies: CapabilitySupport::Unsupported,
+            limitations: vec![],
             notes: vec![],
         },
     }
 }
 
 fn snapshot_with_capabilities(alias: &str, capabilities: AdapterCapabilities) -> SchemaSnapshot {
-    let mut snapshot = snapshot(alias, true, true);
-    snapshot.source_kind = capabilities.source_kind.clone();
+    let mut snapshot = snapshot_for(&capabilities.source_kind, alias, true, true);
     snapshot.capabilities = capabilities;
     snapshot
 }
@@ -408,6 +688,7 @@ fn unsupported_capabilities(source_kind: &str) -> AdapterCapabilities {
         triggers: CapabilitySupport::Unsupported,
         routines: CapabilitySupport::Unsupported,
         dependencies: CapabilitySupport::Unsupported,
+        limitations: vec![],
         notes: vec![],
     }
 }
@@ -425,6 +706,7 @@ fn postgres_capabilities() -> AdapterCapabilities {
         triggers: CapabilitySupport::Supported,
         routines: CapabilitySupport::Supported,
         dependencies: CapabilitySupport::Partial,
+        limitations: vec![],
         notes: vec![],
     }
 }
@@ -452,8 +734,18 @@ fn column(key: ObjectKey, table_key: ObjectKey, name: &str, ordinal_position: u3
 }
 
 fn key(alias: &str, kind: ObjectKind, object_name: &str, sub_object: Option<&str>) -> ObjectKey {
+    key_for("sqlite", alias, kind, object_name, sub_object)
+}
+
+fn key_for(
+    source_kind: &str,
+    alias: &str,
+    kind: ObjectKind,
+    object_name: &str,
+    sub_object: Option<&str>,
+) -> ObjectKey {
     ObjectKey::new(
-        "sqlite",
+        source_kind,
         alias,
         "main",
         "main",

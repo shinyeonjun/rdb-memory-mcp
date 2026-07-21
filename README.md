@@ -29,8 +29,19 @@ For installation and MCP client configuration, see [docs/install.md](docs/instal
 - Find tables and columns by name.
 - Analyze impact from a table, column, or graph object key.
 - Trace relationship paths through schema graph edges.
-- Diff two indexed schema snapshots.
+- Diff two indexed schema snapshots without treating connection-alias changes as schema changes.
 - Use query_graph as a constrained, read-only graph query escape hatch after typed tools are not enough.
+
+## Trust And Scale Behavior
+
+- Snapshot replacement is transactional. A failed re-index keeps the last valid snapshot intact.
+- Bare aliases work across database types when unique. Ambiguous aliases and duplicate table names return explicit errors with stable-key candidates.
+- MCP table and column results include database, schema, and stable object keys. List/search tools and the CLI inventory contract are paged; graph traversals clamp depth to 8 and results to 200 and report whether output was truncated.
+- MCP schema diffs default to 100 results and clamp at 200. Each change list, impact seed list, and the shared impact-node budget are bounded; exact category counts and `truncated` remain in the response.
+- Bounded traversals merge inbound and outbound evidence before truncation and keep dependencies, constraints, and indexes ahead of broad ownership lists such as table columns.
+- Ordinary stable keys keep the original colon-delimited form. Keys containing `:` or `%` inside an identifier use a backward-compatible `v2:` escaped form, so quoted database identifiers do not collide or misparse.
+- Adapter limitations are returned with capability warnings instead of being represented as invented metadata.
+- SQLite DDL is evaluated in an in-memory database. External database attachment is denied while DDL is being applied.
 
 For the full product boundary and design history, see [docs/plans/database-memory-mcp.md](docs/plans/database-memory-mcp.md).
 
@@ -51,11 +62,13 @@ The CLI exposes a versioned metadata-only JSON contract. Machine-readable output
 ~~~powershell
 database-memory contract --format json
 database-memory inventory ddl-sqlite:shop --limit 100 --format json --cache-path examples/shop-cache.sqlite
+database-memory inventory ddl-sqlite:shop --offset 100 --limit 100 --format json --cache-path examples/shop-cache.sqlite
 database-memory impact-analysis ddl-sqlite:shop --object-key sqlite:shop:main:main:table:orders --max-depth 3 --limit 50 --format json --cache-path examples/shop-cache.sqlite
 database-memory trace-relationships ddl-sqlite:shop sqlite:shop:main:main:table:orders --max-depth 4 --limit 20 --format json --cache-path examples/shop-cache.sqlite
 ~~~
 
 The contract reports `metadata_only: true` and `row_data_access: false`; traversal and inventory limits are bounded by the binary contract.
+Inventory responses use stable table-key ordering and report `offset`, `has_more`, and `next_offset`, so callers can continue without treating the first page as the complete schema.
 
 ## MCP Client Config
 
@@ -95,7 +108,7 @@ indexes indexed: 5
 cache path: examples/shop-cache.sqlite
 ~~~
 
-DDL imports use the snapshot key ddl-sqlite:<alias>. The graph object keys still use sqlite:<alias>:... because the DDL source applies the SQL to an in-memory SQLite database and reuses SQLite metadata introspection.
+DDL imports use the snapshot key ddl-sqlite:<alias>. The graph object keys still use sqlite:<alias>:... because the DDL source applies the SQL to an in-memory SQLite database and reuses SQLite metadata introspection. The DDL authorizer rejects external database attachment and extension loading.
 
 Describe a table:
 
@@ -125,6 +138,9 @@ capability warnings:
   trigger dependency metadata is not tracked by the ddl-sqlite adapter.
   routine dependency metadata is not tracked by the ddl-sqlite adapter.
   cross-object dependency metadata is not tracked by the ddl-sqlite adapter.
+  SQLite CHECK and UNIQUE constraints are not emitted as constraint nodes.
+  SQLite partial-index predicates and expression-index expressions are not extracted.
+  SQLite generated columns are identified, but generation expressions are not extracted.
 ~~~
 
 Find tables and columns:
@@ -145,6 +161,8 @@ database-memory find-column ddl-sqlite:shop customer --cache-path examples/shop-
 ~~~text
 orders.customer_id
 ~~~
+
+Use `--format json` when the caller needs stable column/table keys, database and schema identity, type, nullability, default value, ordinal position, or generated-column state.
 
 You can also materialize the schema yourself with SQLite, then index the resulting database file with --source sqlite.
 
@@ -175,7 +193,7 @@ The MCP client may call impact_analysis like this:
 }
 ~~~
 
-Decoded tool text captured from the release MCP server:
+Representative decoded tool text (bounded-response metadata and edge endpoints are abbreviated below):
 
 ~~~json
 {
@@ -228,7 +246,10 @@ Decoded tool text captured from the release MCP server:
     "view dependency metadata is not tracked by the ddl-sqlite adapter.",
     "trigger dependency metadata is not tracked by the ddl-sqlite adapter.",
     "routine dependency metadata is not tracked by the ddl-sqlite adapter.",
-    "cross-object dependency metadata is not tracked by the ddl-sqlite adapter."
+    "cross-object dependency metadata is not tracked by the ddl-sqlite adapter.",
+    "SQLite CHECK and UNIQUE constraints are not emitted as constraint nodes.",
+    "SQLite partial-index predicates and expression-index expressions are not extracted.",
+    "SQLite generated columns are identified, but generation expressions are not extracted."
   ]
 }
 ~~~
@@ -249,13 +270,13 @@ The captured result includes paths from the column to idx_orders_customer_id, to
 
 ## Adapter Capabilities
 
-All adapters are metadata-only by default. Level 1 means schemas/tables/columns plus primary keys, foreign keys, unique constraints, and indexes.
+All adapters are metadata-only by default. Level 1 targets schemas/tables/columns plus primary keys, foreign keys, unique constraints, and indexes; adapter-specific gaps are listed below and returned at runtime.
 
 | Source | Input | Needs live connection? | Level 1 | Level 2+ metadata |
 | --- | --- | --- | --- | --- |
-| sqlite | --path <db-file> | Local database file only | Supported | Views, triggers, routines, and dependency metadata are unsupported. |
-| ddl-sqlite | --path <sql-file-or-dir> | No | Supported after applying SQLite DDL to an in-memory DB | Views, triggers, routines, and dependency metadata are unsupported. |
+| sqlite | --path <db-file> | Local database file only | Partial: tables, generated-column identity, PK/FK, indexes, views, and triggers | View-to-table/column dependencies are resolved at prepare time. Trigger-body dependencies, CHECK/UNIQUE constraint nodes, partial/expression index definitions, and routines are not fully extracted. |
+| ddl-sqlite | --path <sql-file-or-dir> | No | Same SQLite metadata after authorized in-memory DDL application | Same SQLite limitations; external database attachment and extension loading are denied. |
 | postgres | --connection-string <url> | Yes | Supported | Furthest along: views, triggers, and routines are supported; cross-object dependencies are partial/best-effort through PostgreSQL catalogs. |
 | mysql | --connection-string <url> | Yes | Supported | Views, triggers, routines, and dependency metadata are unsupported at Level 1. |
 | sqlserver | --connection-string <ado-connection-string> | Yes | Supported | Views, triggers, routines, and dependency metadata are unsupported at Level 1. |
-| oracle | --connection-string <user/password@connect_string> | Yes | Supported for the current schema | Views, triggers, routines, and dependency metadata are unsupported at Level 1. |
+| oracle | --connection-string <user/password@connect_string> | Yes; Oracle Client 11.2+ is required at runtime | Supported for the current schema | Views, triggers, routines, and dependency metadata are unsupported at Level 1. |

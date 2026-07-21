@@ -173,17 +173,11 @@ pub(crate) fn next_edges_bounded(
     }
 
     let mut edges = Vec::new();
+    let fetch_limit = max_edges.saturating_add(1);
+    let mut source_truncated = false;
     if matches!(direction, Direction::Outbound | Direction::Both) {
-        let mut outbound =
-            store.edges_from_limited(snapshot_key, node_key, max_edges.saturating_add(1))?;
-        if outbound.len() > max_edges {
-            outbound.truncate(max_edges);
-            edges.extend(outbound.into_iter().map(|edge| {
-                let next = edge.edge_to.clone();
-                (edge, next)
-            }));
-            return Ok((edges, true));
-        }
+        let outbound = store.edges_from_limited(snapshot_key, node_key, fetch_limit)?;
+        source_truncated |= outbound.len() > max_edges;
         edges.extend(outbound.into_iter().map(|edge| {
             let next = edge.edge_to.clone();
             (edge, next)
@@ -191,19 +185,43 @@ pub(crate) fn next_edges_bounded(
     }
 
     if matches!(direction, Direction::Inbound | Direction::Both) {
-        let remaining = max_edges - edges.len();
-        let mut inbound =
-            store.edges_to_limited(snapshot_key, node_key, remaining.saturating_add(1))?;
-        let has_more = inbound.len() > remaining;
-        inbound.truncate(remaining);
+        let inbound = store.edges_to_limited(snapshot_key, node_key, fetch_limit)?;
+        source_truncated |= inbound.len() > max_edges;
         edges.extend(inbound.into_iter().map(|edge| {
             let next = edge.edge_from.clone();
             (edge, next)
         }));
-        return Ok((edges, has_more));
     }
 
-    Ok((edges, false))
+    Ok(merge_bounded_edges(edges, max_edges, source_truncated))
+}
+
+pub(crate) fn merge_bounded_edges(
+    mut edges: Vec<(GraphEdgeRecord, String)>,
+    max_edges: usize,
+    source_truncated: bool,
+) -> (Vec<(GraphEdgeRecord, String)>, bool) {
+    edges.sort_by(|left, right| {
+        traversal_edge_priority(&left.0.edge_type)
+            .cmp(&traversal_edge_priority(&right.0.edge_type))
+            .then_with(|| left.0.edge_key.cmp(&right.0.edge_key))
+    });
+    edges.dedup_by(|left, right| left.0.edge_key == right.0.edge_key);
+    let truncated = source_truncated || edges.len() > max_edges;
+    edges.truncate(max_edges);
+    (edges, truncated)
+}
+
+fn traversal_edge_priority(edge_type: &str) -> u8 {
+    match edge_type {
+        "DATABASE_HAS_SCHEMA"
+        | "SCHEMA_HAS_TABLE"
+        | "SCHEMA_HAS_VIEW"
+        | "SCHEMA_HAS_ROUTINE"
+        | "TABLE_HAS_COLUMN" => 2,
+        "TABLE_HAS_INDEX" => 1,
+        _ => 0,
+    }
 }
 
 fn result(
@@ -347,6 +365,78 @@ mod impact_analysis_tests {
             impact_analysis_bounded(&store, SNAPSHOT, "A", Direction::Outbound, 1, 2).unwrap();
         assert!(bounded.truncated);
         assert_eq!(reached_keys(&bounded.result), vec!["N000", "N001"]);
+    }
+
+    #[test]
+    fn bounded_edges_keep_impact_relations_ahead_of_wide_table_columns() {
+        let store = empty_store();
+        node(&store, "table:orders", "Table");
+        node(&store, "constraint:orders", "ForeignKey");
+        node(&store, "index:orders", "Index");
+        node(&store, "view:orders", "View");
+        edge(
+            &store,
+            "constraint-edge",
+            "table:orders",
+            "constraint:orders",
+            "TABLE_HAS_CONSTRAINT",
+        );
+        edge(
+            &store,
+            "index-edge",
+            "table:orders",
+            "index:orders",
+            "TABLE_HAS_INDEX",
+        );
+        edge(
+            &store,
+            "view-edge",
+            "view:orders",
+            "table:orders",
+            "VIEW_DEPENDS_ON_TABLE",
+        );
+        for index in 0..32 {
+            let column = format!("column:orders:{index:02}");
+            node(&store, &column, "Column");
+            edge(
+                &store,
+                &format!("column-edge-{index:02}"),
+                "table:orders",
+                &column,
+                "TABLE_HAS_COLUMN",
+            );
+        }
+
+        let (edges, has_more) =
+            next_edges_bounded(&store, SNAPSHOT, "table:orders", Direction::Both, 3).unwrap();
+        let edge_types = edges
+            .iter()
+            .map(|(edge, _)| edge.edge_type.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(has_more);
+        assert_eq!(
+            edge_types,
+            vec![
+                "TABLE_HAS_CONSTRAINT",
+                "VIEW_DEPENDS_ON_TABLE",
+                "TABLE_HAS_INDEX"
+            ]
+        );
+    }
+
+    #[test]
+    fn bounded_both_direction_deduplicates_self_loop_edges() {
+        let store = empty_store();
+        node(&store, "A", "Table");
+        edge(&store, "self", "A", "A", "SELF_REFERENCE");
+
+        let (edges, has_more) =
+            next_edges_bounded(&store, SNAPSHOT, "A", Direction::Both, 2).unwrap();
+
+        assert!(!has_more);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].0.edge_key, "self");
     }
 
     fn seeded_store() -> GraphStore {

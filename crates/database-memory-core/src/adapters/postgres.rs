@@ -891,6 +891,7 @@ fn postgres_capabilities() -> AdapterCapabilities {
         triggers: CapabilitySupport::Supported,
         routines: CapabilitySupport::Supported,
         dependencies: CapabilitySupport::Partial,
+        limitations: vec![],
         notes: vec![
             "Reads information_schema and pg_catalog metadata only; no user table rows are read.".to_owned(),
             "View dependencies use pg_rewrite/pg_depend and are resolved only to known table/column keys.".to_owned(),

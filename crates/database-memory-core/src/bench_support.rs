@@ -171,6 +171,7 @@ pub fn synthetic_schema_snapshot(config: &SyntheticSchemaConfig) -> SchemaSnapsh
             triggers: CapabilitySupport::Unsupported,
             routines: CapabilitySupport::Unsupported,
             dependencies: CapabilitySupport::Unsupported,
+            limitations: vec![],
             notes: vec![
                 "Synthetic in-memory schema metadata for performance baselines; no database connection or row data."
                     .to_owned(),

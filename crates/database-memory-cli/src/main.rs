@@ -13,7 +13,7 @@ use database_memory_core::introspect_schema_source;
 use metadata::{
     describe_table, open_existing_store, render_find_column, render_find_table,
     render_impact_analysis, render_inventory, render_relationship_trace, render_table_description,
-    require_snapshot, snapshot_key,
+    require_snapshot, resolve_snapshot_key,
 };
 use serde_json::json;
 
@@ -95,7 +95,7 @@ cache path: {}
             cache_path,
         } => {
             let store = open_existing_store(&cache_path)?;
-            let snapshot_key = snapshot_key(&alias);
+            let snapshot_key = resolve_snapshot_key(&store, &alias)?;
             require_snapshot(&store, &snapshot_key)?;
             let description = describe_table(
                 &store,
@@ -107,13 +107,14 @@ cache path: {}
         }
         Command::Inventory {
             alias,
+            offset,
             limit,
             cache_path,
         } => {
             let store = open_existing_store(&cache_path)?;
-            let snapshot_key = snapshot_key(&alias);
+            let snapshot_key = resolve_snapshot_key(&store, &alias)?;
             require_snapshot(&store, &snapshot_key)?;
-            render_inventory(&store, &snapshot_key, limit)
+            render_inventory(&store, &snapshot_key, offset, limit)
         }
         Command::FindTable {
             alias,
@@ -122,7 +123,7 @@ cache path: {}
             cache_path,
         } => {
             let store = open_existing_store(&cache_path)?;
-            let snapshot_key = snapshot_key(&alias);
+            let snapshot_key = resolve_snapshot_key(&store, &alias)?;
             require_snapshot(&store, &snapshot_key)?;
             render_find_table(&store, &snapshot_key, &query, format)
         }
@@ -133,7 +134,7 @@ cache path: {}
             cache_path,
         } => {
             let store = open_existing_store(&cache_path)?;
-            let snapshot_key = snapshot_key(&alias);
+            let snapshot_key = resolve_snapshot_key(&store, &alias)?;
             require_snapshot(&store, &snapshot_key)?;
             render_find_column(&store, &snapshot_key, &query, format)
         }
@@ -148,7 +149,7 @@ cache path: {}
             cache_path,
         } => {
             let store = open_existing_store(&cache_path)?;
-            let snapshot_key = snapshot_key(&alias);
+            let snapshot_key = resolve_snapshot_key(&store, &alias)?;
             require_snapshot(&store, &snapshot_key)?;
             render_impact_analysis(
                 &store,
@@ -170,7 +171,7 @@ cache path: {}
             cache_path,
         } => {
             let store = open_existing_store(&cache_path)?;
-            let snapshot_key = snapshot_key(&alias);
+            let snapshot_key = resolve_snapshot_key(&store, &alias)?;
             require_snapshot(&store, &snapshot_key)?;
             render_relationship_trace(
                 &store,
@@ -216,6 +217,7 @@ fn render_contract(format: args::OutputFormat) -> String {
                 "inventory_limits": {
                     "default_tables": args::DEFAULT_INVENTORY_LIMIT,
                     "max_tables": args::MAX_INVENTORY_TABLES,
+                    "offset_pagination": true,
                 }
             }))
             .expect("static contract metadata should serialize")
@@ -273,5 +275,6 @@ mod tests {
             value["inventory_limits"]["max_tables"],
             args::MAX_INVENTORY_TABLES
         );
+        assert_eq!(value["inventory_limits"]["offset_pagination"], true);
     }
 }

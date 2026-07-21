@@ -10,6 +10,7 @@ Prerequisites:
 - A C compiler/toolchain available to Cargo, because some adapter dependencies build native code.
 - On Windows, use the MSVC Rust toolchain with Visual Studio Build Tools or another working MSVC C/C++ build environment.
 - On macOS or Linux, a normal system C compiler such as clang or gcc is expected.
+- Oracle only: Oracle Client 11.2 or later must also be available at runtime. Building the vendored ODPI-C sources does not bundle Oracle Client libraries.
 
 Build the whole workspace in release mode:
 
@@ -29,6 +30,7 @@ Windows:
 - This project has been built with the MSVC Rust toolchain.
 - Install Rust with rustup and make sure an MSVC C/C++ build environment is available before running the release build.
 - Native/build-heavy dependencies include bundled SQLite through `rusqlite`, SQL Server support through `tiberius`/rustls/ring, Oracle support through `odpic-sys` vendored C sources, and MySQL support through the `mysql` crate dependency tree.
+- To use Oracle, install an Oracle Instant Client matching the binary architecture and put the directory containing `oci.dll` on `PATH` before starting the CLI, MCP server, or desktop app.
 
 macOS:
 
@@ -41,6 +43,8 @@ Linux:
 - Install Rust with rustup or your distribution package manager.
 - Ensure gcc or clang plus typical build tooling is installed.
 - The same native adapter dependencies are compiled during `cargo build --release`.
+
+For Oracle on macOS or Linux, install Oracle Client 11.2 or later and make its shared libraries discoverable according to the Instant Client installation instructions before starting the process.
 
 ## MCP Client Configuration
 

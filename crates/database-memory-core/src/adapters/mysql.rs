@@ -506,6 +506,7 @@ fn mysql_capabilities() -> AdapterCapabilities {
         triggers: CapabilitySupport::Unsupported,
         routines: CapabilitySupport::Unsupported,
         dependencies: CapabilitySupport::Unsupported,
+        limitations: vec![],
         notes: vec![
             "Reads INFORMATION_SCHEMA metadata only; no user table rows are read.".to_owned(),
             "MySQL/MariaDB database/catalog names are mapped to the common schema field."

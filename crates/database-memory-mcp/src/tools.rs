@@ -9,15 +9,17 @@ use database_memory_core::graph_query::{
 };
 use database_memory_core::graph_store::{GraphNodeRecord, GraphStore};
 use database_memory_core::impact_analysis::{
-    impact_analysis as run_impact_analysis, Direction, ImpactAnalysisResult,
+    impact_analysis_bounded as run_impact_analysis, Direction, ImpactAnalysisResult,
 };
 use database_memory_core::relationship_trace::{
-    trace_relationships as run_trace_relationships, GraphPath,
+    trace_relationships_bounded as run_trace_relationships, GraphPath,
 };
-use database_memory_core::schema_diff::{schema_diff as run_schema_diff, SchemaDiff};
+use database_memory_core::schema_diff::{
+    schema_diff_bounded as run_schema_diff, BoundedSchemaDiff,
+};
 use database_memory_core::{
     capability_warnings, introspect_schema_source, ColumnObject, ConstraintKind, ConstraintObject,
-    IndexObject, ObjectKey,
+    IndexObject, ObjectKey, ObjectKind,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -25,6 +27,18 @@ use serde_json::{json, Value};
 use crate::types::*;
 
 const DEFAULT_CACHE_PATH: &str = ".database-memory/graph.sqlite";
+const DEFAULT_PAGE_LIMIT: usize = 100;
+const MAX_PAGE_LIMIT: usize = 500;
+const DEFAULT_TRAVERSAL_DEPTH: u32 = 3;
+const MAX_TRAVERSAL_DEPTH: u32 = 8;
+const DEFAULT_RESULT_LIMIT: usize = 100;
+const MAX_RESULT_LIMIT: usize = 200;
+
+struct Page<T> {
+    items: Vec<T>,
+    metadata: PageMetadata,
+}
+
 pub(crate) fn index_database_for_request(
     request: IndexDatabaseRequest,
 ) -> Result<IndexDatabaseResult, String> {
@@ -87,12 +101,19 @@ pub(crate) fn list_tables_for_request(
 ) -> Result<ListTablesResult, String> {
     let cache_path = cache_path(request.cache_path);
     let store = open_existing_store(&cache_path)?;
-    let snapshot_key = snapshot_key(&request.alias);
+    let snapshot_key = resolve_snapshot_key(&store, &request.alias)?;
     require_snapshot(&store, &snapshot_key)?;
-    let tables = list_table_names(&store, &snapshot_key, request.name_filter.as_deref())?;
+    let page = paginate(
+        find_tables(&store, &snapshot_key, request.name_filter.as_deref())?,
+        request.offset,
+        request.limit,
+    )?;
+    let tables = page.items.iter().map(|item| item.table.clone()).collect();
     Ok(ListTablesResult {
         snapshot_key,
         tables,
+        table_matches: page.items,
+        page: page.metadata,
     })
 }
 
@@ -101,7 +122,7 @@ pub(crate) fn describe_table_for_request(
 ) -> Result<TableDescription, String> {
     let cache_path = cache_path(request.cache_path);
     let store = open_existing_store(&cache_path)?;
-    let snapshot_key = snapshot_key(&request.alias);
+    let snapshot_key = resolve_snapshot_key(&store, &request.alias)?;
     require_snapshot(&store, &snapshot_key)?;
     describe_table(&store, &snapshot_key, &request.table_name)
 }
@@ -109,12 +130,19 @@ pub(crate) fn describe_table_for_request(
 pub(crate) fn find_table_for_request(request: FindTableRequest) -> Result<FindTableResult, String> {
     let cache_path = cache_path(request.cache_path);
     let store = open_existing_store(&cache_path)?;
-    let snapshot_key = snapshot_key(&request.alias);
+    let snapshot_key = resolve_snapshot_key(&store, &request.alias)?;
     require_snapshot(&store, &snapshot_key)?;
-    let tables = list_table_names(&store, &snapshot_key, Some(&request.query))?;
+    let page = paginate(
+        find_tables(&store, &snapshot_key, Some(&request.query))?,
+        request.offset,
+        request.limit,
+    )?;
+    let tables = page.items.iter().map(|item| item.table.clone()).collect();
     Ok(FindTableResult {
         snapshot_key,
         tables,
+        table_matches: page.items,
+        page: page.metadata,
     })
 }
 
@@ -123,18 +151,24 @@ pub(crate) fn find_column_for_request(
 ) -> Result<FindColumnResult, String> {
     let cache_path = cache_path(request.cache_path);
     let store = open_existing_store(&cache_path)?;
-    let snapshot_key = snapshot_key(&request.alias);
+    let snapshot_key = resolve_snapshot_key(&store, &request.alias)?;
     require_snapshot(&store, &snapshot_key)?;
+    let page = paginate(
+        find_columns(&store, &snapshot_key, &request.query)?,
+        request.offset,
+        request.limit,
+    )?;
     Ok(FindColumnResult {
         snapshot_key: snapshot_key.clone(),
-        columns: find_columns(&store, &snapshot_key, &request.query)?,
+        columns: page.items,
+        page: page.metadata,
     })
 }
 
 pub(crate) fn impact_analysis_for_request(request: ImpactAnalysisRequest) -> Result<Value, String> {
     let cache_path = cache_path(request.cache_path);
     let store = open_existing_store(&cache_path)?;
-    let snapshot_key = snapshot_key(&request.alias);
+    let snapshot_key = resolve_snapshot_key(&store, &request.alias)?;
     require_snapshot(&store, &snapshot_key)?;
     let direction = parse_direction(&request.direction)?;
     let object_key = resolve_object_key(
@@ -144,15 +178,34 @@ pub(crate) fn impact_analysis_for_request(request: ImpactAnalysisRequest) -> Res
         request.table.as_deref(),
         request.column.as_deref(),
     )?;
-    let result = run_impact_analysis(
+    let max_depth_requested = request.max_depth.unwrap_or(DEFAULT_TRAVERSAL_DEPTH);
+    let max_depth_applied = max_depth_requested.min(MAX_TRAVERSAL_DEPTH);
+    let result_limit_requested = request.result_limit.unwrap_or(DEFAULT_RESULT_LIMIT);
+    let result_limit_applied = result_limit_requested.min(MAX_RESULT_LIMIT);
+    let bounded = run_impact_analysis(
         &store,
         &snapshot_key,
         &object_key,
         direction,
-        request.max_depth.unwrap_or(3),
+        max_depth_applied,
+        result_limit_applied,
     )
     .map_err(|err| err.to_string())?;
-    let mut value = impact_json(&result);
+    let result_count = bounded
+        .result
+        .groups
+        .iter()
+        .map(|group| group.nodes.len())
+        .sum::<usize>();
+    let mut value = impact_json(&bounded.result);
+    value["max_depth_requested"] = json!(max_depth_requested);
+    value["max_depth_applied"] = json!(max_depth_applied);
+    value["max_depth_clamped"] = json!(max_depth_requested != max_depth_applied);
+    value["result_limit_requested"] = json!(result_limit_requested);
+    value["result_limit_applied"] = json!(result_limit_applied);
+    value["result_limit_clamped"] = json!(result_limit_requested != result_limit_applied);
+    value["result_count"] = json!(result_count);
+    value["truncated"] = json!(bounded.truncated);
     value["capability_warnings"] = json!(snapshot_capability_warnings(&store, &snapshot_key)?);
     Ok(value)
 }
@@ -162,23 +215,37 @@ pub(crate) fn trace_relationships_for_request(
 ) -> Result<Value, String> {
     let cache_path = cache_path(request.cache_path);
     let store = open_existing_store(&cache_path)?;
-    let snapshot_key = snapshot_key(&request.alias);
+    let snapshot_key = resolve_snapshot_key(&store, &request.alias)?;
     require_snapshot(&store, &snapshot_key)?;
     let direction = parse_direction(&request.direction)?;
-    let paths = run_trace_relationships(
+    required_node(&store, &snapshot_key, &request.start_object_key)?;
+    let max_depth_requested = request.max_depth.unwrap_or(DEFAULT_TRAVERSAL_DEPTH);
+    let max_depth_applied = max_depth_requested.min(MAX_TRAVERSAL_DEPTH);
+    let result_limit_requested = request.result_limit.unwrap_or(DEFAULT_RESULT_LIMIT);
+    let result_limit_applied = result_limit_requested.min(MAX_RESULT_LIMIT);
+    let bounded = run_trace_relationships(
         &store,
         &snapshot_key,
         &request.start_object_key,
         direction,
-        request.max_depth.unwrap_or(3),
+        max_depth_applied,
+        result_limit_applied,
     )
     .map_err(|err| err.to_string())?;
     Ok(json!({
         "snapshot_key": snapshot_key,
         "start_object_key": request.start_object_key,
         "direction": direction_name(direction),
-        "max_depth": request.max_depth.unwrap_or(3),
-        "paths": graph_paths_json(&paths),
+        "max_depth": max_depth_applied,
+        "max_depth_requested": max_depth_requested,
+        "max_depth_applied": max_depth_applied,
+        "max_depth_clamped": max_depth_requested != max_depth_applied,
+        "result_limit_requested": result_limit_requested,
+        "result_limit_applied": result_limit_applied,
+        "result_limit_clamped": result_limit_requested != result_limit_applied,
+        "result_count": bounded.paths.len(),
+        "truncated": bounded.truncated,
+        "paths": graph_paths_json(&bounded.paths),
         "capability_warnings": snapshot_capability_warnings(&store, &snapshot_key)?,
     }))
 }
@@ -186,13 +253,27 @@ pub(crate) fn trace_relationships_for_request(
 pub(crate) fn schema_diff_for_request(request: SchemaDiffRequest) -> Result<Value, String> {
     let cache_path = cache_path(request.cache_path);
     let store = open_existing_store(&cache_path)?;
-    let from_snapshot_key = snapshot_key(&request.from_alias);
-    let to_snapshot_key = snapshot_key(&request.to_alias);
+    let from_snapshot_key = resolve_snapshot_key(&store, &request.from_alias)?;
+    let to_snapshot_key = resolve_snapshot_key(&store, &request.to_alias)?;
     require_snapshot(&store, &from_snapshot_key)?;
     require_snapshot(&store, &to_snapshot_key)?;
-    let diff = run_schema_diff(&store, &from_snapshot_key, &to_snapshot_key)
-        .map_err(|err| err.to_string())?;
-    Ok(schema_diff_json(&diff))
+    let result_limit_requested = request.result_limit.unwrap_or(DEFAULT_RESULT_LIMIT);
+    if result_limit_requested == 0 {
+        return Err("result_limit must be greater than zero".to_owned());
+    }
+    let result_limit_applied = result_limit_requested.min(MAX_RESULT_LIMIT);
+    let diff = run_schema_diff(
+        &store,
+        &from_snapshot_key,
+        &to_snapshot_key,
+        result_limit_applied,
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(schema_diff_json(
+        &diff,
+        result_limit_requested,
+        result_limit_applied,
+    ))
 }
 
 pub(crate) fn query_graph_for_request(
@@ -200,11 +281,11 @@ pub(crate) fn query_graph_for_request(
 ) -> Result<GraphQueryResult, String> {
     let cache_path = cache_path(request.cache_path);
     let store = open_existing_store(&cache_path)?;
-    let snapshot_key = request
-        .snapshot_key
-        .clone()
-        .or_else(|| request.alias.as_deref().map(snapshot_key))
-        .ok_or("pass snapshot_key or alias")?;
+    let snapshot_key = match (request.snapshot_key.clone(), request.alias.as_deref()) {
+        (Some(snapshot_key), _) => snapshot_key,
+        (None, Some(alias)) => resolve_snapshot_key(&store, alias)?,
+        (None, None) => return Err("pass snapshot_key or alias".to_owned()),
+    };
     require_snapshot(&store, &snapshot_key)?;
     let traversal = request
         .traversal
@@ -216,6 +297,9 @@ pub(crate) fn query_graph_for_request(
             })
         })
         .transpose()?;
+    if let Some(traversal) = &traversal {
+        required_node(&store, &snapshot_key, &traversal.start_node_key)?;
+    }
     run_query_graph(
         &store,
         &GraphQuery {
@@ -272,13 +356,16 @@ fn describe_table(
     table_name: &str,
 ) -> Result<TableDescription, String> {
     let table = find_table_node(store, snapshot_key, table_name)?;
+    let table_identity = object_key(&table)?;
     let columns = table_columns(store, snapshot_key, &table.node_key)?;
     let constraints = table_constraints(store, snapshot_key, &table.node_key)?;
-    let primary_key = constraints
+    let primary_key_columns = constraints
         .iter()
         .find(|constraint| constraint.kind == ConstraintKind::PrimaryKey)
-        .map(|constraint| names_from_keys(&constraint.columns))
+        .map(|constraint| constraint.columns.as_slice())
         .unwrap_or_default();
+    let primary_key = names_from_keys(primary_key_columns);
+    let primary_key_keys = string_keys(primary_key_columns);
     let mut outbound = constraints
         .iter()
         .filter(|constraint| constraint.kind == ConstraintKind::ForeignKey)
@@ -305,51 +392,76 @@ fn describe_table(
     inbound.sort_by(|left, right| left.name.cmp(&right.name));
 
     Ok(TableDescription {
-        table: table_name.to_owned(),
+        snapshot_key: snapshot_key.to_owned(),
+        object_key: table.node_key.clone(),
+        database: table_identity.database,
+        schema: table_identity.schema,
+        table: table_identity.object_name,
         columns: columns
             .into_iter()
             .map(|column| ColumnDescription {
+                object_key: column.key.to_string(),
                 name: column.name,
+                ordinal_position: column.ordinal_position,
                 data_type: column.data_type,
                 nullable: column.is_nullable,
+                default_value: column.default_value,
+                generated: column.is_generated,
             })
             .collect(),
         primary_key,
+        primary_key_keys,
+        constraints: constraints.iter().map(constraint_description).collect(),
         foreign_keys: ForeignKeysDescription { outbound, inbound },
         indexes: table_indexes(store, snapshot_key, &table.node_key)?
             .into_iter()
             .map(|index| IndexDescription {
+                object_key: index.key.to_string(),
                 name: index.name,
+                column_keys: string_keys(&index.columns),
                 columns: names_from_keys(&index.columns),
                 unique: index.is_unique,
                 primary: index.is_primary,
+                predicate: index.predicate,
+                expression: index.expression,
             })
             .collect(),
         capability_warnings: snapshot_capability_warnings(store, snapshot_key)?,
     })
 }
 
-fn list_table_names(
+fn find_tables(
     store: &GraphStore,
     snapshot_key: &str,
     filter: Option<&str>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<TableMatch>, String> {
     let needle = filter.map(str::to_lowercase);
     let mut tables = Vec::new();
     for node in store
         .nodes_by_label(snapshot_key, "Table")
         .map_err(|err| err.to_string())?
     {
-        let name = object_key(&node)?.object_name;
+        let key = object_key(&node)?;
         if needle
             .as_ref()
-            .map(|needle| name.to_lowercase().contains(needle))
+            .map(|needle| key.object_name.to_lowercase().contains(needle))
             .unwrap_or(true)
         {
-            tables.push(name);
+            tables.push(TableMatch {
+                object_key: node.node_key,
+                database: key.database,
+                schema: key.schema,
+                table: key.object_name,
+            });
         }
     }
-    tables.sort();
+    tables.sort_by(|left, right| {
+        left.database
+            .cmp(&right.database)
+            .then_with(|| left.schema.cmp(&right.schema))
+            .then_with(|| left.table.cmp(&right.table))
+            .then_with(|| left.object_key.cmp(&right.object_key))
+    });
     Ok(tables)
 }
 
@@ -370,16 +482,33 @@ fn find_columns(
             .clone()
             .unwrap_or_else(|| key.object_name.clone());
         if column.to_lowercase().contains(&needle) {
+            let table_key = ObjectKey::new(
+                key.source_kind.clone(),
+                key.connection_alias.clone(),
+                key.database.clone(),
+                key.schema.clone(),
+                ObjectKind::Table,
+                key.object_name.clone(),
+                None,
+            )
+            .to_string();
             columns.push(ColumnMatch {
+                object_key: node.node_key,
+                table_key,
+                database: key.database,
+                schema: key.schema,
                 table: key.object_name,
                 column,
             });
         }
     }
     columns.sort_by(|left, right| {
-        left.table
-            .cmp(&right.table)
+        left.database
+            .cmp(&right.database)
+            .then_with(|| left.schema.cmp(&right.schema))
+            .then_with(|| left.table.cmp(&right.table))
             .then_with(|| left.column.cmp(&right.column))
+            .then_with(|| left.object_key.cmp(&right.object_key))
     });
     Ok(columns)
 }
@@ -389,17 +518,42 @@ fn find_table_node(
     snapshot_key: &str,
     table_name: &str,
 ) -> Result<GraphNodeRecord, String> {
-    for node in store
-        .nodes_by_label(snapshot_key, "Table")
+    if let Some(node) = store
+        .get_node(snapshot_key, table_name)
         .map_err(|err| err.to_string())?
     {
-        if object_key(&node)?.object_name == table_name {
+        if node.label == "Table" {
             return Ok(node);
         }
+        return Err(format!("graph node '{table_name}' is not a table"));
     }
-    Err(format!(
-        "table '{table_name}' not found in snapshot '{snapshot_key}'"
-    ))
+
+    let mut matches = store
+        .nodes_by_label(snapshot_key, "Table")
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .filter_map(|node| match object_key(&node) {
+            Ok(key) if key.object_name == table_name => Some(Ok(node)),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    matches.sort_by(|left, right| left.node_key.cmp(&right.node_key));
+
+    match matches.len() {
+        0 => Err(format!(
+            "table '{table_name}' not found in snapshot '{snapshot_key}'"
+        )),
+        1 => Ok(matches.remove(0)),
+        _ => Err(format!(
+            "table '{table_name}' is ambiguous in snapshot '{snapshot_key}'; pass one object key: {}",
+            matches
+                .iter()
+                .map(|node| node.node_key.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 fn table_columns(
@@ -466,6 +620,7 @@ fn resolve_object_key(
     column: Option<&str>,
 ) -> Result<String, String> {
     if let Some(object_key) = object_key {
+        required_node(store, snapshot_key, object_key)?;
         return Ok(object_key.to_owned());
     }
 
@@ -489,16 +644,7 @@ fn resolve_object_key(
                 .filter(|item| item.column == column)
                 .collect::<Vec<_>>();
             match matches.as_slice() {
-                [item] => Ok(ObjectKey::new(
-                    "sqlite",
-                    alias_from_snapshot_key(snapshot_key),
-                    "main",
-                    "main",
-                    database_memory_core::ObjectKind::Column,
-                    item.table.clone(),
-                    Some(item.column.clone()),
-                )
-                .to_string()),
+                [item] => Ok(item.object_key.clone()),
                 [] => Err(format!(
                     "column '{column}' not found in snapshot '{snapshot_key}'"
                 )),
@@ -561,16 +707,53 @@ fn old_cache_error(node: &GraphNodeRecord) -> String {
 
 fn foreign_key_description(constraint: &ConstraintObject) -> ForeignKeyDescription {
     ForeignKeyDescription {
+        object_key: constraint.key.to_string(),
         name: constraint.name.clone(),
+        table_key: constraint.table_key.to_string(),
         table: constraint.table_key.object_name.clone(),
+        column_keys: string_keys(&constraint.columns),
         columns: names_from_keys(&constraint.columns),
+        referenced_table_key: constraint
+            .referenced_table_key
+            .as_ref()
+            .map(ToString::to_string),
         referenced_table: constraint
             .referenced_table_key
             .as_ref()
             .map(|key| key.object_name.clone())
             .unwrap_or_default(),
+        referenced_column_keys: string_keys(&constraint.referenced_columns),
         referenced_columns: names_from_keys(&constraint.referenced_columns),
     }
+}
+
+fn constraint_description(constraint: &ConstraintObject) -> ConstraintDescription {
+    ConstraintDescription {
+        object_key: constraint.key.to_string(),
+        name: constraint.name.clone(),
+        kind: constraint_kind_name(constraint.kind).to_owned(),
+        column_keys: string_keys(&constraint.columns),
+        columns: names_from_keys(&constraint.columns),
+        referenced_table_key: constraint
+            .referenced_table_key
+            .as_ref()
+            .map(ToString::to_string),
+        referenced_column_keys: string_keys(&constraint.referenced_columns),
+        expression: constraint.expression.clone(),
+    }
+}
+
+fn constraint_kind_name(kind: ConstraintKind) -> &'static str {
+    match kind {
+        ConstraintKind::PrimaryKey => "primary_key",
+        ConstraintKind::ForeignKey => "foreign_key",
+        ConstraintKind::Unique => "unique",
+        ConstraintKind::Check => "check",
+    }
+}
+
+fn string_keys(keys: &[ObjectKey]) -> Vec<String> {
+    keys.iter().map(ToString::to_string).collect()
 }
 
 fn names_from_keys(keys: &[ObjectKey]) -> Vec<String> {
@@ -618,11 +801,58 @@ fn cache_path(cache_path: Option<String>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CACHE_PATH))
 }
 
-fn snapshot_key(alias: &str) -> String {
-    if alias.contains(':') {
-        alias.to_owned()
-    } else {
-        format!("sqlite:{alias}")
+fn paginate<T>(
+    items: Vec<T>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<Page<T>, String> {
+    let offset = offset.unwrap_or(0);
+    let limit_requested = limit.unwrap_or(DEFAULT_PAGE_LIMIT);
+    if limit_requested == 0 {
+        return Err("limit must be greater than zero".to_owned());
+    }
+    let limit_applied = limit_requested.min(MAX_PAGE_LIMIT);
+    let total = items.len();
+    let has_more = offset.saturating_add(limit_applied) < total;
+    let items = items.into_iter().skip(offset).take(limit_applied).collect();
+
+    Ok(Page {
+        items,
+        metadata: PageMetadata {
+            total,
+            offset,
+            limit_requested,
+            limit_applied,
+            limit_clamped: limit_requested != limit_applied,
+            has_more,
+        },
+    })
+}
+
+fn resolve_snapshot_key(store: &GraphStore, selector: &str) -> Result<String, String> {
+    if store
+        .get_snapshot(selector)
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Ok(selector.to_owned());
+    }
+
+    let matches = store
+        .list_snapshots()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|snapshot| alias_from_snapshot_key(&snapshot.snapshot_key) == selector)
+        .map(|snapshot| snapshot.snapshot_key)
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [snapshot_key] => Ok(snapshot_key.clone()),
+        [] => Err(format!("database snapshot '{selector}' not found")),
+        _ => Err(format!(
+            "database alias '{selector}' is ambiguous; pass one snapshot key: {}",
+            matches.join(", ")
+        )),
     }
 }
 
@@ -688,6 +918,8 @@ fn impact_json(result: &ImpactAnalysisResult) -> Value {
                 "display_name": &node.display_name,
                 "depth": node.depth,
                 "edge_type_used": &node.edge_type_used,
+                "edge_from": &node.edge_from,
+                "edge_to": &node.edge_to,
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
     })
@@ -702,16 +934,35 @@ fn graph_paths_json(paths: &[GraphPath]) -> Vec<Value> {
                     "node_key": &hop.node_key,
                     "label": &hop.label,
                     "edge_type_used": &hop.edge_type_used,
+                    "edge_from": &hop.edge_from,
+                    "edge_to": &hop.edge_to,
                 })).collect::<Vec<_>>()
             })
         })
         .collect()
 }
 
-fn schema_diff_json(diff: &SchemaDiff) -> Value {
+fn schema_diff_json(
+    bounded: &BoundedSchemaDiff,
+    result_limit_requested: usize,
+    result_limit_applied: usize,
+) -> Value {
+    let diff = &bounded.diff;
     json!({
         "from_snapshot_key": &diff.from_snapshot_key,
         "to_snapshot_key": &diff.to_snapshot_key,
+        "counts": {
+            "added_nodes": bounded.counts.added_nodes,
+            "removed_nodes": bounded.counts.removed_nodes,
+            "changed_nodes": bounded.counts.changed_nodes,
+            "added_edges": bounded.counts.added_edges,
+            "removed_edges": bounded.counts.removed_edges,
+            "impacted_seeds": bounded.counts.impacted_seeds,
+        },
+        "result_limit_requested": result_limit_requested,
+        "result_limit_applied": result_limit_applied,
+        "result_limit_clamped": result_limit_requested != result_limit_applied,
+        "truncated": bounded.truncated,
         "added_nodes": diff.added_nodes.iter().map(node_json).collect::<Vec<_>>(),
         "removed_nodes": diff.removed_nodes.iter().map(node_json).collect::<Vec<_>>(),
         "changed_nodes": diff.changed_nodes.iter().map(|changed| json!({
@@ -723,17 +974,14 @@ fn schema_diff_json(diff: &SchemaDiff) -> Value {
         "impacted": diff.impacted.iter().map(|impact| json!({
             "seed_node_key": &impact.seed_node_key,
             "snapshot_key": &impact.snapshot_key,
+            "truncated": impact.truncated,
             "impact": impact_json(&impact.impact),
         })).collect::<Vec<_>>(),
     })
 }
 
-pub(crate) fn tool_json<T: Serialize>(result: Result<T, String>) -> String {
-    let value = match result {
-        Ok(value) => serde_json::to_value(value).expect("tool result should serialize"),
-        Err(error) => json!({ "error": error }),
-    };
-    serde_json::to_string(&value).expect("tool result should serialize")
+pub(crate) fn tool_json<T: Serialize>(result: Result<T, String>) -> Result<String, String> {
+    result.and_then(|value| serde_json::to_string(&value).map_err(|error| error.to_string()))
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<(), std::io::Error> {

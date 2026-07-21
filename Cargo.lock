@@ -351,7 +351,7 @@ dependencies = [
 
 [[package]]
 name = "database-memory-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "database-memory-core",
  "serde_json",
@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "database-memory-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "mysql",
  "oracle",
@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "database-memory-mcp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "database-memory-core",
  "rmcp",

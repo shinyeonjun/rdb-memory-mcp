@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use database_memory_core::graph_store::{GraphNodeRecord, GraphStore};
@@ -8,7 +8,7 @@ use database_memory_core::impact_analysis::{
 use database_memory_core::relationship_trace::{trace_relationships_bounded, GraphPath};
 use database_memory_core::{
     capability_warnings, ColumnObject, ConstraintKind, ConstraintObject, IndexObject, ObjectKey,
-    ObjectKind,
+    ObjectKind, SchemaSnapshot, TableObject,
 };
 use serde_json::json;
 
@@ -27,11 +27,38 @@ pub(crate) fn open_existing_store(cache_path: &Path) -> Result<GraphStore, Strin
     GraphStore::open(cache_path).map_err(|err| err.to_string())
 }
 
-pub(crate) fn snapshot_key(alias: &str) -> String {
-    if alias.contains(':') {
-        alias.to_owned()
-    } else {
-        format!("sqlite:{alias}")
+pub(crate) fn resolve_snapshot_key(store: &GraphStore, selector: &str) -> Result<String, String> {
+    if store
+        .get_snapshot(selector)
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Ok(selector.to_owned());
+    }
+
+    let matches = store
+        .list_snapshots()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|snapshot| {
+            snapshot
+                .snapshot_key
+                .split_once(':')
+                .map(|(_, alias)| alias == selector)
+                .unwrap_or(false)
+        })
+        .map(|snapshot| snapshot.snapshot_key)
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [snapshot_key] => Ok(snapshot_key.clone()),
+        [] => Err(format!(
+            "snapshot selector '{selector}' not found in cache; run index first"
+        )),
+        _ => Err(format!(
+            "snapshot alias '{selector}' is ambiguous; use one snapshot key: {}",
+            matches.join(", ")
+        )),
     }
 }
 
@@ -64,6 +91,7 @@ pub(crate) struct TableDescription {
     outbound_foreign_keys: Vec<ForeignKeyDescription>,
     inbound_foreign_keys: Vec<ForeignKeyDescription>,
     indexes: Vec<IndexObject>,
+    dependents: Vec<DependentObjectDescription>,
     capability_warnings: Vec<String>,
 }
 
@@ -78,6 +106,15 @@ struct ForeignKeyDescription {
     referenced_table: String,
     referenced_columns: Vec<String>,
     referenced_column_keys: Vec<String>,
+}
+
+#[derive(Clone)]
+struct DependentObjectDescription {
+    key: String,
+    kind: String,
+    name: String,
+    relation: String,
+    column_keys: Vec<String>,
 }
 
 pub(crate) fn describe_table(
@@ -119,6 +156,7 @@ pub(crate) fn describe_table(
         inbound_foreign_keys.push(foreign_key_description(&foreign_key_from_node(&node)?));
     }
     inbound_foreign_keys.sort_by(|left, right| left.name.cmp(&right.name));
+    let dependents = table_dependents(store, snapshot_key, &table.node_key, &columns)?;
 
     Ok(TableDescription {
         snapshot_key: snapshot_key.to_owned(),
@@ -130,8 +168,114 @@ pub(crate) fn describe_table(
         outbound_foreign_keys,
         inbound_foreign_keys,
         indexes: table_indexes(store, snapshot_key, &table.node_key)?,
+        dependents,
         capability_warnings: snapshot_capability_warnings(store, snapshot_key)?,
     })
+}
+
+fn table_dependents(
+    store: &GraphStore,
+    snapshot_key: &str,
+    table_key: &str,
+    columns: &[ColumnObject],
+) -> Result<Vec<DependentObjectDescription>, String> {
+    let mut dependents = BTreeMap::<String, DependentObjectDescription>::new();
+    for edge in store
+        .edges_to(snapshot_key, table_key)
+        .map_err(|error| error.to_string())?
+    {
+        if matches!(
+            edge.edge_type.as_str(),
+            "VIEW_DEPENDS_ON_TABLE" | "ROUTINE_DEPENDS_ON_TABLE"
+        ) {
+            let node = required_node(store, snapshot_key, &edge.edge_from)?;
+            merge_dependent(
+                &mut dependents,
+                dependent_from_node(&node, &edge.edge_type)?,
+                None,
+            );
+        }
+    }
+    for column in columns {
+        for edge in store
+            .edges_to(snapshot_key, &column.key.to_string())
+            .map_err(|error| error.to_string())?
+        {
+            if matches!(
+                edge.edge_type.as_str(),
+                "VIEW_DEPENDS_ON_COLUMN" | "ROUTINE_DEPENDS_ON_COLUMN"
+            ) {
+                let node = required_node(store, snapshot_key, &edge.edge_from)?;
+                merge_dependent(
+                    &mut dependents,
+                    dependent_from_node(&node, &edge.edge_type)?,
+                    Some(column.key.to_string()),
+                );
+            }
+        }
+    }
+    for edge in store
+        .edges_from(snapshot_key, table_key)
+        .map_err(|error| error.to_string())?
+    {
+        if edge.edge_type == "TABLE_HAS_TRIGGER" {
+            let node = required_node(store, snapshot_key, &edge.edge_to)?;
+            merge_dependent(
+                &mut dependents,
+                dependent_from_node(&node, &edge.edge_type)?,
+                None,
+            );
+        }
+    }
+    Ok(dependents.into_values().collect())
+}
+
+fn dependent_from_node(
+    node: &GraphNodeRecord,
+    relation: &str,
+) -> Result<DependentObjectDescription, String> {
+    let key = object_key(node)?;
+    let kind = match key.object_kind {
+        ObjectKind::View => "view",
+        ObjectKind::Trigger => "trigger",
+        ObjectKind::Routine => "routine",
+        _ => {
+            return Err(format!(
+                "graph node '{}' is not a DB dependent object",
+                node.node_key
+            ))
+        }
+    };
+    let relation = match relation {
+        "VIEW_DEPENDS_ON_TABLE" | "VIEW_DEPENDS_ON_COLUMN" => "view_depends_on",
+        "ROUTINE_DEPENDS_ON_TABLE" | "ROUTINE_DEPENDS_ON_COLUMN" => "routine_depends_on",
+        "TABLE_HAS_TRIGGER" => "table_has_trigger",
+        _ => relation,
+    };
+    Ok(DependentObjectDescription {
+        key: node.node_key.clone(),
+        kind: kind.to_owned(),
+        name: node
+            .display_name
+            .clone()
+            .unwrap_or_else(|| key.object_name.clone()),
+        relation: relation.to_owned(),
+        column_keys: Vec::new(),
+    })
+}
+
+fn merge_dependent(
+    dependents: &mut BTreeMap<String, DependentObjectDescription>,
+    dependent: DependentObjectDescription,
+    column_key: Option<String>,
+) {
+    let entry = dependents.entry(dependent.key.clone()).or_insert(dependent);
+    if let Some(column_key) = column_key {
+        if !entry.column_keys.contains(&column_key) {
+            entry.column_keys.push(column_key);
+            entry.column_keys.sort();
+        }
+    }
 }
 
 fn find_table_node(
@@ -309,6 +453,17 @@ fn render_table_description_text(description: &TableDescription) -> String {
             ));
         }
     }
+    out.push_str("dependents:\n");
+    if description.dependents.is_empty() {
+        out.push_str("  (none)\n");
+    } else {
+        for dependent in &description.dependents {
+            out.push_str(&format!(
+                "  {} {} via {}\n",
+                dependent.kind, dependent.name, dependent.relation
+            ));
+        }
+    }
     if !description.capability_warnings.is_empty() {
         out.push_str(
             "capability warnings:
@@ -392,6 +547,13 @@ fn table_description_json_value(description: &TableDescription) -> serde_json::V
             "predicate": &index.predicate,
             "expression": &index.expression,
         })).collect::<Vec<_>>(),
+        "dependents": description.dependents.iter().map(|dependent| json!({
+            "key": &dependent.key,
+            "kind": &dependent.kind,
+            "name": &dependent.name,
+            "relation": &dependent.relation,
+            "column_keys": &dependent.column_keys,
+        })).collect::<Vec<_>>(),
         "capability_warnings": &description.capability_warnings,
     })
 }
@@ -399,42 +561,269 @@ fn table_description_json_value(description: &TableDescription) -> serde_json::V
 pub(crate) fn render_inventory(
     store: &GraphStore,
     snapshot_key: &str,
+    offset: usize,
     limit_requested: usize,
 ) -> Result<String, String> {
-    let mut table_nodes = store
-        .nodes_by_label(snapshot_key, "Table")
-        .map_err(|err| err.to_string())?;
-    table_nodes.sort_by(|left, right| left.node_key.cmp(&right.node_key));
+    let record = store
+        .get_snapshot(snapshot_key)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("snapshot '{snapshot_key}' not found in cache; run index first"))?;
+    let snapshot =
+        serde_json::from_str::<SchemaSnapshot>(&record.payload_json).map_err(|error| {
+            format!("snapshot '{snapshot_key}' payload is incompatible; re-index it: {error}")
+        })?;
+    let warnings = capability_warnings(&snapshot.capabilities);
+    let index = InventoryDescriptionIndex::new(&snapshot);
+    let mut table_entries = snapshot
+        .tables
+        .iter()
+        .map(|table| (table.key.to_string(), table))
+        .collect::<Vec<_>>();
+    table_entries.sort_by(|left, right| left.0.cmp(&right.0));
 
-    let total_tables = table_nodes.len();
-    let (limit_applied, limit_clamped, truncated) = inventory_bounds(limit_requested, total_tables);
-    let mut tables = Vec::with_capacity(total_tables.min(limit_applied));
-    for table in table_nodes.into_iter().take(limit_applied) {
-        let description = describe_table(store, snapshot_key, Some(&table.node_key), None)?;
+    let total_tables = table_entries.len();
+    let (limit_applied, limit_clamped) = inventory_bounds(limit_requested);
+    let mut tables = Vec::with_capacity(total_tables.saturating_sub(offset).min(limit_applied));
+    for (table_key, table) in table_entries.into_iter().skip(offset).take(limit_applied) {
+        let description = index.describe(snapshot_key, table_key, table, &warnings);
         tables.push(table_description_json_value(&description));
     }
+    let next_offset = offset.saturating_add(tables.len());
+    let has_more = next_offset < total_tables;
 
     Ok(json_line(json!({
         "contract_version": PRODUCT_CONTRACT_VERSION,
         "snapshot_key": snapshot_key,
+        "offset": offset,
         "limit_requested": limit_requested,
         "limit_applied": limit_applied,
         "limit_clamped": limit_clamped,
         "result_count": tables.len(),
         "total_tables": total_tables,
-        "truncated": truncated,
-        "capability_warnings": snapshot_capability_warnings(store, snapshot_key)?,
+        "has_more": has_more,
+        "next_offset": has_more.then_some(next_offset),
+        "truncated": has_more,
+        "capability_warnings": warnings,
         "tables": tables,
     })))
 }
 
-fn inventory_bounds(limit_requested: usize, total_tables: usize) -> (usize, bool, bool) {
+struct InventoryDescriptionIndex<'a> {
+    columns: HashMap<String, Vec<&'a ColumnObject>>,
+    constraints: HashMap<String, Vec<&'a ConstraintObject>>,
+    inbound_foreign_keys: HashMap<String, Vec<&'a ConstraintObject>>,
+    indexes: HashMap<String, Vec<&'a IndexObject>>,
+    dependents: HashMap<String, BTreeMap<String, DependentObjectDescription>>,
+}
+
+impl<'a> InventoryDescriptionIndex<'a> {
+    fn new(snapshot: &'a SchemaSnapshot) -> Self {
+        let mut index = Self {
+            columns: HashMap::new(),
+            constraints: HashMap::new(),
+            inbound_foreign_keys: HashMap::new(),
+            indexes: HashMap::new(),
+            dependents: HashMap::new(),
+        };
+        for column in &snapshot.columns {
+            index
+                .columns
+                .entry(column.table_key.to_string())
+                .or_default()
+                .push(column);
+        }
+        for constraint in &snapshot.constraints {
+            index
+                .constraints
+                .entry(constraint.table_key.to_string())
+                .or_default()
+                .push(constraint);
+            if constraint.kind == ConstraintKind::ForeignKey {
+                if let Some(referenced_table) = &constraint.referenced_table_key {
+                    index
+                        .inbound_foreign_keys
+                        .entry(referenced_table.to_string())
+                        .or_default()
+                        .push(constraint);
+                }
+            }
+        }
+        for item in &snapshot.indexes {
+            index
+                .indexes
+                .entry(item.table_key.to_string())
+                .or_default()
+                .push(item);
+        }
+        let column_tables = snapshot
+            .columns
+            .iter()
+            .map(|column| (column.key.to_string(), column.table_key.to_string()))
+            .collect::<HashMap<_, _>>();
+        for view in &snapshot.views {
+            index.record_dependencies(
+                &view.key,
+                &view.name,
+                "view",
+                "view_depends_on",
+                &view.depends_on,
+                &column_tables,
+            );
+        }
+        for routine in &snapshot.routines {
+            index.record_dependencies(
+                &routine.key,
+                &routine.name,
+                "routine",
+                "routine_depends_on",
+                &routine.depends_on,
+                &column_tables,
+            );
+        }
+        for trigger in &snapshot.triggers {
+            if trigger.table_key.object_kind == ObjectKind::Table {
+                index.record_dependent(
+                    trigger.table_key.to_string(),
+                    &trigger.key,
+                    &trigger.name,
+                    "trigger",
+                    "table_has_trigger",
+                    None,
+                );
+            }
+        }
+        index
+    }
+
+    fn record_dependencies(
+        &mut self,
+        key: &ObjectKey,
+        name: &str,
+        kind: &str,
+        relation: &str,
+        dependencies: &[ObjectKey],
+        column_tables: &HashMap<String, String>,
+    ) {
+        for dependency in dependencies {
+            match dependency.object_kind {
+                ObjectKind::Table => {
+                    self.record_dependent(dependency.to_string(), key, name, kind, relation, None)
+                }
+                ObjectKind::Column => {
+                    if let Some(table_key) = column_tables.get(&dependency.to_string()) {
+                        self.record_dependent(
+                            table_key.clone(),
+                            key,
+                            name,
+                            kind,
+                            relation,
+                            Some(dependency.to_string()),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn record_dependent(
+        &mut self,
+        table_key: String,
+        key: &ObjectKey,
+        name: &str,
+        kind: &str,
+        relation: &str,
+        column_key: Option<String>,
+    ) {
+        merge_dependent(
+            self.dependents.entry(table_key).or_default(),
+            DependentObjectDescription {
+                key: key.to_string(),
+                kind: kind.to_owned(),
+                name: name.to_owned(),
+                relation: relation.to_owned(),
+                column_keys: Vec::new(),
+            },
+            column_key,
+        );
+    }
+
+    fn describe(
+        &self,
+        snapshot_key: &str,
+        table_key: String,
+        table: &TableObject,
+        capability_warnings: &[String],
+    ) -> TableDescription {
+        let mut columns = self
+            .columns
+            .get(&table_key)
+            .into_iter()
+            .flatten()
+            .map(|column| (*column).clone())
+            .collect::<Vec<_>>();
+        columns.sort_by_key(|column| column.ordinal_position);
+        let mut constraints = self
+            .constraints
+            .get(&table_key)
+            .into_iter()
+            .flatten()
+            .map(|constraint| (*constraint).clone())
+            .collect::<Vec<_>>();
+        constraints.sort_by_key(|constraint| constraint.key.to_string());
+        let primary_key = constraints
+            .iter()
+            .find(|constraint| constraint.kind == ConstraintKind::PrimaryKey)
+            .map(|constraint| names_from_keys(&constraint.columns))
+            .unwrap_or_default();
+        let mut outbound_foreign_keys = constraints
+            .iter()
+            .filter(|constraint| constraint.kind == ConstraintKind::ForeignKey)
+            .map(foreign_key_description)
+            .collect::<Vec<_>>();
+        outbound_foreign_keys.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut inbound_foreign_keys = self
+            .inbound_foreign_keys
+            .get(&table_key)
+            .into_iter()
+            .flatten()
+            .map(|constraint| foreign_key_description(constraint))
+            .collect::<Vec<_>>();
+        inbound_foreign_keys.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut indexes = self
+            .indexes
+            .get(&table_key)
+            .into_iter()
+            .flatten()
+            .map(|index| (*index).clone())
+            .collect::<Vec<_>>();
+        indexes.sort_by(|left, right| left.name.cmp(&right.name));
+        let dependents = self
+            .dependents
+            .get(&table_key)
+            .into_iter()
+            .flat_map(|items| items.values().cloned())
+            .collect();
+
+        TableDescription {
+            snapshot_key: snapshot_key.to_owned(),
+            table_key,
+            table_name: table.name.clone(),
+            columns,
+            primary_key,
+            constraints,
+            outbound_foreign_keys,
+            inbound_foreign_keys,
+            indexes,
+            dependents,
+            capability_warnings: capability_warnings.to_vec(),
+        }
+    }
+}
+
+fn inventory_bounds(limit_requested: usize) -> (usize, bool) {
     let limit_applied = limit_requested.min(MAX_INVENTORY_TABLES);
-    (
-        limit_applied,
-        limit_requested != limit_applied,
-        total_tables > limit_applied,
-    )
+    (limit_applied, limit_requested != limit_applied)
 }
 
 fn constraint_kind_name(kind: ConstraintKind) -> &'static str {
@@ -521,12 +910,9 @@ pub(crate) fn render_find_column(
         .nodes_by_label(snapshot_key, "Column")
         .map_err(|err| err.to_string())?
     {
-        let key = object_key(&node)?;
-        let column_name = key
-            .sub_object
-            .as_deref()
-            .unwrap_or(&key.object_name)
-            .to_owned();
+        let column = column_from_node(&node)?;
+        let key = &column.key;
+        let column_name = column.name.clone();
         if column_name.to_lowercase().contains(&needle) {
             let column_key = key.to_string();
             let table_key = ObjectKey::new(
@@ -547,6 +933,11 @@ pub(crate) fn render_find_column(
                 "database": key.database,
                 "table": key.object_name,
                 "column": column_name,
+                "ordinal_position": column.ordinal_position,
+                "type": column.data_type,
+                "nullable": column.is_nullable,
+                "default_value": column.default_value,
+                "generated": column.is_generated,
             }));
         }
     }
@@ -851,9 +1242,11 @@ fn yes_no(value: bool) -> &'static str {
 mod tests {
     use super::*;
     use database_memory_core::graph_builder::insert_schema_snapshot_graph;
+    use database_memory_core::graph_store::GraphSnapshotRecord;
     use database_memory_core::{
-        AdapterCapabilities, CapabilitySupport, DatabaseObject, ObjectKind, SchemaObject,
-        SchemaSnapshot, TableKind, TableObject,
+        AdapterCapabilities, CapabilitySupport, DatabaseObject, ObjectKind, RoutineKind,
+        RoutineObject, SchemaObject, SchemaSnapshot, TableKind, TableObject, TriggerObject,
+        ViewObject,
     };
 
     const SNAPSHOT: &str = "sqlite:sample";
@@ -962,6 +1355,91 @@ mod tests {
         );
         assert_eq!(found_columns["columns"][0]["schema"], "main");
         assert_eq!(found_columns["columns"][0]["database"], "main");
+        assert_eq!(found_columns["columns"][0]["type"], "INTEGER");
+        assert_eq!(found_columns["columns"][0]["nullable"], false);
+        assert_eq!(found_columns["columns"][0]["generated"], false);
+    }
+
+    #[test]
+    fn inventory_and_describe_include_direct_view_trigger_and_routine_dependents() {
+        let mut source = snapshot();
+        let orders = key(ObjectKind::Table, "orders", None);
+        let user_id = key(ObjectKind::Column, "orders", Some("user_id"));
+        source.views.push(ViewObject {
+            key: key(ObjectKind::View, "order_users", None),
+            schema_key: key(ObjectKind::Schema, "main", None),
+            name: "order_users".to_owned(),
+            definition: None,
+            depends_on: vec![orders.clone(), user_id.clone()],
+        });
+        source.triggers.push(TriggerObject {
+            key: key(ObjectKind::Trigger, "orders", Some("orders_touch")),
+            table_key: orders.clone(),
+            name: "orders_touch".to_owned(),
+            timing: Some("AFTER".to_owned()),
+            events: vec!["UPDATE".to_owned()],
+            definition: None,
+            executes_routine_key: None,
+        });
+        source.routines.push(RoutineObject {
+            key: key(ObjectKind::Routine, "refresh_orders", None),
+            schema_key: key(ObjectKind::Schema, "main", None),
+            name: "refresh_orders".to_owned(),
+            kind: RoutineKind::Function,
+            definition: None,
+            depends_on: vec![orders.clone(), user_id.clone()],
+        });
+        let store = GraphStore::in_memory().unwrap();
+        insert_schema_snapshot_graph(&store, SNAPSHOT, 0, &source).unwrap();
+
+        let inventory: serde_json::Value =
+            serde_json::from_str(&render_inventory(&store, SNAPSHOT, 0, 10).unwrap()).unwrap();
+        let table = inventory["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|table| table["table_key"] == orders.to_string())
+            .unwrap();
+        let dependents = table["dependents"].as_array().unwrap();
+
+        assert_eq!(dependents.len(), 3);
+        assert!(dependents.iter().any(|dependent| {
+            dependent["kind"] == "view"
+                && dependent["name"] == "order_users"
+                && dependent["column_keys"] == json!([user_id.to_string()])
+        }));
+        assert!(dependents.iter().any(|dependent| {
+            dependent["kind"] == "trigger"
+                && dependent["relation"] == "table_has_trigger"
+                && dependent["column_keys"] == json!([])
+        }));
+
+        let described = describe_table(&store, SNAPSHOT, Some(&orders.to_string()), None).unwrap();
+        assert_eq!(table, &table_description_json_value(&described));
+    }
+
+    #[test]
+    fn snapshot_selector_supports_non_sqlite_aliases_and_rejects_ambiguity() {
+        let store = GraphStore::in_memory().unwrap();
+        for snapshot_key in ["postgres:shared", "mysql:shared"] {
+            store
+                .insert_snapshot(&GraphSnapshotRecord {
+                    snapshot_key: snapshot_key.to_owned(),
+                    source: Some(snapshot_key.to_owned()),
+                    captured_at_unix_ms: 0,
+                    payload_json: "{}".to_owned(),
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            resolve_snapshot_key(&store, "postgres:shared").unwrap(),
+            "postgres:shared"
+        );
+        let error = resolve_snapshot_key(&store, "shared").unwrap_err();
+        assert!(error.contains("ambiguous"));
+        assert!(error.contains("mysql:shared"));
+        assert!(error.contains("postgres:shared"));
     }
 
     #[test]
@@ -1025,17 +1503,20 @@ mod tests {
             "cross-object dependency metadata is not tracked by the sqlite adapter."
         ]);
         let inventory: serde_json::Value =
-            serde_json::from_str(&render_inventory(&store, SNAPSHOT, 1).unwrap()).unwrap();
+            serde_json::from_str(&render_inventory(&store, SNAPSHOT, 0, 1).unwrap()).unwrap();
         assert_eq!(
             inventory,
             json!({
                 "contract_version": PRODUCT_CONTRACT_VERSION,
                 "snapshot_key": SNAPSHOT,
+                "offset": 0,
                 "limit_requested": 1,
                 "limit_applied": 1,
                 "limit_clamped": false,
                 "result_count": 1,
                 "total_tables": 3,
+                "has_more": true,
+                "next_offset": 1,
                 "truncated": true,
                 "capability_warnings": warnings,
                 "tables": [{
@@ -1056,13 +1537,14 @@ mod tests {
                     "constraints": [],
                     "foreign_keys": { "outbound": [], "inbound": [] },
                     "indexes": [],
+                    "dependents": [],
                     "capability_warnings": warnings
                 }]
             })
         );
 
         let all: serde_json::Value =
-            serde_json::from_str(&render_inventory(&store, SNAPSHOT, 10).unwrap()).unwrap();
+            serde_json::from_str(&render_inventory(&store, SNAPSHOT, 0, 10).unwrap()).unwrap();
         let table_keys = all["tables"]
             .as_array()
             .unwrap()
@@ -1098,9 +1580,26 @@ mod tests {
         );
 
         assert_eq!(
-            inventory_bounds(MAX_INVENTORY_TABLES + 1, MAX_INVENTORY_TABLES + 1),
-            (MAX_INVENTORY_TABLES, true, true)
+            inventory_bounds(MAX_INVENTORY_TABLES + 1),
+            (MAX_INVENTORY_TABLES, true)
         );
+
+        let second_page: serde_json::Value =
+            serde_json::from_str(&render_inventory(&store, SNAPSHOT, 1, 1).unwrap()).unwrap();
+        assert_eq!(second_page["offset"], 1);
+        assert_eq!(second_page["result_count"], 1);
+        assert_eq!(second_page["next_offset"], 2);
+        assert_ne!(
+            second_page["tables"][0]["table_key"],
+            inventory["tables"][0]["table_key"]
+        );
+
+        let exhausted: serde_json::Value =
+            serde_json::from_str(&render_inventory(&store, SNAPSHOT, 3, 1).unwrap()).unwrap();
+        assert_eq!(exhausted["tables"], json!([]));
+        assert_eq!(exhausted["has_more"], false);
+        assert_eq!(exhausted["next_offset"], serde_json::Value::Null);
+        assert_eq!(exhausted["truncated"], false);
     }
 
     #[test]
@@ -1246,6 +1745,7 @@ mod tests {
                 triggers: CapabilitySupport::Unsupported,
                 routines: CapabilitySupport::Unsupported,
                 dependencies: CapabilitySupport::Unsupported,
+                limitations: vec![],
                 notes: vec![],
             },
         }

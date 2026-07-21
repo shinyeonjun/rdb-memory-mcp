@@ -35,6 +35,7 @@ pub(crate) enum Command {
     },
     Inventory {
         alias: String,
+        offset: usize,
         limit: usize,
         cache_path: PathBuf,
     },
@@ -106,6 +107,7 @@ fn parse_inventory_args(
     config_loader: &impl Fn(&Path) -> Option<DatabaseMemoryConfig>,
 ) -> Result<Command, String> {
     let mut alias = None;
+    let mut offset = 0;
     let mut limit = DEFAULT_INVENTORY_LIMIT;
     let mut cache_path = None;
     let mut config_path = None;
@@ -127,6 +129,12 @@ fn parse_inventory_args(
                 if limit == 0 {
                     return Err("inventory limit must be at least 1".to_owned());
                 }
+            }
+            "--offset" => {
+                let value = args.next().ok_or("missing value for --offset")?;
+                offset = value
+                    .parse()
+                    .map_err(|_| format!("invalid inventory offset '{value}'"))?;
             }
             "--cache-path" => {
                 cache_path = Some(PathBuf::from(
@@ -151,6 +159,7 @@ fn parse_inventory_args(
     let profile = profile_for_alias(Some(&alias), &config_path, config_loader);
     Ok(Command::Inventory {
         alias,
+        offset,
         limit,
         cache_path: cache_path
             .or_else(|| profile.and_then(|profile| profile.cache_path))
@@ -521,7 +530,7 @@ fn describe_table_usage() -> &'static str {
 }
 
 fn inventory_usage() -> &'static str {
-    "usage: database-memory inventory <alias> [--limit <n>] [--format json] [--cache-path <path>] [--config-path <path>]"
+    "usage: database-memory inventory <alias> [--offset <n>] [--limit <n>] [--format json] [--cache-path <path>] [--config-path <path>]"
 }
 
 fn usage() -> &'static str {
@@ -531,7 +540,7 @@ fn usage() -> &'static str {
        database-memory index --source sqlserver --connection-string <ado-connection-string> --alias <name> [--format text|json] [--cache-path <path>]
        database-memory index --source oracle --connection-string <user/password@connect_string> --alias <name> [--format text|json] [--cache-path <path>]
        database-memory describe-table <alias> [<table-name> | --object-key <stable-key>] [--format text|json] [--cache-path <path>] [--config-path <path>]
-       database-memory inventory <alias> [--limit <n>] [--format json] [--cache-path <path>] [--config-path <path>]
+       database-memory inventory <alias> [--offset <n>] [--limit <n>] [--format json] [--cache-path <path>] [--config-path <path>]
        database-memory find-table <alias> <query> [--format text|json] [--cache-path <path>] [--config-path <path>]
        database-memory find-column <alias> <query> [--format text|json] [--cache-path <path>] [--config-path <path>]
        database-memory impact-analysis <alias> [<table-name> | --table <name> [--column <name>] | --object-key <key>] [--direction inbound|outbound|both] [--max-depth <n>] [--limit <n>] [--cache-path <path>] [--config-path <path>]
@@ -720,6 +729,8 @@ mod tests {
                 [
                     "inventory",
                     "postgres:sample",
+                    "--offset",
+                    "1000",
                     "--limit",
                     "6000",
                     "--format",
@@ -733,6 +744,7 @@ mod tests {
             .unwrap(),
             Command::Inventory {
                 alias: "postgres:sample".to_owned(),
+                offset: 1_000,
                 limit: 6_000,
                 cache_path: PathBuf::from("cache.sqlite"),
             }
@@ -742,6 +754,7 @@ mod tests {
             parse_args(["inventory", "sample"].into_iter().map(str::to_owned)).unwrap(),
             Command::Inventory {
                 alias: "sample".to_owned(),
+                offset: 0,
                 limit: DEFAULT_INVENTORY_LIMIT,
                 cache_path: PathBuf::from(".database-memory").join("graph.sqlite"),
             }

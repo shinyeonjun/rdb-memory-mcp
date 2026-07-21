@@ -20,6 +20,15 @@ jobs:
         shell: pwsh
         run: rustup toolchain install 1.96.1 --profile minimal --component clippy --component rustfmt --target x86_64-pc-windows-msvc
 
+      - name: Verify release tag matches crate version
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $versions = @($metadata.packages | Where-Object { $_.name -like "database-memory-*" } | Select-Object -ExpandProperty version -Unique)
+          if ($versions.Count -ne 1 -or $env:GITHUB_REF_NAME -ne "v$($versions[0])") {
+            throw "Release tag '$env:GITHUB_REF_NAME' does not match one shared crate version: $($versions -join ', ')"
+          }
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

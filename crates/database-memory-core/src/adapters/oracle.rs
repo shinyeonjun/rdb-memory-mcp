@@ -563,6 +563,7 @@ fn oracle_capabilities() -> AdapterCapabilities {
         triggers: CapabilitySupport::Unsupported,
         routines: CapabilitySupport::Unsupported,
         dependencies: CapabilitySupport::Unsupported,
+        limitations: vec![],
         notes: vec![
             "Reads Oracle ALL_* data dictionary metadata only; no user table rows are read.".to_owned(),
             "Oracle users/owners are mapped to the common schema field; Phase 21 scopes introspection to the current schema.".to_owned(),

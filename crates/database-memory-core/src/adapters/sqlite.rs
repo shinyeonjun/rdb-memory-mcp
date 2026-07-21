@@ -2,13 +2,15 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{Connection, OpenFlags};
 
 use crate::{
     AdapterCapabilities, CapabilitySupport, ColumnObject, ConstraintKind, ConstraintObject,
     DatabaseObject, IndexObject, ObjectKey, ObjectKind, SchemaObject, SchemaSnapshot, TableKind,
-    TableObject,
+    TableObject, TriggerObject, ViewObject,
 };
 
 pub type SqliteAdapterResult<T> = Result<T, SqliteAdapterError>;
@@ -185,6 +187,59 @@ fn snapshot_from_connection(
         )?);
     }
 
+    let view_rows = schema_entries(conn, "view")?;
+    let view_keys = view_rows
+        .iter()
+        .map(|entry| {
+            (
+                entry.name.clone(),
+                key(
+                    object_source_kind,
+                    connection_alias,
+                    ObjectKind::View,
+                    &entry.name,
+                    None,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut views = Vec::with_capacity(view_rows.len());
+    for view in view_rows {
+        views.push(ViewObject {
+            key: view_keys[&view.name].clone(),
+            schema_key: schema_key.clone(),
+            name: view.name.clone(),
+            definition: view.sql,
+            depends_on: view_dependencies(conn, &view.name, &table_keys, &column_keys, &view_keys)?,
+        });
+    }
+
+    let triggers = schema_entries(conn, "trigger")?
+        .into_iter()
+        .filter_map(|trigger| {
+            let owner_key = table_keys
+                .get(&trigger.owner_name)
+                .or_else(|| view_keys.get(&trigger.owner_name))?
+                .clone();
+            let (timing, events) = trigger_characteristics(trigger.sql.as_deref());
+            Some(TriggerObject {
+                key: key(
+                    object_source_kind,
+                    connection_alias,
+                    ObjectKind::Trigger,
+                    &trigger.owner_name,
+                    Some(trigger.name.clone()),
+                ),
+                table_key: owner_key,
+                name: trigger.name,
+                timing,
+                events,
+                definition: trigger.sql,
+                executes_routine_key: None,
+            })
+        })
+        .collect::<Vec<_>>();
+
     Ok(SchemaSnapshot {
         source_kind: snapshot_source_kind.to_owned(),
         connection_alias: connection_alias.to_owned(),
@@ -194,8 +249,8 @@ fn snapshot_from_connection(
         columns,
         constraints,
         indexes,
-        views: vec![],
-        triggers: vec![],
+        views,
+        triggers,
         routines: vec![],
         capabilities: AdapterCapabilities {
             source_kind: snapshot_source_kind.to_owned(),
@@ -205,13 +260,154 @@ fn snapshot_from_connection(
             columns: true,
             constraints: true,
             indexes: true,
-            views: CapabilitySupport::Unsupported,
-            triggers: CapabilitySupport::Unsupported,
+            views: CapabilitySupport::Supported,
+            triggers: CapabilitySupport::Supported,
             routines: CapabilitySupport::Unsupported,
-            dependencies: CapabilitySupport::Unsupported,
+            dependencies: CapabilitySupport::Partial,
+            limitations: vec![
+                "SQLite CHECK and UNIQUE constraints are not emitted as constraint nodes."
+                    .to_owned(),
+                "SQLite partial-index predicates and expression-index expressions are not extracted."
+                    .to_owned(),
+                "SQLite generated columns are identified, but generation expressions are not extracted."
+                    .to_owned(),
+                "SQLite view dependencies are resolved from prepare-time read authorization; trigger-body dependencies are not emitted."
+                    .to_owned(),
+            ],
             notes,
         },
     })
+}
+
+struct SchemaEntry {
+    name: String,
+    owner_name: String,
+    sql: Option<String>,
+}
+
+fn schema_entries(conn: &Connection, object_type: &str) -> SqliteAdapterResult<Vec<SchemaEntry>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT name, tbl_name, sql
+        FROM sqlite_schema
+        WHERE type = ?1 AND name NOT LIKE 'sqlite_%'
+        ORDER BY name
+        ",
+    )?;
+    let rows = stmt.query_map([object_type], |row| {
+        Ok(SchemaEntry {
+            name: row.get(0)?,
+            owner_name: row.get(1)?,
+            sql: row.get(2)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(SqliteAdapterError::from)
+}
+
+fn view_dependencies(
+    conn: &Connection,
+    view_name: &str,
+    table_keys: &BTreeMap<String, ObjectKey>,
+    column_keys: &BTreeMap<(String, String), ObjectKey>,
+    view_keys: &BTreeMap<String, ObjectKey>,
+) -> SqliteAdapterResult<Vec<ObjectKey>> {
+    let selected_columns = relation_column_names(conn, view_name)?;
+    let projection = if selected_columns.is_empty() {
+        "1".to_owned()
+    } else {
+        selected_columns
+            .iter()
+            .map(|column| quote_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let reads = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let captured_reads = Arc::clone(&reads);
+    conn.authorizer(Some(move |context: AuthContext<'_>| {
+        if let AuthAction::Read {
+            table_name,
+            column_name,
+        } = context.action
+        {
+            if let Ok(mut items) = captured_reads.lock() {
+                items.push((table_name.to_owned(), column_name.to_owned()));
+            }
+        }
+        Authorization::Allow
+    }));
+
+    let prepare_result = conn
+        .prepare(&format!(
+            "SELECT {projection} FROM {} LIMIT 0",
+            quote_identifier(view_name)
+        ))
+        .map(|_| ());
+    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    prepare_result?;
+
+    let mut dependencies = BTreeMap::<String, ObjectKey>::new();
+    if let Ok(reads) = reads.lock() {
+        for (table_name, column_name) in reads.iter() {
+            if let Some(table_key) = table_keys.get(table_name) {
+                dependencies.insert(table_key.to_string(), table_key.clone());
+                if let Some(column_key) =
+                    column_keys.get(&(table_name.clone(), column_name.clone()))
+                {
+                    dependencies.insert(column_key.to_string(), column_key.clone());
+                }
+            } else if table_name != view_name {
+                if let Some(view_key) = view_keys.get(table_name) {
+                    dependencies.insert(view_key.to_string(), view_key.clone());
+                }
+            }
+        }
+    }
+    Ok(dependencies.into_values().collect())
+}
+
+fn relation_column_names(
+    conn: &Connection,
+    relation_name: &str,
+) -> SqliteAdapterResult<Vec<String>> {
+    let mut stmt = conn.prepare(&format!(
+        "PRAGMA table_xinfo({})",
+        quote_string(relation_name)
+    ))?;
+    let rows = stmt.query_map([], |row| row.get(1))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(SqliteAdapterError::from)
+}
+
+fn trigger_characteristics(definition: Option<&str>) -> (Option<String>, Vec<String>) {
+    let tokens = definition
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|character: char| !character.is_ascii_alphabetic())
+                .to_ascii_uppercase()
+        })
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let timing = if tokens
+        .windows(2)
+        .any(|window| window[0] == "INSTEAD" && window[1] == "OF")
+    {
+        Some("INSTEAD OF".to_owned())
+    } else {
+        tokens
+            .iter()
+            .find(|token| matches!(token.as_str(), "BEFORE" | "AFTER"))
+            .cloned()
+    };
+    let events = tokens
+        .iter()
+        .find(|token| matches!(token.as_str(), "INSERT" | "UPDATE" | "DELETE"))
+        .cloned()
+        .into_iter()
+        .collect();
+    (timing, events)
 }
 
 struct ColumnWithPk {
@@ -240,7 +436,7 @@ fn table_columns(
     table_name: &str,
     table_key: &ObjectKey,
 ) -> SqliteAdapterResult<Vec<ColumnWithPk>> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", quote_string(table_name)))?;
+    let mut stmt = conn.prepare(&format!("PRAGMA table_xinfo({})", quote_string(table_name)))?;
     let rows = stmt.query_map([], |row| {
         let cid: i64 = row.get(0)?;
         let name: String = row.get(1)?;
@@ -248,6 +444,7 @@ fn table_columns(
         let not_null: i64 = row.get(3)?;
         let default_value: Option<String> = row.get(4)?;
         let pk_position: i64 = row.get(5)?;
+        let hidden: i64 = row.get(6)?;
         Ok(ColumnWithPk {
             object: ColumnObject {
                 key: key(
@@ -259,11 +456,11 @@ fn table_columns(
                 ),
                 table_key: table_key.clone(),
                 name,
-                ordinal_position: (cid + 1) as u32,
+                ordinal_position: u32::try_from(cid).unwrap_or(0).saturating_add(1),
                 data_type,
                 is_nullable: not_null == 0 && pk_position == 0,
                 default_value,
-                is_generated: false,
+                is_generated: matches!(hidden, 2 | 3),
             },
             pk_position: (pk_position > 0).then_some(pk_position),
         })
@@ -382,7 +579,7 @@ fn table_indexes(
 
     let mut indexes = Vec::new();
     for row in rows {
-        let (name, unique, origin, partial) = row?;
+        let (name, unique, origin, _partial) = row?;
         let columns = index_columns(conn, table_name, &name, column_keys)?;
         indexes.push(IndexObject {
             key: key(
@@ -397,7 +594,7 @@ fn table_indexes(
             columns,
             is_unique: unique != 0,
             is_primary: origin == "pk",
-            predicate: (partial != 0).then_some("partial index predicate unavailable".to_owned()),
+            predicate: None,
             expression: None,
         });
     }
@@ -446,6 +643,10 @@ fn quote_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('\"', "\"\""))
+}
+
 #[cfg(test)]
 mod sqlite_adapter_tests {
     use std::fs;
@@ -454,6 +655,9 @@ mod sqlite_adapter_tests {
     use rusqlite::Connection;
 
     use super::*;
+    use crate::graph_builder::insert_schema_snapshot_graph;
+    use crate::graph_store::GraphStore;
+    use crate::impact_analysis::{impact_analysis, Direction};
 
     #[test]
     fn sqlite_adapter_extracts_tables_and_columns() {
@@ -471,6 +675,10 @@ mod sqlite_adapter_tests {
             .columns
             .iter()
             .any(|column| column.name == "user_id" && column.data_type == "INTEGER"));
+        assert!(snapshot
+            .columns
+            .iter()
+            .any(|column| column.name == "total_with_tax" && column.is_generated));
         assert!(snapshot.capabilities.metadata_only);
         let _ = fs::remove_file(path);
     }
@@ -506,6 +714,126 @@ mod sqlite_adapter_tests {
                     .iter()
                     .any(|key| key.sub_object.as_deref() == Some("user_id"))
         }));
+        let partial = snapshot
+            .indexes
+            .iter()
+            .find(|index| index.name == "idx_orders_positive_total")
+            .unwrap();
+        assert_eq!(partial.predicate, None);
+        assert!(snapshot
+            .capabilities
+            .limitations
+            .iter()
+            .any(|limitation| limitation.contains("partial-index predicates")));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sqlite_adapter_preserves_reserved_characters_in_stable_keys() {
+        let path = sample_database_path();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE "order:events" (
+                "value:raw%text" TEXT
+            );
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let snapshot = introspect_sqlite(&path, "sample:west").unwrap();
+        let table = snapshot
+            .tables
+            .iter()
+            .find(|table| table.name == "order:events")
+            .unwrap();
+        let column = snapshot
+            .columns
+            .iter()
+            .find(|column| column.name == "value:raw%text")
+            .unwrap();
+
+        assert_eq!(
+            table.key.to_string(),
+            "v2:sqlite:sample%3Awest:main:main:table:order%3Aevents"
+        );
+        assert_eq!(table.key, table.key.to_string().parse().unwrap());
+        assert_eq!(column.key, column.key.to_string().parse().unwrap());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sqlite_adapter_extracts_views_triggers_and_view_dependencies() {
+        let path = sample_database_path();
+        create_sample_database(&path);
+
+        let snapshot = introspect_sqlite(&path, "sample").unwrap();
+        let view = snapshot
+            .views
+            .iter()
+            .find(|view| view.name == "order_totals")
+            .unwrap();
+        let trigger = snapshot
+            .triggers
+            .iter()
+            .find(|trigger| trigger.name == "trg_orders_touch")
+            .unwrap();
+
+        assert!(view
+            .definition
+            .as_deref()
+            .is_some_and(|sql| sql.contains("CREATE VIEW")));
+        assert!(view
+            .depends_on
+            .iter()
+            .any(|key| { key.object_kind == ObjectKind::Table && key.object_name == "orders" }));
+        assert!(view.depends_on.iter().any(|key| {
+            key.object_kind == ObjectKind::Column
+                && key.object_name == "orders"
+                && key.sub_object.as_deref() == Some("total_cents")
+        }));
+        assert_eq!(trigger.table_key.object_name, "orders");
+        assert_eq!(trigger.timing.as_deref(), Some("AFTER"));
+        assert_eq!(trigger.events, vec!["UPDATE"]);
+        assert_eq!(snapshot.capabilities.views, CapabilitySupport::Supported);
+        assert_eq!(snapshot.capabilities.triggers, CapabilitySupport::Supported);
+        assert_eq!(
+            snapshot.capabilities.dependencies,
+            CapabilitySupport::Partial
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sqlite_view_dependency_is_reachable_from_its_source_column() {
+        let path = sample_database_path();
+        create_sample_database(&path);
+        let snapshot = introspect_sqlite(&path, "sample").unwrap();
+        let source_column = snapshot
+            .columns
+            .iter()
+            .find(|column| column.table_key.object_name == "orders" && column.name == "total_cents")
+            .unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        insert_schema_snapshot_graph(&store, "sqlite-view-impact", 1, &snapshot).unwrap();
+
+        let impact = impact_analysis(
+            &store,
+            "sqlite-view-impact",
+            &source_column.key.to_string(),
+            Direction::Inbound,
+            1,
+        )
+        .unwrap();
+
+        assert!(impact.groups.iter().any(|group| {
+            group.label == "View"
+                && group
+                    .nodes
+                    .iter()
+                    .any(|node| node.display_name.as_deref() == Some("order_totals"))
+        }));
         let _ = fs::remove_file(path);
     }
 
@@ -522,10 +850,22 @@ mod sqlite_adapter_tests {
                 id INTEGER PRIMARY KEY,
                 user_id INTEGER NOT NULL,
                 total_cents INTEGER NOT NULL,
+                total_with_tax INTEGER GENERATED ALWAYS AS (total_cents + 10) STORED,
                 FOREIGN KEY (user_id) REFERENCES users(id)
             );
 
             CREATE INDEX idx_orders_user_id ON orders(user_id);
+            CREATE INDEX idx_orders_positive_total ON orders(total_cents)
+                WHERE total_cents > 0;
+
+            CREATE VIEW order_totals AS
+                SELECT id, user_id, total_cents FROM orders;
+
+            CREATE TRIGGER trg_orders_touch
+                AFTER UPDATE OF total_cents ON orders
+                BEGIN
+                    SELECT NEW.total_cents;
+                END;
             ",
         )
         .unwrap();

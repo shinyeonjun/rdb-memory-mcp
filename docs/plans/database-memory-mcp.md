@@ -154,6 +154,8 @@ Stable object key format:
 <source-kind>:<connection-alias>:<database>:<schema>:<object-kind>:<object-name>[:<sub-object>]
 ```
 
+The original form remains canonical when every component is delimiter-safe. If any component contains `:` or `%`, the key is prefixed with `v2:` and those characters are encoded as `%3A` and `%25`. Parsers accept both forms; malformed or unknown escapes are rejected.
+
 Example:
 
 ```text

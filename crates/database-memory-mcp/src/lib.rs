@@ -25,32 +25,50 @@ impl DatabaseMemoryMcp {
     }
 
     #[tool(description = "Index database schema metadata into the local graph cache")]
-    pub fn index_database(&self, Parameters(request): Parameters<IndexDatabaseRequest>) -> String {
+    pub fn index_database(
+        &self,
+        Parameters(request): Parameters<IndexDatabaseRequest>,
+    ) -> Result<String, String> {
         tool_json(index_database_for_request(request))
     }
 
     #[tool(description = "List indexed database snapshots in a graph cache")]
-    pub fn list_databases(&self, Parameters(request): Parameters<ListDatabasesRequest>) -> String {
+    pub fn list_databases(
+        &self,
+        Parameters(request): Parameters<ListDatabasesRequest>,
+    ) -> Result<String, String> {
         tool_json(list_databases_for_request(request))
     }
 
     #[tool(description = "List table names for an indexed database alias")]
-    pub fn list_tables(&self, Parameters(request): Parameters<ListTablesRequest>) -> String {
+    pub fn list_tables(
+        &self,
+        Parameters(request): Parameters<ListTablesRequest>,
+    ) -> Result<String, String> {
         tool_json(list_tables_for_request(request))
     }
 
     #[tool(description = "Describe one indexed table from graph metadata")]
-    pub fn describe_table(&self, Parameters(request): Parameters<DescribeTableRequest>) -> String {
+    pub fn describe_table(
+        &self,
+        Parameters(request): Parameters<DescribeTableRequest>,
+    ) -> Result<String, String> {
         tool_json(describe_table_for_request(request))
     }
 
     #[tool(description = "Find indexed tables by substring")]
-    pub fn find_table(&self, Parameters(request): Parameters<FindTableRequest>) -> String {
+    pub fn find_table(
+        &self,
+        Parameters(request): Parameters<FindTableRequest>,
+    ) -> Result<String, String> {
         tool_json(find_table_for_request(request))
     }
 
     #[tool(description = "Find indexed columns by substring")]
-    pub fn find_column(&self, Parameters(request): Parameters<FindColumnRequest>) -> String {
+    pub fn find_column(
+        &self,
+        Parameters(request): Parameters<FindColumnRequest>,
+    ) -> Result<String, String> {
         tool_json(find_column_for_request(request))
     }
 
@@ -58,7 +76,7 @@ impl DatabaseMemoryMcp {
     pub fn impact_analysis(
         &self,
         Parameters(request): Parameters<ImpactAnalysisRequest>,
-    ) -> String {
+    ) -> Result<String, String> {
         tool_json(impact_analysis_for_request(request))
     }
 
@@ -66,22 +84,31 @@ impl DatabaseMemoryMcp {
     pub fn trace_relationships(
         &self,
         Parameters(request): Parameters<TraceRelationshipsRequest>,
-    ) -> String {
+    ) -> Result<String, String> {
         tool_json(trace_relationships_for_request(request))
     }
 
     #[tool(description = "Diff two indexed schema snapshots")]
-    pub fn schema_diff(&self, Parameters(request): Parameters<SchemaDiffRequest>) -> String {
+    pub fn schema_diff(
+        &self,
+        Parameters(request): Parameters<SchemaDiffRequest>,
+    ) -> Result<String, String> {
         tool_json(schema_diff_for_request(request))
     }
 
     #[tool(description = "Run a constrained read-only JSON query over indexed graph metadata")]
-    pub fn query_graph(&self, Parameters(request): Parameters<QueryGraphRequest>) -> String {
+    pub fn query_graph(
+        &self,
+        Parameters(request): Parameters<QueryGraphRequest>,
+    ) -> Result<String, String> {
         tool_json(query_graph_for_request(request))
     }
 
     #[tool(description = "Return basic stats for a database-memory graph cache")]
-    pub fn graph_stats(&self, Parameters(request): Parameters<GraphStatsRequest>) -> String {
+    pub fn graph_stats(
+        &self,
+        Parameters(request): Parameters<GraphStatsRequest>,
+    ) -> Result<String, String> {
         let cache_path = request
             .cache_path
             .as_deref()
