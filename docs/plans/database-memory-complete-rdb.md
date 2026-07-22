@@ -560,7 +560,7 @@ Rollback:
 
 ### Phase 11: Final Support Ledger And Release Candidate
 
-Status: In Progress
+Status: Complete (publication remains owner-gated)
 
 Goal:
 
@@ -574,6 +574,23 @@ Deliverables:
 - Proprietary SQL Server/Oracle/ODBC matrix receipt when an owner-controlled,
   licensed self-hosted runner and secrets are available.
 - Final machine-readable support ledger review and release-candidate decision.
+
+Completed:
+
+- Prepared the `0.2.0` candidate at behavioral revision
+  `a2e8596e81fb2b70c368e4ccca2c4372a1c35f9b`.
+- Collected a green four-job hosted CI receipt and a green 13-job open-source
+  live matrix receipt for that exact revision.
+- Re-read the release binary contract and verified contract v2,
+  `metadata_only = true`, `row_data_access = false`, and authoritative outcomes
+  limited to `complete` and `failed`.
+- Kept the licensed SQL Server, Oracle, and ODBC hosted job owner-gated instead
+  of pretending it ran. Prior local live evidence remains documented; a fresh
+  hosted receipt requires an owner-controlled licensed Windows runner.
+- Froze DB2 as unsupported under the owner's no-EULA decision. It is neither a
+  release claim nor a hidden partial implementation.
+- Recorded the final decision and exact workflow receipts in
+  `docs/reports/database-memory-complete-rdb.phase-11.md`.
 
 Release rule:
 
