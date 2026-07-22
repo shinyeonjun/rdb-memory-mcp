@@ -4,15 +4,27 @@ use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags};
 
-use super::sqlite_catalog::{analyze_sqlite_path, certify_discovery, discover_sqlite_connection};
+use super::sqlite_catalog::{
+    analyze_sqlite_path, analyze_sqlite_path_with_cancellation, certify_discovery,
+    discover_sqlite_connection,
+};
 use crate::analysis_outcome::AnalysisOutcome;
 use crate::certification::{CertificationError, CertifiedSchemaSnapshot};
+use crate::introspection::CancellationToken;
 use crate::SchemaSnapshot;
 
 pub type SqliteAdapterResult<T> = Result<T, SqliteAdapterError>;
 
 pub fn introspect_sqlite_complete(path: &Path, connection_alias: &str) -> AnalysisOutcome {
     analyze_sqlite_path(path, connection_alias)
+}
+
+pub fn introspect_sqlite_complete_with_cancellation(
+    path: &Path,
+    connection_alias: &str,
+    cancellation: &CancellationToken,
+) -> AnalysisOutcome {
+    analyze_sqlite_path_with_cancellation(path, connection_alias, cancellation)
 }
 
 pub fn introspect_sqlite(

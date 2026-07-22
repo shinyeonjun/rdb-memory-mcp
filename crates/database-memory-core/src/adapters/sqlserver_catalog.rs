@@ -23,7 +23,8 @@ use crate::certification::{
     ServerIdentity,
 };
 use crate::introspection::{
-    CatalogDiscovery, CatalogIntrospector, DatabaseAnalysisService, IntrospectionRequest,
+    CancellationToken, CatalogDiscovery, CatalogIntrospector, DatabaseAnalysisService,
+    IntrospectionRequest,
 };
 use crate::{
     AdapterCapabilities, CapabilitySupport, ColumnObject, ConstraintKind, ConstraintObject,
@@ -60,9 +61,22 @@ impl CatalogIntrospector for SqlServerCatalogAdapter {
         &mut self,
         request: &IntrospectionRequest,
     ) -> Result<CatalogDiscovery, AnalysisFailure> {
+        self.discover_with_cancellation(request, &CancellationToken::new())
+    }
+
+    fn discover_with_cancellation(
+        &mut self,
+        request: &IntrospectionRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<CatalogDiscovery, AnalysisFailure> {
+        cancellation.checkpoint(
+            SQLSERVER_SOURCE,
+            &request.connection_alias,
+            AnalysisStage::Configuration,
+        )?;
         validate_request(request)?;
         validate_connection_policy(request, &self.connection_string)?;
-        run_catalog_discovery(&self.connection_string, request)
+        run_catalog_discovery(&self.connection_string, request, cancellation)
     }
 }
 
@@ -73,70 +87,126 @@ pub(crate) fn analyze_sqlserver(
     requested_schemas: Vec<String>,
     timeout_ms: u64,
 ) -> AnalysisOutcome {
+    analyze_sqlserver_with_cancellation(
+        connection_string,
+        connection_alias,
+        requested_catalogs,
+        requested_schemas,
+        timeout_ms,
+        &CancellationToken::new(),
+    )
+}
+
+pub(crate) fn analyze_sqlserver_with_cancellation(
+    connection_string: &str,
+    connection_alias: &str,
+    requested_catalogs: Vec<String>,
+    requested_schemas: Vec<String>,
+    timeout_ms: u64,
+    cancellation: &CancellationToken,
+) -> AnalysisOutcome {
     let request = IntrospectionRequest {
         connection_alias: connection_alias.to_owned(),
         requested_catalogs,
         requested_schemas,
         timeout_ms,
     };
-    DatabaseAnalysisService::new(SqlServerCatalogAdapter::new(connection_string)).analyze(&request)
+    DatabaseAnalysisService::new(SqlServerCatalogAdapter::new(connection_string))
+        .analyze_with_cancellation(&request, cancellation)
 }
 
 fn run_catalog_discovery(
     connection_string: &str,
     request: &IntrospectionRequest,
+    cancellation: &CancellationToken,
 ) -> Result<CatalogDiscovery, AnalysisFailure> {
     let connection_string = connection_string.to_owned();
     let request = request.clone();
+    let cancellation = cancellation.clone();
     if tokio::runtime::Handle::try_current().is_ok() {
         let worker_request = request.clone();
+        let worker_cancellation = cancellation.clone();
         return std::thread::spawn(move || {
-            run_catalog_discovery_on_runtime(&connection_string, &worker_request)
+            run_catalog_discovery_on_runtime(
+                &connection_string,
+                &worker_request,
+                &worker_cancellation,
+            )
         })
         .join()
         .map_err(|_| internal_failure(&request, "SQL Server adapter worker thread panicked"))?;
     }
-    run_catalog_discovery_on_runtime(&connection_string, &request)
+    run_catalog_discovery_on_runtime(&connection_string, &request, &cancellation)
 }
 
 fn run_catalog_discovery_on_runtime(
     connection_string: &str,
     request: &IntrospectionRequest,
+    cancellation: &CancellationToken,
 ) -> Result<CatalogDiscovery, AnalysisFailure> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| internal_failure(request, error.to_string()))?;
     runtime.block_on(async {
-        match tokio::time::timeout(
-            Duration::from_millis(request.timeout_ms),
-            discover_catalog_async(connection_string, request),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(AnalysisFailure::redacted(
-                AnalysisFailureCode::Timeout,
-                AnalysisStage::Discovery,
-                SQLSERVER_SOURCE,
-                &request.connection_alias,
-                format!(
-                    "SQL Server metadata analysis exceeded the {} ms timeout",
-                    request.timeout_ms
-                ),
-                "increase the bounded timeout or reduce the requested schema scope",
-                true,
-                Some(connection_string),
-            )),
+        tokio::select! {
+            biased;
+            _ = wait_for_cancellation(cancellation.clone()) => {
+                Err(cancelled_failure(request))
+            }
+            result = tokio::time::timeout(
+                Duration::from_millis(request.timeout_ms),
+                discover_catalog_async(connection_string, request, cancellation),
+            ) => match result {
+                Ok(result) => result,
+                Err(_) => Err(AnalysisFailure::redacted(
+                    AnalysisFailureCode::Timeout,
+                    AnalysisStage::Discovery,
+                    SQLSERVER_SOURCE,
+                    &request.connection_alias,
+                    format!(
+                        "SQL Server metadata analysis exceeded the {} ms timeout",
+                        request.timeout_ms
+                    ),
+                    "increase the bounded timeout or reduce the requested schema scope",
+                    true,
+                    Some(connection_string),
+                )),
+            },
         }
     })
+}
+
+async fn wait_for_cancellation(cancellation: CancellationToken) {
+    while !cancellation.is_cancelled() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn cancelled_failure(request: &IntrospectionRequest) -> AnalysisFailure {
+    AnalysisFailure::redacted(
+        AnalysisFailureCode::Cancelled,
+        AnalysisStage::Discovery,
+        SQLSERVER_SOURCE,
+        &request.connection_alias,
+        "SQL Server metadata analysis was cancelled",
+        "start a new analysis when the result is still needed",
+        true,
+        None,
+    )
 }
 
 async fn discover_catalog_async(
     connection_string: &str,
     request: &IntrospectionRequest,
+    cancellation: &CancellationToken,
 ) -> Result<CatalogDiscovery, AnalysisFailure> {
     let mut client = connect_sqlserver(connection_string, request).await?;
+    cancellation.checkpoint(
+        SQLSERVER_SOURCE,
+        &request.connection_alias,
+        AnalysisStage::Connection,
+    )?;
     configure_session(&mut client, request)
         .await
         .map_err(|error| catalog_failure(request, connection_string, error))?;
@@ -155,15 +225,30 @@ async fn discover_catalog_async(
         .map_err(|error| catalog_failure(request, connection_string, error))?;
     let selected_schemas = select_schemas(request, &available_schemas)
         .map_err(|error| catalog_failure(request, connection_string, error))?;
+    cancellation.checkpoint(
+        SQLSERVER_SOURCE,
+        &request.connection_alias,
+        AnalysisStage::CapabilityProbe,
+    )?;
 
     let first = RawSqlServerCatalog::read(&mut client, strategy, &selected_schemas)
         .await
         .map_err(|error| catalog_failure(request, connection_string, error))?;
+    cancellation.checkpoint(
+        SQLSERVER_SOURCE,
+        &request.connection_alias,
+        AnalysisStage::Discovery,
+    )?;
     let second = RawSqlServerCatalog::read(&mut client, strategy, &selected_schemas)
         .await
         .map_err(|error| catalog_failure(request, connection_string, error))?;
     let stable = require_stable_catalog(first, &second)
         .map_err(|error| catalog_failure(request, connection_string, error))?;
+    cancellation.checkpoint(
+        SQLSERVER_SOURCE,
+        &request.connection_alias,
+        AnalysisStage::Mapping,
+    )?;
 
     SqlServerSnapshotMapper::new(&request.connection_alias, facts, strategy)
         .map(stable)
@@ -7555,6 +7640,22 @@ mod tests {
             .tables
             .iter()
             .any(|table| table.name == "visible_table"));
+    }
+
+    #[test]
+    fn async_runtime_cancellation_preempts_connection_work() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let failure = run_catalog_discovery_on_runtime(
+            "not-a-sqlserver-connection-string",
+            &request("sqlserver-cancelled-runtime"),
+            &cancellation,
+        )
+        .expect_err("cancelled runtime must fail");
+
+        assert_eq!(failure.code, AnalysisFailureCode::Cancelled);
+        assert_eq!(failure.stage, AnalysisStage::Discovery);
     }
 
     fn request(alias: &str) -> IntrospectionRequest {

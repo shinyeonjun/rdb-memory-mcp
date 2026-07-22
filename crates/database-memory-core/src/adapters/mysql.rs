@@ -2,9 +2,10 @@ use std::error::Error;
 use std::fmt;
 
 use crate::analysis_outcome::{AnalysisFailure, AnalysisOutcome};
+use crate::introspection::CancellationToken;
 use crate::SchemaSnapshot;
 
-use super::mysql_catalog::analyze_mysql_family;
+use super::mysql_catalog::{analyze_mysql_family, analyze_mysql_family_with_cancellation};
 
 pub type MysqlAdapterResult<T> = Result<T, MysqlAdapterError>;
 
@@ -57,6 +58,22 @@ pub fn introspect_mysql_complete_scoped(
         connection_alias,
         requested_databases,
         timeout_ms,
+    )
+}
+
+pub fn introspect_mysql_complete_scoped_with_cancellation(
+    connection_string: &str,
+    connection_alias: &str,
+    requested_databases: Vec<String>,
+    timeout_ms: u64,
+    cancellation: &CancellationToken,
+) -> AnalysisOutcome {
+    analyze_mysql_family_with_cancellation(
+        connection_string,
+        connection_alias,
+        requested_databases,
+        timeout_ms,
+        cancellation,
     )
 }
 

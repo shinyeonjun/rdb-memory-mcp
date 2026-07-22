@@ -2,9 +2,10 @@ use std::error::Error;
 use std::fmt;
 
 use crate::analysis_outcome::{AnalysisFailure, AnalysisOutcome};
+use crate::introspection::CancellationToken;
 use crate::SchemaSnapshot;
 
-use super::postgres_catalog::analyze_postgres;
+use super::postgres_catalog::{analyze_postgres, analyze_postgres_with_cancellation};
 
 pub type PostgresAdapterResult<T> = Result<T, PostgresAdapterError>;
 
@@ -57,6 +58,22 @@ pub fn introspect_postgres_complete_scoped(
         connection_alias,
         requested_schemas,
         timeout_ms,
+    )
+}
+
+pub fn introspect_postgres_complete_scoped_with_cancellation(
+    connection_string: &str,
+    connection_alias: &str,
+    requested_schemas: Vec<String>,
+    timeout_ms: u64,
+    cancellation: &CancellationToken,
+) -> AnalysisOutcome {
+    analyze_postgres_with_cancellation(
+        connection_string,
+        connection_alias,
+        requested_schemas,
+        timeout_ms,
+        cancellation,
     )
 }
 

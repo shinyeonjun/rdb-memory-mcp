@@ -2,9 +2,10 @@ use std::error::Error;
 use std::fmt;
 
 use crate::analysis_outcome::{AnalysisFailure, AnalysisOutcome};
+use crate::introspection::CancellationToken;
 use crate::SchemaSnapshot;
 
-use super::sqlserver_catalog::analyze_sqlserver;
+use super::sqlserver_catalog::{analyze_sqlserver, analyze_sqlserver_with_cancellation};
 
 pub type SqlServerAdapterResult<T> = Result<T, SqlServerAdapterError>;
 
@@ -65,6 +66,24 @@ pub fn introspect_sqlserver_complete_scoped(
         requested_catalogs,
         requested_schemas,
         timeout_ms,
+    )
+}
+
+pub fn introspect_sqlserver_complete_scoped_with_cancellation(
+    connection_string: &str,
+    connection_alias: &str,
+    requested_catalogs: Vec<String>,
+    requested_schemas: Vec<String>,
+    timeout_ms: u64,
+    cancellation: &CancellationToken,
+) -> AnalysisOutcome {
+    analyze_sqlserver_with_cancellation(
+        connection_string,
+        connection_alias,
+        requested_catalogs,
+        requested_schemas,
+        timeout_ms,
+        cancellation,
     )
 }
 

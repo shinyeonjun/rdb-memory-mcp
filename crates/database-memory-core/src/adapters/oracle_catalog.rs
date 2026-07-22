@@ -16,7 +16,8 @@ use crate::certification::{
     ObjectCategory, RelationshipCategory, ServerIdentity,
 };
 use crate::introspection::{
-    CatalogDiscovery, CatalogIntrospector, DatabaseAnalysisService, IntrospectionRequest,
+    CancellationToken, CatalogDiscovery, CatalogIntrospector, DatabaseAnalysisService,
+    IntrospectionRequest,
 };
 use crate::{
     AdapterCapabilities, CapabilitySupport, ColumnObject, ConstraintKind, ConstraintObject,
@@ -51,9 +52,22 @@ impl CatalogIntrospector for OracleCatalogAdapter {
         &mut self,
         request: &IntrospectionRequest,
     ) -> Result<CatalogDiscovery, AnalysisFailure> {
+        self.discover_with_cancellation(request, &CancellationToken::new())
+    }
+
+    fn discover_with_cancellation(
+        &mut self,
+        request: &IntrospectionRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<CatalogDiscovery, AnalysisFailure> {
+        cancellation.checkpoint(
+            ORACLE_SOURCE,
+            &request.connection_alias,
+            AnalysisStage::Configuration,
+        )?;
         validate_request(request)?;
         validate_connection_policy(request, &self.connection_string)?;
-        discover_oracle(&self.connection_string, request)
+        discover_oracle(&self.connection_string, request, cancellation)
     }
 }
 
@@ -64,18 +78,38 @@ pub(crate) fn analyze_oracle(
     requested_schemas: Vec<String>,
     timeout_ms: u64,
 ) -> AnalysisOutcome {
+    analyze_oracle_with_cancellation(
+        connection_string,
+        connection_alias,
+        requested_catalogs,
+        requested_schemas,
+        timeout_ms,
+        &CancellationToken::new(),
+    )
+}
+
+pub(crate) fn analyze_oracle_with_cancellation(
+    connection_string: &str,
+    connection_alias: &str,
+    requested_catalogs: Vec<String>,
+    requested_schemas: Vec<String>,
+    timeout_ms: u64,
+    cancellation: &CancellationToken,
+) -> AnalysisOutcome {
     let request = IntrospectionRequest {
         connection_alias: connection_alias.to_owned(),
         requested_catalogs,
         requested_schemas,
         timeout_ms,
     };
-    DatabaseAnalysisService::new(OracleCatalogAdapter::new(connection_string)).analyze(&request)
+    DatabaseAnalysisService::new(OracleCatalogAdapter::new(connection_string))
+        .analyze_with_cancellation(&request, cancellation)
 }
 
 fn discover_oracle(
     connection_string: &str,
     request: &IntrospectionRequest,
+    cancellation: &CancellationToken,
 ) -> Result<CatalogDiscovery, AnalysisFailure> {
     let parsed = parse_oracle_connection_string(connection_string).map_err(|error| {
         catalog_failure(
@@ -87,6 +121,11 @@ fn discover_oracle(
     })?;
     let connection = Connection::connect(parsed.username, parsed.password, parsed.connect_string)
         .map_err(|error| connection_failure(request, connection_string, error))?;
+    cancellation.checkpoint(
+        ORACLE_SOURCE,
+        &request.connection_alias,
+        AnalysisStage::Connection,
+    )?;
     connection
         .set_call_timeout(Some(Duration::from_millis(request.timeout_ms)))
         .map_err(|error| {
@@ -121,11 +160,17 @@ fn discover_oracle(
                 AnalysisStage::CapabilityProbe,
             )
         })?;
+    cancellation.checkpoint(
+        ORACLE_SOURCE,
+        &request.connection_alias,
+        AnalysisStage::CapabilityProbe,
+    )?;
 
-    let result = discover_connected(&connection, request, deadline).map_err(|error| {
-        let stage = error.stage();
-        catalog_failure(request, connection_string, error, stage)
-    });
+    let result =
+        discover_connected(&connection, request, deadline, cancellation).map_err(|error| {
+            let stage = error.stage();
+            catalog_failure(request, connection_string, error, stage)
+        });
     let rollback = connection.rollback().map_err(|error| {
         catalog_failure(
             request,
@@ -146,16 +191,38 @@ fn discover_connected(
     connection: &Connection,
     request: &IntrospectionRequest,
     deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<CatalogDiscovery, CatalogError> {
     let facts = ServerFacts::read(connection, deadline)?;
     let strategy = OracleCatalogVersion::detect(&facts.version, &facts.release)?;
     validate_catalog_scope(request, &facts)?;
     let scope = DictionaryScope::select(connection, request, &facts, deadline)?;
+    cancellation
+        .checkpoint(
+            ORACLE_SOURCE,
+            &request.connection_alias,
+            AnalysisStage::CapabilityProbe,
+        )
+        .map_err(CatalogError::Cancelled)?;
 
     let first = RawOracleCatalog::read(connection, &scope, deadline)?;
+    cancellation
+        .checkpoint(
+            ORACLE_SOURCE,
+            &request.connection_alias,
+            AnalysisStage::Discovery,
+        )
+        .map_err(CatalogError::Cancelled)?;
     let second = RawOracleCatalog::read(connection, &scope, deadline)?;
     let stable = require_stable_catalog(first, &second)?;
     validate_raw_catalog(&stable, &scope)?;
+    cancellation
+        .checkpoint(
+            ORACLE_SOURCE,
+            &request.connection_alias,
+            AnalysisStage::Mapping,
+        )
+        .map_err(CatalogError::Cancelled)?;
 
     OracleSnapshotMapper::new(&request.connection_alias, facts, strategy, scope).map(stable)
 }
@@ -509,6 +576,7 @@ enum CatalogError {
     UnsupportedMetadata(String),
     CatalogChanged(String),
     Mapping(String),
+    Cancelled(AnalysisFailure),
     Timeout,
     Query(oracle::Error),
     QueryContext {
@@ -526,6 +594,7 @@ impl CatalogError {
                 AnalysisStage::Discovery
             }
             Self::Mapping(_) => AnalysisStage::Mapping,
+            Self::Cancelled(failure) => failure.stage,
             Self::Query(_) | Self::QueryContext { .. } => AnalysisStage::Discovery,
         }
     }
@@ -620,6 +689,7 @@ fn catalog_failure(
             "inspect the Oracle catalog identities and fix every unresolved mapping".to_owned(),
             false,
         ),
+        CatalogError::Cancelled(failure) => return failure,
         CatalogError::Timeout => (
             AnalysisFailureCode::Timeout,
             format!(

@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use crate::analysis_outcome::{
     AnalysisFailure, AnalysisFailureCode, AnalysisOutcome, AnalysisStage,
 };
@@ -13,6 +16,54 @@ pub struct IntrospectionRequest {
     pub requested_catalogs: Vec<String>,
     pub requested_schemas: Vec<String>,
     pub timeout_ms: u64,
+}
+
+/// A cloneable, one-way signal shared by an analysis caller and its adapter.
+///
+/// Cancellation is cooperative for synchronous drivers: an in-flight driver
+/// call remains bounded by its configured timeout, and the next lifecycle
+/// checkpoint converts the result to `cancelled` without emitting a snapshot.
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    /// Creates a token in the active state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Permanently cancels this token and every clone of it.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Returns whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn checkpoint(
+        &self,
+        source_kind: &str,
+        connection_alias: &str,
+        stage: AnalysisStage,
+    ) -> Result<(), AnalysisFailure> {
+        if !self.is_cancelled() {
+            return Ok(());
+        }
+        Err(AnalysisFailure::redacted(
+            AnalysisFailureCode::Cancelled,
+            stage,
+            source_kind,
+            connection_alias,
+            "database metadata analysis was cancelled",
+            "start a new analysis when the result is still needed",
+            true,
+            None,
+        ))
+    }
 }
 
 impl IntrospectionRequest {
@@ -52,6 +103,29 @@ pub trait CatalogIntrospector {
         &mut self,
         request: &IntrospectionRequest,
     ) -> Result<CatalogDiscovery, AnalysisFailure>;
+
+    /// Runs discovery with a shared cancellation signal.
+    ///
+    /// Existing third-party implementations inherit lifecycle-boundary checks;
+    /// adapters can override this method to add driver-specific interruption.
+    fn discover_with_cancellation(
+        &mut self,
+        request: &IntrospectionRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<CatalogDiscovery, AnalysisFailure> {
+        cancellation.checkpoint(
+            self.source_kind(),
+            &request.connection_alias,
+            AnalysisStage::Discovery,
+        )?;
+        let discovery = self.discover(request)?;
+        cancellation.checkpoint(
+            self.source_kind(),
+            &request.connection_alias,
+            AnalysisStage::Discovery,
+        )?;
+        Ok(discovery)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -91,16 +165,45 @@ impl<A: CatalogIntrospector> DatabaseAnalysisService<A> {
     }
 
     pub fn analyze(&mut self, request: &IntrospectionRequest) -> AnalysisOutcome {
+        self.analyze_with_cancellation(request, &CancellationToken::new())
+    }
+
+    /// Runs analysis with a caller-owned cancellation signal.
+    ///
+    /// A cancellation observed before, during, or immediately after discovery
+    /// always returns a failed outcome and discards any uncommitted discovery.
+    pub fn analyze_with_cancellation(
+        &mut self,
+        request: &IntrospectionRequest,
+        cancellation: &CancellationToken,
+    ) -> AnalysisOutcome {
         if let Err(failure) = request.validate(self.adapter.source_kind()) {
             return AnalysisOutcome::failed(failure);
         }
-        let discovery = match self.adapter.discover(request) {
+        if let Err(failure) = cancellation.checkpoint(
+            self.adapter.source_kind(),
+            &request.connection_alias,
+            AnalysisStage::Configuration,
+        ) {
+            return AnalysisOutcome::failed(failure);
+        }
+        let discovery = match self
+            .adapter
+            .discover_with_cancellation(request, cancellation)
+        {
             Ok(discovery) => discovery,
             Err(failure) => return AnalysisOutcome::failed(failure),
         };
+        if let Err(failure) = cancellation.checkpoint(
+            self.adapter.source_kind(),
+            &request.connection_alias,
+            AnalysisStage::Validation,
+        ) {
+            return AnalysisOutcome::failed(failure);
+        }
         let source_kind = discovery.snapshot.schema.source_kind.clone();
         let connection_alias = discovery.snapshot.schema.connection_alias.clone();
-        match CanonicalSnapshotAssembler::certify(discovery) {
+        let outcome = match CanonicalSnapshotAssembler::certify(discovery) {
             Ok(snapshot) => match AnalysisOutcome::complete(snapshot) {
                 Ok(outcome) => outcome,
                 Err(error) => AnalysisOutcome::failed(certification_failure(
@@ -114,7 +217,15 @@ impl<A: CatalogIntrospector> DatabaseAnalysisService<A> {
                 &connection_alias,
                 error,
             )),
+        };
+        if let Err(failure) = cancellation.checkpoint(
+            self.adapter.source_kind(),
+            &request.connection_alias,
+            AnalysisStage::Validation,
+        ) {
+            return AnalysisOutcome::failed(failure);
         }
+        outcome
     }
 }
 
@@ -224,6 +335,69 @@ mod tests {
             outcome.failure().unwrap().code,
             AnalysisFailureCode::InvalidConfiguration
         );
+    }
+
+    #[test]
+    fn pre_cancelled_request_fails_before_the_adapter_is_called() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let mut service = DatabaseAnalysisService::new(FakeAdapter { discovery: None });
+
+        let outcome = service.analyze_with_cancellation(&request(), &cancellation);
+
+        let failure = outcome.failure().expect("cancelled analysis must fail");
+        assert_eq!(failure.code, AnalysisFailureCode::Cancelled);
+        assert_eq!(failure.stage, AnalysisStage::Configuration);
+        assert!(outcome.certified_snapshot().is_none());
+    }
+
+    #[test]
+    fn cancellation_after_discovery_prevents_certification() {
+        struct CancellingAdapter {
+            cancellation: CancellationToken,
+            discovery: Option<CatalogDiscovery>,
+        }
+
+        impl CatalogIntrospector for CancellingAdapter {
+            fn source_kind(&self) -> &'static str {
+                "fake-rdb"
+            }
+
+            fn discover(
+                &mut self,
+                _request: &IntrospectionRequest,
+            ) -> Result<CatalogDiscovery, AnalysisFailure> {
+                self.cancellation.cancel();
+                Ok(self.discovery.take().expect("fake called once"))
+            }
+        }
+
+        let cancellation = CancellationToken::new();
+        let snapshot = snapshot();
+        let mut service = DatabaseAnalysisService::new(CancellingAdapter {
+            cancellation: cancellation.clone(),
+            discovery: Some(discovery(
+                snapshot.clone(),
+                fixture_discovery_counts(&snapshot),
+            )),
+        });
+
+        let outcome = service.analyze_with_cancellation(&request(), &cancellation);
+
+        let failure = outcome.failure().expect("cancelled analysis must fail");
+        assert_eq!(failure.code, AnalysisFailureCode::Cancelled);
+        assert_eq!(failure.stage, AnalysisStage::Discovery);
+        assert!(outcome.certified_snapshot().is_none());
+    }
+
+    #[test]
+    fn cancellation_token_clones_share_state() {
+        let cancellation = CancellationToken::new();
+        let worker = cancellation.clone();
+
+        worker.cancel();
+
+        assert!(cancellation.is_cancelled());
     }
 
     fn discovery(

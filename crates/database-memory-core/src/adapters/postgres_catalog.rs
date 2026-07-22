@@ -20,7 +20,8 @@ use crate::certification::{
     ServerIdentity,
 };
 use crate::introspection::{
-    CatalogDiscovery, CatalogIntrospector, DatabaseAnalysisService, IntrospectionRequest,
+    CancellationToken, CatalogDiscovery, CatalogIntrospector, DatabaseAnalysisService,
+    IntrospectionRequest,
 };
 use crate::{
     AdapterCapabilities, CapabilitySupport, ColumnObject, ConstraintKind, ConstraintObject,
@@ -56,80 +57,108 @@ impl CatalogIntrospector for PostgresCatalogAdapter {
         &mut self,
         request: &IntrospectionRequest,
     ) -> Result<CatalogDiscovery, AnalysisFailure> {
-        validate_request(request)?;
-        let mut config = Config::from_str(&self.connection_string).map_err(|error| {
-            connection_failure(request, &self.connection_string, error.to_string())
-        })?;
-        validate_transport_policy(request, &self.connection_string, &config)?;
-        config.connect_timeout(Duration::from_millis(request.timeout_ms));
-        let tls = native_tls::TlsConnector::builder()
-            .build()
-            .map_err(|error| {
-                connection_failure(request, &self.connection_string, error.to_string())
-            })?;
-        let mut client = config
-            .connect(MakeTlsConnector::new(tls))
-            .map_err(|error| {
-                classify_postgres_error(
-                    request,
-                    &self.connection_string,
-                    error,
-                    AnalysisStage::Connection,
-                )
-            })?;
-        let mut transaction = client
-            .build_transaction()
-            .isolation_level(IsolationLevel::RepeatableRead)
-            .read_only(true)
-            .start()
-            .map_err(|error| {
-                classify_postgres_error(
-                    request,
-                    &self.connection_string,
-                    error,
-                    AnalysisStage::CapabilityProbe,
-                )
-            })?;
-        let timeout = format!("{}ms", request.timeout_ms);
-        transaction
-            .query_one(
-                "SELECT set_config('statement_timeout', $1, true)",
-                &[&timeout],
-            )
-            .map_err(|error| {
-                classify_postgres_error(
-                    request,
-                    &self.connection_string,
-                    error,
-                    AnalysisStage::CapabilityProbe,
-                )
-            })?;
-        transaction
-            .query_one("SELECT set_config('lock_timeout', $1, true)", &[&timeout])
-            .map_err(|error| {
-                classify_postgres_error(
-                    request,
-                    &self.connection_string,
-                    error,
-                    AnalysisStage::CapabilityProbe,
-                )
-            })?;
+        discover_postgres(&self.connection_string, request, &CancellationToken::new())
+    }
 
-        let raw = RawPostgresCatalog::read(&mut transaction, request)
-            .map_err(|error| catalog_failure(request, &self.connection_string, error))?;
-        let discovery = PostgresSnapshotMapper::new(&request.connection_alias)
-            .map(raw)
-            .map_err(|error| catalog_failure(request, &self.connection_string, error))?;
-        transaction.commit().map_err(|error| {
+    fn discover_with_cancellation(
+        &mut self,
+        request: &IntrospectionRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<CatalogDiscovery, AnalysisFailure> {
+        discover_postgres(&self.connection_string, request, cancellation)
+    }
+}
+
+fn discover_postgres(
+    connection_string: &str,
+    request: &IntrospectionRequest,
+    cancellation: &CancellationToken,
+) -> Result<CatalogDiscovery, AnalysisFailure> {
+    cancellation.checkpoint(
+        POSTGRES_SOURCE,
+        &request.connection_alias,
+        AnalysisStage::Configuration,
+    )?;
+    validate_request(request)?;
+    let mut config = Config::from_str(connection_string)
+        .map_err(|error| connection_failure(request, connection_string, error.to_string()))?;
+    validate_transport_policy(request, connection_string, &config)?;
+    config.connect_timeout(Duration::from_millis(request.timeout_ms));
+    let tls = native_tls::TlsConnector::builder()
+        .build()
+        .map_err(|error| connection_failure(request, connection_string, error.to_string()))?;
+    let mut client = config
+        .connect(MakeTlsConnector::new(tls))
+        .map_err(|error| {
+            classify_postgres_error(request, connection_string, error, AnalysisStage::Connection)
+        })?;
+    cancellation.checkpoint(
+        POSTGRES_SOURCE,
+        &request.connection_alias,
+        AnalysisStage::Connection,
+    )?;
+    let mut transaction = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .map_err(|error| {
             classify_postgres_error(
                 request,
-                &self.connection_string,
+                connection_string,
                 error,
-                AnalysisStage::Discovery,
+                AnalysisStage::CapabilityProbe,
             )
         })?;
-        Ok(discovery)
-    }
+    let timeout = format!("{}ms", request.timeout_ms);
+    transaction
+        .query_one(
+            "SELECT set_config('statement_timeout', $1, true)",
+            &[&timeout],
+        )
+        .map_err(|error| {
+            classify_postgres_error(
+                request,
+                connection_string,
+                error,
+                AnalysisStage::CapabilityProbe,
+            )
+        })?;
+    transaction
+        .query_one("SELECT set_config('lock_timeout', $1, true)", &[&timeout])
+        .map_err(|error| {
+            classify_postgres_error(
+                request,
+                connection_string,
+                error,
+                AnalysisStage::CapabilityProbe,
+            )
+        })?;
+    cancellation.checkpoint(
+        POSTGRES_SOURCE,
+        &request.connection_alias,
+        AnalysisStage::CapabilityProbe,
+    )?;
+
+    let raw = RawPostgresCatalog::read(&mut transaction, request)
+        .map_err(|error| catalog_failure(request, connection_string, error))?;
+    cancellation.checkpoint(
+        POSTGRES_SOURCE,
+        &request.connection_alias,
+        AnalysisStage::Discovery,
+    )?;
+    let discovery = PostgresSnapshotMapper::new(&request.connection_alias)
+        .map(raw)
+        .map_err(|error| catalog_failure(request, connection_string, error))?;
+    cancellation.checkpoint(
+        POSTGRES_SOURCE,
+        &request.connection_alias,
+        AnalysisStage::Mapping,
+    )?;
+    transaction.commit().map_err(|error| {
+        classify_postgres_error(request, connection_string, error, AnalysisStage::Discovery)
+    })?;
+    Ok(discovery)
 }
 
 pub(crate) fn analyze_postgres(
@@ -138,13 +167,30 @@ pub(crate) fn analyze_postgres(
     requested_schemas: Vec<String>,
     timeout_ms: u64,
 ) -> AnalysisOutcome {
+    analyze_postgres_with_cancellation(
+        connection_string,
+        connection_alias,
+        requested_schemas,
+        timeout_ms,
+        &CancellationToken::new(),
+    )
+}
+
+pub(crate) fn analyze_postgres_with_cancellation(
+    connection_string: &str,
+    connection_alias: &str,
+    requested_schemas: Vec<String>,
+    timeout_ms: u64,
+    cancellation: &CancellationToken,
+) -> AnalysisOutcome {
     let request = IntrospectionRequest {
         connection_alias: connection_alias.to_owned(),
         requested_catalogs: Vec::new(),
         requested_schemas,
         timeout_ms,
     };
-    DatabaseAnalysisService::new(PostgresCatalogAdapter::new(connection_string)).analyze(&request)
+    DatabaseAnalysisService::new(PostgresCatalogAdapter::new(connection_string))
+        .analyze_with_cancellation(&request, cancellation)
 }
 
 #[derive(Debug)]

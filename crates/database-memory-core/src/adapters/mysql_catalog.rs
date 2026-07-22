@@ -26,7 +26,8 @@ use crate::certification::{
     ServerIdentity,
 };
 use crate::introspection::{
-    CatalogDiscovery, CatalogIntrospector, DatabaseAnalysisService, IntrospectionRequest,
+    CancellationToken, CatalogDiscovery, CatalogIntrospector, DatabaseAnalysisService,
+    IntrospectionRequest,
 };
 use crate::{
     AdapterCapabilities, CapabilitySupport, ColumnObject, ConstraintKind, ConstraintObject,
@@ -60,83 +61,101 @@ impl CatalogIntrospector for MysqlFamilyCatalogAdapter {
         &mut self,
         request: &IntrospectionRequest,
     ) -> Result<CatalogDiscovery, AnalysisFailure> {
-        validate_request(request)?;
-        let opts = secure_connection_options(request, &self.connection_string)?;
-        let mut connection = Conn::new(opts).map_err(|error| {
-            classify_mysql_error(
-                request,
-                &self.connection_string,
-                MYSQL_FAMILY_SOURCE,
-                error,
-                AnalysisStage::Connection,
-            )
-        })?;
-        let facts = ServerFacts::read(&mut connection).map_err(|error| {
-            catalog_failure(request, &self.connection_string, MYSQL_FAMILY_SOURCE, error)
-        })?;
-        let strategy = MysqlFamilyVersion::detect(&facts.version).map_err(|error| {
-            catalog_failure(request, &self.connection_string, facts.source_kind(), error)
-        })?;
-        validate_scope(request, &facts.database).map_err(|error| {
-            catalog_failure(
-                request,
-                &self.connection_string,
-                strategy.source_kind(),
-                error,
-            )
-        })?;
-        configure_session(&mut connection, strategy, request.timeout_ms).map_err(|error| {
-            catalog_failure(
-                request,
-                &self.connection_string,
-                strategy.source_kind(),
-                error,
-            )
-        })?;
-
-        let tx_options = TxOpts::default()
-            .set_isolation_level(Some(IsolationLevel::RepeatableRead))
-            .set_access_mode(Some(AccessMode::ReadOnly))
-            .set_with_consistent_snapshot(true);
-        let mut transaction = connection.start_transaction(tx_options).map_err(|error| {
-            classify_mysql_error(
-                request,
-                &self.connection_string,
-                strategy.source_kind(),
-                error,
-                AnalysisStage::CapabilityProbe,
-            )
-        })?;
-        let raw =
-            RawMysqlFamilyCatalog::read(&mut transaction, &facts, strategy).map_err(|error| {
-                catalog_failure(
-                    request,
-                    &self.connection_string,
-                    strategy.source_kind(),
-                    error,
-                )
-            })?;
-        let discovery = MysqlFamilySnapshotMapper::new(&request.connection_alias, strategy)
-            .map(raw)
-            .map_err(|error| {
-                catalog_failure(
-                    request,
-                    &self.connection_string,
-                    strategy.source_kind(),
-                    error,
-                )
-            })?;
-        transaction.commit().map_err(|error| {
-            classify_mysql_error(
-                request,
-                &self.connection_string,
-                strategy.source_kind(),
-                error,
-                AnalysisStage::Discovery,
-            )
-        })?;
-        Ok(discovery)
+        discover_mysql_family(&self.connection_string, request, &CancellationToken::new())
     }
+
+    fn discover_with_cancellation(
+        &mut self,
+        request: &IntrospectionRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<CatalogDiscovery, AnalysisFailure> {
+        discover_mysql_family(&self.connection_string, request, cancellation)
+    }
+}
+
+fn discover_mysql_family(
+    connection_string: &str,
+    request: &IntrospectionRequest,
+    cancellation: &CancellationToken,
+) -> Result<CatalogDiscovery, AnalysisFailure> {
+    cancellation.checkpoint(
+        MYSQL_FAMILY_SOURCE,
+        &request.connection_alias,
+        AnalysisStage::Configuration,
+    )?;
+    validate_request(request)?;
+    let opts = secure_connection_options(request, connection_string)?;
+    let mut connection = Conn::new(opts).map_err(|error| {
+        classify_mysql_error(
+            request,
+            connection_string,
+            MYSQL_FAMILY_SOURCE,
+            error,
+            AnalysisStage::Connection,
+        )
+    })?;
+    cancellation.checkpoint(
+        MYSQL_FAMILY_SOURCE,
+        &request.connection_alias,
+        AnalysisStage::Connection,
+    )?;
+    let facts = ServerFacts::read(&mut connection)
+        .map_err(|error| catalog_failure(request, connection_string, MYSQL_FAMILY_SOURCE, error))?;
+    let strategy = MysqlFamilyVersion::detect(&facts.version)
+        .map_err(|error| catalog_failure(request, connection_string, facts.source_kind(), error))?;
+    validate_scope(request, &facts.database).map_err(|error| {
+        catalog_failure(request, connection_string, strategy.source_kind(), error)
+    })?;
+    configure_session(&mut connection, strategy, request.timeout_ms).map_err(|error| {
+        catalog_failure(request, connection_string, strategy.source_kind(), error)
+    })?;
+    cancellation.checkpoint(
+        strategy.source_kind(),
+        &request.connection_alias,
+        AnalysisStage::CapabilityProbe,
+    )?;
+
+    let tx_options = TxOpts::default()
+        .set_isolation_level(Some(IsolationLevel::RepeatableRead))
+        .set_access_mode(Some(AccessMode::ReadOnly))
+        .set_with_consistent_snapshot(true);
+    let mut transaction = connection.start_transaction(tx_options).map_err(|error| {
+        classify_mysql_error(
+            request,
+            connection_string,
+            strategy.source_kind(),
+            error,
+            AnalysisStage::CapabilityProbe,
+        )
+    })?;
+    let raw = RawMysqlFamilyCatalog::read(&mut transaction, &facts, strategy).map_err(|error| {
+        catalog_failure(request, connection_string, strategy.source_kind(), error)
+    })?;
+    cancellation.checkpoint(
+        strategy.source_kind(),
+        &request.connection_alias,
+        AnalysisStage::Discovery,
+    )?;
+    let discovery = MysqlFamilySnapshotMapper::new(&request.connection_alias, strategy)
+        .map(raw)
+        .map_err(|error| {
+            catalog_failure(request, connection_string, strategy.source_kind(), error)
+        })?;
+    cancellation.checkpoint(
+        strategy.source_kind(),
+        &request.connection_alias,
+        AnalysisStage::Mapping,
+    )?;
+    transaction.commit().map_err(|error| {
+        classify_mysql_error(
+            request,
+            connection_string,
+            strategy.source_kind(),
+            error,
+            AnalysisStage::Discovery,
+        )
+    })?;
+    Ok(discovery)
 }
 
 pub(crate) fn analyze_mysql_family(
@@ -145,6 +164,22 @@ pub(crate) fn analyze_mysql_family(
     requested_databases: Vec<String>,
     timeout_ms: u64,
 ) -> AnalysisOutcome {
+    analyze_mysql_family_with_cancellation(
+        connection_string,
+        connection_alias,
+        requested_databases,
+        timeout_ms,
+        &CancellationToken::new(),
+    )
+}
+
+pub(crate) fn analyze_mysql_family_with_cancellation(
+    connection_string: &str,
+    connection_alias: &str,
+    requested_databases: Vec<String>,
+    timeout_ms: u64,
+    cancellation: &CancellationToken,
+) -> AnalysisOutcome {
     let request = IntrospectionRequest {
         connection_alias: connection_alias.to_owned(),
         requested_catalogs: requested_databases.clone(),
@@ -152,7 +187,7 @@ pub(crate) fn analyze_mysql_family(
         timeout_ms,
     };
     DatabaseAnalysisService::new(MysqlFamilyCatalogAdapter::new(connection_string))
-        .analyze(&request)
+        .analyze_with_cancellation(&request, cancellation)
 }
 
 fn validate_request(request: &IntrospectionRequest) -> Result<(), AnalysisFailure> {

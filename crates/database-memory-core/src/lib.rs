@@ -531,6 +531,8 @@ fn push_capability_warning(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -605,6 +607,58 @@ mod tests {
                 .contains("select "),
             "graph_query must stay a JSON metadata filter, not SQL"
         );
+    }
+
+    #[test]
+    fn every_native_adapter_honors_a_pre_cancelled_analysis() {
+        let cancellation = introspection::CancellationToken::new();
+        cancellation.cancel();
+        let outcomes = [
+            adapters::sqlite::introspect_sqlite_complete_with_cancellation(
+                Path::new("missing-cancelled.sqlite"),
+                "sqlite-cancelled",
+                &cancellation,
+            ),
+            adapters::postgres::introspect_postgres_complete_scoped_with_cancellation(
+                "not-a-postgres-url",
+                "postgres-cancelled",
+                Vec::new(),
+                30_000,
+                &cancellation,
+            ),
+            adapters::mysql::introspect_mysql_complete_scoped_with_cancellation(
+                "not-a-mysql-url",
+                "mysql-cancelled",
+                Vec::new(),
+                30_000,
+                &cancellation,
+            ),
+            adapters::sqlserver::introspect_sqlserver_complete_scoped_with_cancellation(
+                "not-a-sqlserver-connection-string",
+                "sqlserver-cancelled",
+                Vec::new(),
+                Vec::new(),
+                30_000,
+                &cancellation,
+            ),
+            adapters::oracle::introspect_oracle_complete_scoped_with_cancellation(
+                "not-an-oracle-connection-string",
+                "oracle-cancelled",
+                Vec::new(),
+                Vec::new(),
+                30_000,
+                &cancellation,
+            ),
+        ];
+
+        for outcome in outcomes {
+            assert_eq!(outcome.status(), analysis_outcome::AnalysisStatus::Failed);
+            assert_eq!(
+                outcome.failure().expect("cancelled outcome").code,
+                analysis_outcome::AnalysisFailureCode::Cancelled
+            );
+            assert!(outcome.certified_snapshot().is_none());
+        }
     }
 
     #[test]

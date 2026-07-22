@@ -23,8 +23,8 @@ use crate::certification::{
     ObjectCategory, RelationshipCategory, ServerIdentity,
 };
 use crate::introspection::{
-    CanonicalSnapshotAssembler, CatalogDiscovery, CatalogIntrospector, DatabaseAnalysisService,
-    IntrospectionRequest,
+    CancellationToken, CanonicalSnapshotAssembler, CatalogDiscovery, CatalogIntrospector,
+    DatabaseAnalysisService, IntrospectionRequest,
 };
 use crate::{
     AdapterCapabilities, CapabilitySupport, ColumnObject, ConstraintKind, ConstraintObject,
@@ -57,40 +57,79 @@ impl CatalogIntrospector for SqlitePathCatalogAdapter {
         &mut self,
         request: &IntrospectionRequest,
     ) -> Result<CatalogDiscovery, AnalysisFailure> {
-        validate_sqlite_scope(request)?;
-        let conn = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|error| sqlite_open_failure(request, error))?;
-        conn.busy_timeout(Duration::from_millis(request.timeout_ms))
-            .map_err(|error| sqlite_failure(request, error.into()))?;
-        conn.pragma_update(None, "query_only", true)
-            .map_err(|error| sqlite_capability_failure(request, error))?;
+        discover_sqlite_path(&self.path, request, &CancellationToken::new())
+    }
 
-        let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
-        conn.progress_handler(1_000, Some(move || Instant::now() >= deadline));
-
-        let discovery = discover_sqlite_connection(
-            &conn,
-            SQLITE_SOURCE,
-            SQLITE_SOURCE,
-            &request.connection_alias,
-            vec![
-                "SQLite file opened read-only; only sqlite_schema and PRAGMA metadata were read."
-                    .to_owned(),
-            ],
-        );
-        conn.progress_handler(0, None::<fn() -> bool>);
-        discovery.map_err(|error| sqlite_failure(request, error))
+    fn discover_with_cancellation(
+        &mut self,
+        request: &IntrospectionRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<CatalogDiscovery, AnalysisFailure> {
+        discover_sqlite_path(&self.path, request, cancellation)
     }
 }
 
+fn discover_sqlite_path(
+    path: &Path,
+    request: &IntrospectionRequest,
+    cancellation: &CancellationToken,
+) -> Result<CatalogDiscovery, AnalysisFailure> {
+    cancellation.checkpoint(
+        SQLITE_SOURCE,
+        &request.connection_alias,
+        AnalysisStage::Configuration,
+    )?;
+    validate_sqlite_scope(request)?;
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| sqlite_open_failure(request, error))?;
+    cancellation.checkpoint(
+        SQLITE_SOURCE,
+        &request.connection_alias,
+        AnalysisStage::Connection,
+    )?;
+    conn.busy_timeout(Duration::from_millis(request.timeout_ms))
+        .map_err(|error| sqlite_failure(request, cancellation, error.into()))?;
+    conn.pragma_update(None, "query_only", true)
+        .map_err(|error| sqlite_capability_failure(request, error))?;
+
+    let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
+    let progress_cancellation = cancellation.clone();
+    conn.progress_handler(
+        1_000,
+        Some(move || progress_cancellation.is_cancelled() || Instant::now() >= deadline),
+    );
+
+    let discovery = discover_sqlite_connection(
+        &conn,
+        SQLITE_SOURCE,
+        SQLITE_SOURCE,
+        &request.connection_alias,
+        vec![
+            "SQLite file opened read-only; only sqlite_schema and PRAGMA metadata were read."
+                .to_owned(),
+        ],
+    );
+    conn.progress_handler(0, None::<fn() -> bool>);
+    discovery.map_err(|error| sqlite_failure(request, cancellation, error))
+}
+
 pub(crate) fn analyze_sqlite_path(path: &Path, connection_alias: &str) -> AnalysisOutcome {
+    analyze_sqlite_path_with_cancellation(path, connection_alias, &CancellationToken::new())
+}
+
+pub(crate) fn analyze_sqlite_path_with_cancellation(
+    path: &Path,
+    connection_alias: &str,
+    cancellation: &CancellationToken,
+) -> AnalysisOutcome {
     let request = IntrospectionRequest {
         connection_alias: connection_alias.to_owned(),
         requested_catalogs: vec![MAIN_CATALOG.to_owned()],
         requested_schemas: vec![MAIN_SCHEMA.to_owned()],
         timeout_ms: 30_000,
     };
-    DatabaseAnalysisService::new(SqlitePathCatalogAdapter::new(path)).analyze(&request)
+    DatabaseAnalysisService::new(SqlitePathCatalogAdapter::new(path))
+        .analyze_with_cancellation(&request, cancellation)
 }
 
 pub(crate) fn discover_sqlite_connection(
@@ -155,19 +194,36 @@ fn validate_sqlite_scope(request: &IntrospectionRequest) -> Result<(), AnalysisF
     ))
 }
 
-fn sqlite_failure(request: &IntrospectionRequest, error: SqliteAdapterError) -> AnalysisFailure {
+fn sqlite_failure(
+    request: &IntrospectionRequest,
+    cancellation: &CancellationToken,
+    error: SqliteAdapterError,
+) -> AnalysisFailure {
     if matches!(
         &error,
         SqliteAdapterError::Storage(storage)
             if storage.sqlite_error_code() == Some(ErrorCode::OperationInterrupted)
     ) {
+        let cancelled = cancellation.is_cancelled();
         return AnalysisFailure::redacted(
-            AnalysisFailureCode::Timeout,
+            if cancelled {
+                AnalysisFailureCode::Cancelled
+            } else {
+                AnalysisFailureCode::Timeout
+            },
             AnalysisStage::Discovery,
             SQLITE_SOURCE,
             &request.connection_alias,
-            "SQLite metadata introspection exceeded its configured timeout",
-            "increase the bounded timeout or reduce schema complexity, then retry",
+            if cancelled {
+                "SQLite metadata introspection was cancelled"
+            } else {
+                "SQLite metadata introspection exceeded its configured timeout"
+            },
+            if cancelled {
+                "start a new analysis when the result is still needed"
+            } else {
+                "increase the bounded timeout or reduce schema complexity, then retry"
+            },
             true,
             None,
         );
