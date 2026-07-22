@@ -56,28 +56,64 @@ fn redact_url_passwords(value: &str) -> String {
 
 fn redact_ado_passwords(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
-    for segment in value.split_inclusive(';') {
-        let (body, suffix) = segment
-            .strip_suffix(';')
-            .map(|body| (body, ";"))
-            .unwrap_or((segment, ""));
+    let mut segment_start = 0;
+    let mut characters = value.char_indices().peekable();
+    let mut braced = false;
+    let mut quoted = None;
 
-        if let Some(eq_index) = body.find('=') {
-            let key = body[..eq_index]
-                .trim()
-                .replace(' ', "")
-                .to_ascii_lowercase();
-            if key == "password" || key == "pwd" {
-                output.push_str(&body[..=eq_index]);
-                output.push_str(REDACTION);
-                output.push_str(suffix);
-                continue;
+    while let Some((index, character)) = characters.next() {
+        if braced {
+            if character == '}' {
+                if characters.peek().is_some_and(|(_, next)| *next == '}') {
+                    characters.next();
+                } else {
+                    braced = false;
+                }
             }
+            continue;
+        }
+        if let Some(quote) = quoted {
+            if character == quote {
+                if characters.peek().is_some_and(|(_, next)| *next == quote) {
+                    characters.next();
+                } else {
+                    quoted = None;
+                }
+            }
+            continue;
         }
 
+        match character {
+            '{' => braced = true,
+            '\'' | '"' => quoted = Some(character),
+            ';' => {
+                push_redacted_ado_segment(&mut output, &value[segment_start..index]);
+                output.push(';');
+                segment_start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    push_redacted_ado_segment(&mut output, &value[segment_start..]);
+    output
+}
+
+fn push_redacted_ado_segment(output: &mut String, segment: &str) {
+    let Some(eq_index) = segment.find('=') else {
+        output.push_str(segment);
+        return;
+    };
+    let key = segment[..eq_index]
+        .trim()
+        .replace(' ', "")
+        .to_ascii_lowercase();
+    if key == "password" || key == "pwd" {
+        output.push_str(&segment[..=eq_index]);
+        output.push_str(REDACTION);
+    } else {
         output.push_str(segment);
     }
-    output
 }
 
 fn redact_oracle_passwords(value: &str) -> String {
@@ -133,6 +169,16 @@ mod redact_tests {
                 "server=tcp:localhost,1433;user=sa;password=Password123;database=app;TrustServerCertificate=true"
             ),
             "server=tcp:localhost,1433;user=sa;password=***;database=app;TrustServerCertificate=true"
+        );
+        assert_eq!(
+            redact_connection_string(
+                "Driver={ODBC Driver 17 for SQL Server};UID=sa;PWD={abc;123};Server=localhost"
+            ),
+            "Driver={ODBC Driver 17 for SQL Server};UID=sa;PWD=***;Server=localhost"
+        );
+        assert_eq!(
+            redact_connection_string("Driver={DB2};PWD={unterminated;secret"),
+            "Driver={DB2};PWD=***"
         );
     }
 

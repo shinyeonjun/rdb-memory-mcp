@@ -1,5 +1,6 @@
 pub mod mysql;
 mod mysql_catalog;
+pub mod odbc;
 pub mod oracle;
 mod oracle_catalog;
 pub mod postgres;

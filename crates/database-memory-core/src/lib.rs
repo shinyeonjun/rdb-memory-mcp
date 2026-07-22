@@ -574,6 +574,7 @@ mod tests {
             ("postgres", include_str!("adapters/postgres.rs")),
             ("mysql", include_str!("adapters/mysql.rs")),
             ("mysql-catalog", include_str!("adapters/mysql_catalog.rs")),
+            ("odbc", include_str!("adapters/odbc.rs")),
             ("sqlserver", include_str!("adapters/sqlserver.rs")),
             (
                 "sqlserver-catalog",
