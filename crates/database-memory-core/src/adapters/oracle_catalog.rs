@@ -494,7 +494,7 @@ fn prepare_call(connection: &Connection, deadline: Instant) -> Result<(), Catalo
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .ok_or(CatalogError::Timeout)?;
-    if remaining.is_zero() {
+    if remaining < Duration::from_millis(1) {
         return Err(CatalogError::Timeout);
     }
     connection.set_call_timeout(Some(remaining))?;
@@ -630,15 +630,27 @@ fn catalog_failure(
             true,
         ),
         CatalogError::Query(error) => {
+            let timeout = is_timeout_error(&error);
             let permission = matches!(error.oci_code(), Some(942 | 1031));
             (
-                if permission {
+                if timeout {
+                    AnalysisFailureCode::Timeout
+                } else if permission {
                     AnalysisFailureCode::PermissionDenied
                 } else {
                     AnalysisFailureCode::MetadataQueryFailed
                 },
-                error.to_string(),
-                if permission {
+                if timeout {
+                    format!(
+                        "Oracle metadata analysis exceeded the {} ms timeout",
+                        request.timeout_ms
+                    )
+                } else {
+                    error.to_string()
+                },
+                if timeout {
+                    "increase the bounded timeout or reduce the selected schema scope".to_owned()
+                } else if permission {
                     "use USER_* for the session owner or grant direct/role access to every required DBA_* dictionary view"
                         .to_owned()
                 } else {
@@ -649,15 +661,27 @@ fn catalog_failure(
             )
         }
         CatalogError::QueryContext { catalog, source } => {
+            let timeout = is_timeout_error(&source);
             let permission = matches!(source.oci_code(), Some(942 | 1031));
             (
-                if permission {
+                if timeout {
+                    AnalysisFailureCode::Timeout
+                } else if permission {
                     AnalysisFailureCode::PermissionDenied
                 } else {
                     AnalysisFailureCode::MetadataQueryFailed
                 },
-                format!("Oracle {catalog} query failed: {source}"),
-                if permission {
+                if timeout {
+                    format!(
+                        "Oracle metadata analysis exceeded the {} ms timeout while reading {catalog}",
+                        request.timeout_ms
+                    )
+                } else {
+                    format!("Oracle {catalog} query failed: {source}")
+                },
+                if timeout {
+                    "increase the bounded timeout or reduce the selected schema scope".to_owned()
+                } else if permission {
                     "use USER_* for the session owner or grant direct/role access to every required DBA_* dictionary view"
                         .to_owned()
                 } else {
@@ -1334,6 +1358,8 @@ impl RawOracleCatalog {
         scope: &DictionaryScope,
         deadline: Instant,
     ) -> Result<Self, CatalogError> {
+        reject_database_links(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("database-link"))?;
         let recycle = read_recycle_bin(connection, scope, deadline)
             .map_err(|error| error.catalog_context("recycle-bin"))?;
         let inventory = read_inventory(connection, scope, &recycle, deadline)
@@ -1523,6 +1549,30 @@ fn read_principals(
     }
     principals.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(principals)
+}
+
+fn reject_database_links(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<(), CatalogError> {
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let sql = match scope.mode {
+            DictionaryScopeMode::User => "SELECT :1, DB_LINK FROM USER_DB_LINKS ORDER BY DB_LINK",
+            DictionaryScopeMode::Dba => {
+                "SELECT OWNER, DB_LINK FROM DBA_DB_LINKS WHERE OWNER = :1 ORDER BY OWNER, DB_LINK"
+            }
+        };
+        let mut rows = connection.query_as::<(String, String)>(sql, &[owner])?;
+        if let Some(row) = rows.next() {
+            let (link_owner, link_name) = row?;
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle schema {link_owner} contains unsupported database link '{link_name}'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn read_recycle_bin(
@@ -14475,7 +14525,7 @@ mod tests {
             .admin
             .execute(
                 &format!(
-                    "GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW, CREATE MATERIALIZED VIEW, CREATE TRIGGER, CREATE PROCEDURE, CREATE SYNONYM, CREATE TYPE, ADMINISTER DATABASE TRIGGER TO {}",
+                    "GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW, CREATE MATERIALIZED VIEW, CREATE TRIGGER, CREATE PROCEDURE, CREATE SYNONYM, CREATE TYPE, CREATE DATABASE LINK, ADMINISTER DATABASE TRIGGER TO {}",
                     cleanup.username
                 ),
                 &[],
@@ -14637,6 +14687,61 @@ mod tests {
             setup.execute(statement, &[]).expect("create local synonym");
         }
         drop(setup);
+
+        let timed_out = analyze_oracle(&user_url, "oracle-timeout-live", Vec::new(), Vec::new(), 1);
+        assert_eq!(timed_out.status(), AnalysisStatus::Failed);
+        let timed_out_failure = timed_out.failure().expect("bounded deadline must fail");
+        assert_eq!(
+            timed_out_failure.code,
+            AnalysisFailureCode::Timeout,
+            "unexpected Oracle timeout failure: {timed_out_failure:?}"
+        );
+        assert!(timed_out.certified_snapshot().is_none());
+
+        let reader = Connection::connect(&cleanup.username, password, &connect_string)
+            .expect("connect Oracle read-only stability reader");
+        reader
+            .set_call_timeout(Some(Duration::from_secs(30)))
+            .expect("set Oracle stability reader timeout");
+        reader
+            .execute("SET TRANSACTION READ ONLY", &[])
+            .expect("start Oracle read-only stability transaction");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let facts = ServerFacts::read(&reader, deadline).expect("read Oracle stability facts");
+        let scope = DictionaryScope::select(&reader, &request(), &facts, deadline)
+            .expect("select Oracle stability dictionary scope");
+        let before = RawOracleCatalog::read(&reader, &scope, deadline)
+            .expect("read Oracle catalog before concurrent DDL");
+
+        let mutator = Connection::connect(&cleanup.username, password, &connect_string)
+            .expect("connect Oracle catalog mutator");
+        mutator
+            .execute("CREATE TABLE CATALOG_MUTATION_PROBE (ID NUMBER)", &[])
+            .expect("create concurrent Oracle catalog mutation");
+        let during = RawOracleCatalog::read(&reader, &scope, deadline)
+            .expect("read Oracle catalog after concurrent DDL in the same snapshot");
+        assert_eq!(before, during);
+        reader
+            .rollback()
+            .expect("finish Oracle read-only stability transaction");
+
+        reader
+            .execute("SET TRANSACTION READ ONLY", &[])
+            .expect("start fresh Oracle read-only transaction");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let facts =
+            ServerFacts::read(&reader, deadline).expect("read fresh Oracle stability facts");
+        let scope = DictionaryScope::select(&reader, &request(), &facts, deadline)
+            .expect("select fresh Oracle stability dictionary scope");
+        let after = RawOracleCatalog::read(&reader, &scope, deadline)
+            .expect("read Oracle catalog in a fresh snapshot");
+        assert_ne!(before, after);
+        reader
+            .rollback()
+            .expect("finish fresh Oracle read-only transaction");
+        mutator
+            .execute("DROP TABLE CATALOG_MUTATION_PROBE PURGE", &[])
+            .expect("drop concurrent Oracle catalog mutation");
 
         let complete = analyze_oracle(&user_url, "oracle-live", Vec::new(), Vec::new(), 30_000);
         assert_eq!(
@@ -15490,6 +15595,79 @@ mod tests {
         let setup = Connection::connect(&cleanup.username, password, &connect_string)
             .expect("reconnect as isolated Oracle test user");
         setup
+            .execute(
+                &format!(
+                    "CREATE DATABASE LINK REMOTE_LOOPBACK CONNECT TO {} IDENTIFIED BY \"{password}\" USING '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=127.0.0.1)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=FREEPDB1)))'",
+                    cleanup.username
+                ),
+                &[],
+            )
+            .expect("create remote database-link fixture");
+        setup
+            .execute(
+                "CREATE SYNONYM REMOTE_CHILD_ALIAS FOR CHILD_ENTITY@REMOTE_LOOPBACK",
+                &[],
+            )
+            .expect("create remote synonym fixture");
+        drop(setup);
+
+        let failed = analyze_oracle(&user_url, "oracle-live", Vec::new(), Vec::new(), 30_000);
+        assert_eq!(failed.status(), AnalysisStatus::Failed);
+        let remote_failure = failed.failure().expect("remote link must fail");
+        assert_eq!(
+            remote_failure.code,
+            AnalysisFailureCode::UnsupportedMetadata,
+            "unexpected Oracle remote-link failure: {remote_failure:?}"
+        );
+        assert!(failed.certified_snapshot().is_none());
+
+        let dba_failed = analyze_oracle(
+            &admin_url,
+            "oracle-dba-remote-link",
+            Vec::new(),
+            vec![cleanup.username.clone()],
+            30_000,
+        );
+        assert_eq!(dba_failed.status(), AnalysisStatus::Failed);
+        assert_eq!(
+            dba_failed
+                .failure()
+                .expect("DBA-scoped remote link must fail")
+                .code,
+            AnalysisFailureCode::UnsupportedMetadata
+        );
+        assert!(dba_failed.certified_snapshot().is_none());
+
+        let setup = Connection::connect(&cleanup.username, password, &connect_string)
+            .expect("reconnect as isolated Oracle test user");
+        setup
+            .execute("DROP SYNONYM REMOTE_CHILD_ALIAS", &[])
+            .expect("drop remote synonym fixture");
+        setup
+            .execute("DROP DATABASE LINK REMOTE_LOOPBACK", &[])
+            .expect("drop remote database-link fixture");
+        setup
+            .execute(
+                "CREATE FORCE VIEW INVALID_PARENT AS SELECT ID FROM MISSING_PARENT",
+                &[],
+            )
+            .expect("create invalid Oracle object fixture");
+        drop(setup);
+
+        let failed = analyze_oracle(&user_url, "oracle-live", Vec::new(), Vec::new(), 30_000);
+        assert_eq!(failed.status(), AnalysisStatus::Failed);
+        assert_eq!(
+            failed.failure().expect("failed outcome").code,
+            AnalysisFailureCode::UnsupportedMetadata
+        );
+        assert!(failed.certified_snapshot().is_none());
+
+        let setup = Connection::connect(&cleanup.username, password, &connect_string)
+            .expect("reconnect as isolated Oracle test user");
+        setup
+            .execute("DROP VIEW INVALID_PARENT", &[])
+            .expect("drop invalid Oracle object fixture");
+        setup
             .execute("CREATE SYNONYM MISSING_ALIAS FOR MISSING_TARGET", &[])
             .expect("create unresolved synonym fixture");
         drop(setup);
@@ -15687,6 +15865,24 @@ mod tests {
             )
             .expect("create cross-schema routine call");
         drop(child);
+
+        let child_url = format!("{}/{password}@{connect_string}", child_cleanup.username);
+        let denied = analyze_oracle(
+            &child_url,
+            "oracle-multi-denied",
+            Vec::new(),
+            vec![
+                parent_cleanup.username.clone(),
+                child_cleanup.username.clone(),
+            ],
+            30_000,
+        );
+        assert_eq!(denied.status(), AnalysisStatus::Failed);
+        assert_eq!(
+            denied.failure().expect("denied scope must fail").code,
+            AnalysisFailureCode::PermissionDenied
+        );
+        assert!(denied.certified_snapshot().is_none());
 
         let incomplete = analyze_oracle(
             &admin_url,
