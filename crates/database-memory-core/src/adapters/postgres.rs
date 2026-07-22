@@ -152,6 +152,29 @@ mod tests {
     }
 
     #[test]
+    fn postgres_entrypoint_rejects_yugabyte_identity() {
+        let Ok(connection_string) = std::env::var("DATABASE_MEMORY_TEST_YUGABYTE_URL") else {
+            eprintln!(
+                "skipping YugabyteDB identity test; set DATABASE_MEMORY_TEST_YUGABYTE_URL to run it"
+            );
+            return;
+        };
+        let outcome = introspect_postgres_complete_scoped(
+            &connection_string,
+            "yb-through-postgres",
+            vec!["public".to_owned()],
+            30_000,
+        );
+
+        assert_eq!(outcome.status(), AnalysisStatus::Failed);
+        assert_eq!(
+            outcome.failure().map(|failure| failure.code),
+            Some(AnalysisFailureCode::UnsupportedProduct)
+        );
+        assert!(outcome.certified_snapshot().is_none());
+    }
+
+    #[test]
     fn rich_postgres_catalog_is_certified_without_silent_drops() {
         let Ok(connection_string) = std::env::var("DATABASE_MEMORY_TEST_POSTGRES_URL") else {
             eprintln!(

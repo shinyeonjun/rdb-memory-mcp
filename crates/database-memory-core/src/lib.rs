@@ -572,6 +572,10 @@ mod tests {
         let sources = [
             ("sqlite", include_str!("adapters/sqlite.rs")),
             ("postgres", include_str!("adapters/postgres.rs")),
+            (
+                "postgres-catalog",
+                include_str!("adapters/postgres_catalog.rs"),
+            ),
             ("mysql", include_str!("adapters/mysql.rs")),
             ("mysql-catalog", include_str!("adapters/mysql_catalog.rs")),
             ("odbc", include_str!("adapters/odbc.rs")),

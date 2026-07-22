@@ -198,6 +198,7 @@ enum CatalogError {
     Query(postgres::Error),
     InvalidScope(String),
     PermissionDenied(String),
+    UnsupportedProduct(String),
     UnsupportedVersion(i32),
     UnsupportedMetadata(String),
     Mapping(String),
@@ -401,6 +402,16 @@ fn catalog_failure(
             false,
             Some(connection_string),
         ),
+        CatalogError::UnsupportedProduct(message) => AnalysisFailure::redacted(
+            AnalysisFailureCode::UnsupportedProduct,
+            AnalysisStage::CapabilityProbe,
+            POSTGRES_SOURCE,
+            &request.connection_alias,
+            message,
+            "select the matching product adapter; PostgreSQL compatibility is not PostgreSQL certification",
+            false,
+            Some(connection_string),
+        ),
         CatalogError::UnsupportedVersion(major) => AnalysisFailure::redacted(
             AnalysisFailureCode::UnsupportedVersion,
             AnalysisStage::CapabilityProbe,
@@ -440,6 +451,7 @@ fn catalog_failure(
 struct ServerFacts {
     database: String,
     version: String,
+    version_banner: String,
     version_num: i32,
     current_user: String,
     session_user: String,
@@ -859,6 +871,7 @@ impl RawPostgresCatalog {
         request: &IntrospectionRequest,
     ) -> Result<Self, CatalogError> {
         let server = read_server_facts(client)?;
+        validate_postgres_product_identity(&server.version, &server.version_banner)?;
         let catalog_version = PostgresCatalogVersion::detect(server.version_num)?;
         if !request.requested_catalogs.is_empty()
             && request.requested_catalogs != [server.database.clone()]
@@ -959,7 +972,8 @@ fn read_server_facts(client: &mut impl GenericClient) -> Result<ServerFacts, Cat
                current_setting('transaction_isolation'),
                COALESCE((SELECT ssl FROM pg_catalog.pg_stat_ssl WHERE pid = pg_catalog.pg_backend_pid()), false),
                (SELECT version FROM pg_catalog.pg_stat_ssl WHERE pid = pg_catalog.pg_backend_pid()),
-               (SELECT cipher FROM pg_catalog.pg_stat_ssl WHERE pid = pg_catalog.pg_backend_pid())
+               (SELECT cipher FROM pg_catalog.pg_stat_ssl WHERE pid = pg_catalog.pg_backend_pid()),
+               pg_catalog.version()
         ",
         &[],
     )?;
@@ -974,7 +988,27 @@ fn read_server_facts(client: &mut impl GenericClient) -> Result<ServerFacts, Cat
         tls: row.get(7),
         tls_version: row.get(8),
         tls_cipher: row.get(9),
+        version_banner: row.get(10),
     })
+}
+
+fn validate_postgres_product_identity(version: &str, banner: &str) -> Result<(), CatalogError> {
+    let version = version.trim();
+    let banner = banner.trim();
+    let yugabyte = version.to_ascii_uppercase().contains("-YB-")
+        || banner.to_ascii_uppercase().contains("-YB-");
+    if yugabyte {
+        return Err(CatalogError::UnsupportedProduct(format!(
+            "connected product is YugabyteDB YSQL ({version}), not certified PostgreSQL"
+        )));
+    }
+    if !banner.starts_with("PostgreSQL ") {
+        let product = banner.split_whitespace().next().unwrap_or("unknown");
+        return Err(CatalogError::UnsupportedProduct(format!(
+            "connected product reports '{product}', not certified PostgreSQL"
+        )));
+    }
+    Ok(())
 }
 
 fn read_schemas(client: &mut impl GenericClient) -> Result<Vec<RawSchema>, CatalogError> {
@@ -4659,6 +4693,30 @@ mod version_strategy_tests {
         assert!(matches!(
             PostgresCatalogVersion::detect(190_000),
             Err(CatalogError::UnsupportedVersion(19))
+        ));
+    }
+
+    #[test]
+    fn postgres_identity_rejects_wire_compatible_products_before_version_selection() {
+        validate_postgres_product_identity(
+            "16.10 (Debian 16.10-1.pgdg13+1)",
+            "PostgreSQL 16.10 (Debian 16.10-1.pgdg13+1) on x86_64-pc-linux-gnu",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            validate_postgres_product_identity(
+                "15.12-YB-2025.2.3.2-b0",
+                "PostgreSQL 15.12-YB-2025.2.3.2-b0 on x86_64-pc-linux-gnu"
+            ),
+            Err(CatalogError::UnsupportedProduct(_))
+        ));
+        assert!(matches!(
+            validate_postgres_product_identity(
+                "15.0",
+                "CockroachDB CCL v25.2.1 (x86_64-unknown-linux-gnu)"
+            ),
+            Err(CatalogError::UnsupportedProduct(_))
         ));
     }
 
