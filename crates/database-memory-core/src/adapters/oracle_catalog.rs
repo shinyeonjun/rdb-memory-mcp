@@ -21,7 +21,7 @@ use crate::introspection::{
 use crate::{
     AdapterCapabilities, CapabilitySupport, ColumnObject, ConstraintKind, ConstraintObject,
     DatabaseObject, IndexObject, ObjectKey, ObjectKind, SchemaObject, SchemaSnapshot, TableKind,
-    TableObject, ViewObject,
+    TableObject, TriggerObject, ViewObject,
 };
 
 const ORACLE_SOURCE: &str = "oracle";
@@ -822,6 +822,27 @@ struct RawMaterializedView {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct RawTrigger {
+    owner: String,
+    name: String,
+    trigger_type: String,
+    triggering_event: String,
+    table_owner: Option<String>,
+    base_object_type: String,
+    table_name: Option<String>,
+    column_name: Option<String>,
+    referencing_names: Option<String>,
+    when_clause: Option<String>,
+    status: String,
+    description: Option<String>,
+    action_type: String,
+    body: Option<String>,
+    crossedition: Option<String>,
+    fire_once: Option<String>,
+    apply_server_only: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RawConstraintColumn {
     name: String,
     position: Option<i64>,
@@ -885,6 +906,7 @@ struct RawDependency {
     referenced_type: String,
     referenced_link: Option<String>,
     dependency_type: String,
+    referenced_owner_oracle_maintained: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -897,6 +919,7 @@ struct RawOracleCatalog {
     views: Vec<RawView>,
     view_columns: Vec<RawColumn>,
     materialized_views: Vec<RawMaterializedView>,
+    triggers: Vec<RawTrigger>,
     constraints: Vec<RawConstraint>,
     indexes: Vec<RawIndex>,
     dependencies: Vec<RawDependency>,
@@ -926,6 +949,8 @@ impl RawOracleCatalog {
             .map_err(|error| error.catalog_context("view-column"))?;
         let materialized_views = read_materialized_views(connection, scope, deadline)
             .map_err(|error| error.catalog_context("materialized-view"))?;
+        let triggers = read_triggers(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("trigger"))?;
         let mut constraints = read_constraints(connection, scope, &recycle, deadline)
             .map_err(|error| error.catalog_context("constraint"))?;
         attach_constraint_columns(connection, scope, &mut constraints, deadline)
@@ -948,6 +973,7 @@ impl RawOracleCatalog {
             views,
             view_columns,
             materialized_views,
+            triggers,
             constraints,
             indexes,
             dependencies,
@@ -1842,6 +1868,128 @@ fn read_materialized_views(
     Ok(materialized_views)
 }
 
+fn read_triggers(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawTrigger>, CatalogError> {
+    type TriggerTuple = (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let mut triggers = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let sql = match scope.mode {
+            DictionaryScopeMode::User => {
+                "
+                SELECT :1,
+                       TRIGGER_NAME,
+                       TRIGGER_TYPE,
+                       TRIGGERING_EVENT,
+                       TABLE_OWNER,
+                       BASE_OBJECT_TYPE,
+                       TABLE_NAME,
+                       COLUMN_NAME,
+                       REFERENCING_NAMES,
+                       WHEN_CLAUSE,
+                       STATUS,
+                       DESCRIPTION,
+                       ACTION_TYPE,
+                       TRIGGER_BODY,
+                       CROSSEDITION,
+                       FIRE_ONCE,
+                       APPLY_SERVER_ONLY
+                FROM USER_TRIGGERS
+                ORDER BY TRIGGER_NAME
+                "
+            }
+            DictionaryScopeMode::Dba => {
+                "
+                SELECT OWNER,
+                       TRIGGER_NAME,
+                       TRIGGER_TYPE,
+                       TRIGGERING_EVENT,
+                       TABLE_OWNER,
+                       BASE_OBJECT_TYPE,
+                       TABLE_NAME,
+                       COLUMN_NAME,
+                       REFERENCING_NAMES,
+                       WHEN_CLAUSE,
+                       STATUS,
+                       DESCRIPTION,
+                       ACTION_TYPE,
+                       TRIGGER_BODY,
+                       CROSSEDITION,
+                       FIRE_ONCE,
+                       APPLY_SERVER_ONLY
+                FROM DBA_TRIGGERS
+                WHERE OWNER = :1
+                ORDER BY OWNER, TRIGGER_NAME
+                "
+            }
+        };
+        let rows = connection.query_as::<TriggerTuple>(sql, &[owner])?;
+        for row in rows {
+            let (
+                owner,
+                name,
+                trigger_type,
+                triggering_event,
+                table_owner,
+                base_object_type,
+                table_name,
+                column_name,
+                referencing_names,
+                when_clause,
+                status,
+                description,
+                action_type,
+                body,
+                crossedition,
+                fire_once,
+                apply_server_only,
+            ) = row?;
+            triggers.push(RawTrigger {
+                owner,
+                name,
+                trigger_type: trigger_type.trim().to_owned(),
+                triggering_event: triggering_event.trim().to_owned(),
+                table_owner: normalize_optional_token(table_owner),
+                base_object_type: base_object_type.trim().to_owned(),
+                table_name: normalize_optional_token(table_name),
+                column_name: normalize_optional_token(column_name),
+                referencing_names: normalize_optional_token(referencing_names),
+                when_clause: normalize_optional_token(when_clause),
+                status: status.trim().to_owned(),
+                description: normalize_definition(description)?,
+                action_type: action_type.trim().to_owned(),
+                body: normalize_definition(body)?,
+                crossedition: normalize_optional_token(crossedition),
+                fire_once: normalize_optional_token(fire_once),
+                apply_server_only: normalize_optional_token(apply_server_only),
+            });
+        }
+    }
+    triggers.sort_by(|left, right| (&left.owner, &left.name).cmp(&(&right.owner, &right.name)));
+    Ok(triggers)
+}
+
 fn read_view_columns(
     connection: &Connection,
     scope: &DictionaryScope,
@@ -2000,6 +2148,197 @@ fn normalize_definition(value: Option<String>) -> Result<Option<String>, Catalog
         )));
     }
     Ok((!normalized.is_empty()).then_some(normalized))
+}
+
+fn normalize_optional_token(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn reject_dynamic_plsql(kind: &str, name: &str, definition: &str) -> Result<(), CatalogError> {
+    let words = oracle_plsql_words(definition)?;
+    let execute_immediate = words
+        .windows(2)
+        .any(|words| words == ["EXECUTE", "IMMEDIATE"]);
+    let dbms_sql = words.iter().any(|word| word == "DBMS_SQL");
+    let execute_ddl = words
+        .windows(2)
+        .any(|words| words == ["DBMS_UTILITY", "EXEC_DDL_STATEMENT"]);
+    let dynamic_open = words.iter().enumerate().any(|(index, word)| {
+        if word != "OPEN" {
+            return false;
+        }
+        let Some(for_offset) = words[index + 1..]
+            .iter()
+            .take(3)
+            .position(|word| word == "FOR")
+        else {
+            return false;
+        };
+        !matches!(
+            words.get(index + for_offset + 2).map(String::as_str),
+            Some("SELECT" | "WITH")
+        )
+    });
+    if execute_immediate || dbms_sql || execute_ddl || dynamic_open {
+        return Err(CatalogError::UnsupportedMetadata(format!(
+            "Oracle {kind} {name} contains dynamic PL/SQL that prevents complete dependency proof"
+        )));
+    }
+    Ok(())
+}
+
+fn oracle_plsql_words(source: &str) -> Result<Vec<String>, CatalogError> {
+    let chars = source.chars().collect::<Vec<_>>();
+    let mut words = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '-' && chars.get(index + 1) == Some(&'-') {
+            index += 2;
+            while index < chars.len() && chars[index] != '\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if chars[index] == '/' && chars.get(index + 1) == Some(&'*') {
+            index += 2;
+            while index + 1 < chars.len() && !(chars[index] == '*' && chars[index + 1] == '/') {
+                index += 1;
+            }
+            if index + 1 >= chars.len() {
+                return Err(CatalogError::UnsupportedMetadata(
+                    "Oracle PL/SQL contains an unterminated block comment".to_owned(),
+                ));
+            }
+            index += 2;
+            continue;
+        }
+        let q_delimiter_index =
+            if matches!(chars[index], 'q' | 'Q') && chars.get(index + 1) == Some(&'\'') {
+                Some(index + 2)
+            } else if matches!(chars[index], 'n' | 'N')
+                && matches!(chars.get(index + 1), Some('q' | 'Q'))
+                && chars.get(index + 2) == Some(&'\'')
+            {
+                Some(index + 3)
+            } else {
+                None
+            };
+        if let Some(delimiter_index) = q_delimiter_index {
+            let Some(opening) = chars.get(delimiter_index).copied() else {
+                return Err(CatalogError::UnsupportedMetadata(
+                    "Oracle PL/SQL contains an incomplete alternative-quoted literal".to_owned(),
+                ));
+            };
+            let closing = match opening {
+                '[' => ']',
+                '{' => '}',
+                '(' => ')',
+                '<' => '>',
+                other => other,
+            };
+            index = delimiter_index + 1;
+            while index + 1 < chars.len() && !(chars[index] == closing && chars[index + 1] == '\'')
+            {
+                index += 1;
+            }
+            if index + 1 >= chars.len() {
+                return Err(CatalogError::UnsupportedMetadata(
+                    "Oracle PL/SQL contains an unterminated alternative-quoted literal".to_owned(),
+                ));
+            }
+            index += 2;
+            continue;
+        }
+        if chars[index] == '\'' {
+            index += 1;
+            loop {
+                let Some(character) = chars.get(index) else {
+                    return Err(CatalogError::UnsupportedMetadata(
+                        "Oracle PL/SQL contains an unterminated string literal".to_owned(),
+                    ));
+                };
+                if *character != '\'' {
+                    index += 1;
+                    continue;
+                }
+                if chars.get(index + 1) == Some(&'\'') {
+                    index += 2;
+                    continue;
+                }
+                index += 1;
+                break;
+            }
+            continue;
+        }
+        if chars[index] == '"' {
+            index += 1;
+            loop {
+                let Some(character) = chars.get(index) else {
+                    return Err(CatalogError::UnsupportedMetadata(
+                        "Oracle PL/SQL contains an unterminated quoted identifier".to_owned(),
+                    ));
+                };
+                if *character != '"' {
+                    index += 1;
+                    continue;
+                }
+                if chars.get(index + 1) == Some(&'"') {
+                    index += 2;
+                    continue;
+                }
+                index += 1;
+                break;
+            }
+            continue;
+        }
+        if chars[index].is_ascii_alphabetic() || matches!(chars[index], '_' | '$' | '#') {
+            let start = index;
+            index += 1;
+            while index < chars.len()
+                && (chars[index].is_ascii_alphanumeric() || matches!(chars[index], '_' | '$' | '#'))
+            {
+                index += 1;
+            }
+            words.push(
+                chars[start..index]
+                    .iter()
+                    .collect::<String>()
+                    .to_uppercase(),
+            );
+            continue;
+        }
+        index += 1;
+    }
+    Ok(words)
+}
+
+fn oracle_trigger_timing(trigger_type: &str) -> Result<String, CatalogError> {
+    for timing in ["INSTEAD OF", "BEFORE", "AFTER", "COMPOUND"] {
+        if trigger_type.starts_with(timing) {
+            return Ok(timing.to_owned());
+        }
+    }
+    Err(CatalogError::UnsupportedMetadata(format!(
+        "Oracle trigger type '{trigger_type}' has no covered timing"
+    )))
+}
+
+fn oracle_trigger_events(triggering_event: &str) -> Result<Vec<String>, CatalogError> {
+    let events = triggering_event
+        .split(" OR ")
+        .map(str::trim)
+        .filter(|event| !event.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if events.is_empty() {
+        Err(CatalogError::Mapping(
+            "Oracle trigger has no triggering events".to_owned(),
+        ))
+    } else {
+        Ok(events)
+    }
 }
 
 fn read_constraints(
@@ -2469,30 +2808,34 @@ fn read_dependencies(
             DictionaryScopeMode::User => {
                 "
                 SELECT :1,
-                       NAME,
-                       TYPE,
-                       REFERENCED_OWNER,
-                       REFERENCED_NAME,
-                       REFERENCED_TYPE,
-                       REFERENCED_LINK_NAME,
-                       DEPENDENCY_TYPE
-                FROM USER_DEPENDENCIES
-                ORDER BY NAME, TYPE, REFERENCED_OWNER, REFERENCED_NAME, REFERENCED_TYPE
+                       D.NAME,
+                       D.TYPE,
+                       D.REFERENCED_OWNER,
+                       D.REFERENCED_NAME,
+                       D.REFERENCED_TYPE,
+                       D.REFERENCED_LINK_NAME,
+                       D.DEPENDENCY_TYPE,
+                       U.ORACLE_MAINTAINED
+                FROM USER_DEPENDENCIES D
+                LEFT JOIN ALL_USERS U ON U.USERNAME = D.REFERENCED_OWNER
+                ORDER BY D.NAME, D.TYPE, D.REFERENCED_OWNER, D.REFERENCED_NAME, D.REFERENCED_TYPE
                 "
             }
             DictionaryScopeMode::Dba => {
                 "
-                SELECT OWNER,
-                       NAME,
-                       TYPE,
-                       REFERENCED_OWNER,
-                       REFERENCED_NAME,
-                       REFERENCED_TYPE,
-                       REFERENCED_LINK_NAME,
-                       DEPENDENCY_TYPE
-                FROM DBA_DEPENDENCIES
-                WHERE OWNER = :1
-                ORDER BY OWNER, NAME, TYPE, REFERENCED_OWNER, REFERENCED_NAME, REFERENCED_TYPE
+                SELECT D.OWNER,
+                       D.NAME,
+                       D.TYPE,
+                       D.REFERENCED_OWNER,
+                       D.REFERENCED_NAME,
+                       D.REFERENCED_TYPE,
+                       D.REFERENCED_LINK_NAME,
+                       D.DEPENDENCY_TYPE,
+                       U.ORACLE_MAINTAINED
+                FROM DBA_DEPENDENCIES D
+                LEFT JOIN DBA_USERS U ON U.USERNAME = D.REFERENCED_OWNER
+                WHERE D.OWNER = :1
+                ORDER BY D.OWNER, D.NAME, D.TYPE, D.REFERENCED_OWNER, D.REFERENCED_NAME, D.REFERENCED_TYPE
                 "
             }
         };
@@ -2505,6 +2848,7 @@ fn read_dependencies(
             String,
             Option<String>,
             String,
+            Option<String>,
         )>(sql, &[owner])?;
         for row in rows {
             let (
@@ -2516,7 +2860,20 @@ fn read_dependencies(
                 referenced_type,
                 referenced_link,
                 dependency_type,
+                referenced_owner_oracle_maintained,
             ) = row?;
+            let referenced_owner_oracle_maintained = match referenced_owner_oracle_maintained
+                .as_deref()
+            {
+                Some("Y") => true,
+                Some("N") => false,
+                value => {
+                    return Err(CatalogError::Mapping(format!(
+                        "Oracle dependency target owner {referenced_owner} has unprovable ORACLE_MAINTAINED state '{}'",
+                        value.unwrap_or("missing")
+                    )));
+                }
+            };
             dependencies.push(RawDependency {
                 owner,
                 name,
@@ -2526,6 +2883,7 @@ fn read_dependencies(
                 referenced_type,
                 referenced_link,
                 dependency_type,
+                referenced_owner_oracle_maintained,
             });
         }
     }
@@ -2565,7 +2923,7 @@ fn validate_raw_catalog(
         .filter(|object| {
             !matches!(
                 object.object_type.as_str(),
-                "TABLE" | "INDEX" | "SEQUENCE" | "VIEW" | "MATERIALIZED VIEW"
+                "TABLE" | "INDEX" | "SEQUENCE" | "VIEW" | "MATERIALIZED VIEW" | "TRIGGER"
             )
         })
         .take(8)
@@ -2896,6 +3254,98 @@ fn validate_raw_catalog(
         )));
     }
 
+    let mut triggers = BTreeSet::new();
+    for trigger in &raw.triggers {
+        ensure_owner(scope, &trigger.owner, "trigger")?;
+        if !triggers.insert((trigger.owner.clone(), trigger.name.clone())) {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle trigger {}.{}",
+                trigger.owner, trigger.name
+            )));
+        }
+        if !inventory_keys.contains(&(
+            trigger.owner.clone(),
+            "TRIGGER".to_owned(),
+            trigger.name.clone(),
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle trigger {}.{} is missing from the independent object inventory",
+                trigger.owner, trigger.name
+            )));
+        }
+        if trigger.base_object_type != "TABLE" {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle trigger target kind '{}' is not yet covered for {}.{}",
+                trigger.base_object_type, trigger.owner, trigger.name
+            )));
+        }
+        let table_owner = trigger.table_owner.as_deref().ok_or_else(|| {
+            CatalogError::Mapping(format!(
+                "Oracle table trigger {}.{} has no target owner",
+                trigger.owner, trigger.name
+            ))
+        })?;
+        let table_name = trigger.table_name.as_deref().ok_or_else(|| {
+            CatalogError::Mapping(format!(
+                "Oracle table trigger {}.{} has no target table",
+                trigger.owner, trigger.name
+            ))
+        })?;
+        ensure_owner(scope, table_owner, "trigger target")?;
+        if trigger.owner != table_owner {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "cross-owner Oracle trigger {}.{} on {}.{table_name} is outside the certified contract",
+                trigger.owner, trigger.name, table_owner
+            )));
+        }
+        if !tables.contains(&(table_owner.to_owned(), table_name.to_owned())) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle trigger {}.{} targets missing table {}.{}",
+                trigger.owner, trigger.name, table_owner, table_name
+            )));
+        }
+        if materialized_views.contains(&(table_owner.to_owned(), table_name.to_owned())) {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle trigger {}.{} targets materialized view {}.{table_name}, which is not yet covered",
+                trigger.owner, trigger.name, table_owner
+            )));
+        }
+        if trigger.action_type != "PL/SQL" {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle trigger action type '{}' is not yet covered for {}.{}",
+                trigger.action_type, trigger.owner, trigger.name
+            )));
+        }
+        if !matches!(trigger.status.as_str(), "ENABLED" | "DISABLED") {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle trigger {}.{} has unrecognized status '{}'",
+                trigger.owner, trigger.name, trigger.status
+            )));
+        }
+        let body = trigger.body.as_deref().ok_or_else(|| {
+            CatalogError::Mapping(format!(
+                "Oracle trigger {}.{} has no complete body",
+                trigger.owner, trigger.name
+            ))
+        })?;
+        reject_dynamic_plsql(
+            "trigger",
+            &format!("{}.{}", trigger.owner, trigger.name),
+            body,
+        )?;
+        oracle_trigger_timing(&trigger.trigger_type)?;
+    }
+    let inventory_trigger_count = inventory
+        .iter()
+        .filter(|object| object.object_type == "TRIGGER")
+        .count();
+    if inventory_trigger_count != raw.triggers.len() {
+        return Err(CatalogError::Mapping(format!(
+            "Oracle trigger inventory mismatch: USER/DBA_OBJECTS reports {inventory_trigger_count}, USER/DBA_TRIGGERS reports {}",
+            raw.triggers.len()
+        )));
+    }
+
     let mut view_column_keys = BTreeSet::new();
     let mut view_column_ordinals = BTreeSet::new();
     for column in &raw.view_columns {
@@ -2943,13 +3393,15 @@ fn validate_raw_catalog(
             && views.contains(&(dependency.owner.clone(), dependency.name.clone()));
         let source_is_mview = dependency.object_type == "MATERIALIZED VIEW"
             && materialized_views.contains(&(dependency.owner.clone(), dependency.name.clone()));
-        if !source_is_view && !source_is_mview {
+        let source_is_trigger = dependency.object_type == "TRIGGER"
+            && triggers.contains(&(dependency.owner.clone(), dependency.name.clone()));
+        if !source_is_view && !source_is_mview && !source_is_trigger {
             return Err(CatalogError::UnsupportedMetadata(format!(
                 "Oracle dependency source is not yet covered: {}.{} ({})",
                 dependency.owner, dependency.name, dependency.object_type
             )));
         }
-        let expected_dependency_type = if source_is_view { "HARD" } else { "REF" };
+        let expected_dependency_type = if source_is_mview { "REF" } else { "HARD" };
         if dependency.dependency_type != expected_dependency_type {
             return Err(CatalogError::UnsupportedMetadata(format!(
                 "Oracle dependency type '{}' is not covered for {}.{}; expected '{}'",
@@ -2958,6 +3410,9 @@ fn validate_raw_catalog(
                 dependency.name,
                 expected_dependency_type
             )));
+        }
+        if dependency.referenced_owner_oracle_maintained {
+            continue;
         }
         ensure_owner(scope, &dependency.referenced_owner, "dependency target")?;
         let target_exists = match dependency.referenced_type.as_str() {
@@ -2970,6 +3425,10 @@ fn validate_raw_catalog(
                 dependency.referenced_name.clone(),
             )),
             "MATERIALIZED VIEW" => materialized_views.contains(&(
+                dependency.referenced_owner.clone(),
+                dependency.referenced_name.clone(),
+            )),
+            "SEQUENCE" => sequences.contains(&(
                 dependency.referenced_owner.clone(),
                 dependency.referenced_name.clone(),
             )),
@@ -2999,6 +3458,39 @@ fn validate_raw_catalog(
             return Err(CatalogError::Mapping(format!(
                 "Oracle materialized view {}.{} has {storage_dependency_count} storage-table dependency rows; expected exactly one",
                 view.owner, view.name
+            )));
+        }
+    }
+    for trigger in &raw.triggers {
+        let target_owner = trigger.table_owner.as_deref().ok_or_else(|| {
+            CatalogError::Mapping(format!(
+                "Oracle trigger {}.{} has no target owner",
+                trigger.owner, trigger.name
+            ))
+        })?;
+        let target_name = trigger.table_name.as_deref().ok_or_else(|| {
+            CatalogError::Mapping(format!(
+                "Oracle trigger {}.{} has no target table",
+                trigger.owner, trigger.name
+            ))
+        })?;
+        let target_dependency_count = raw
+            .dependencies
+            .iter()
+            .filter(|dependency| {
+                dependency.object_type == "TRIGGER"
+                    && dependency.owner == trigger.owner
+                    && dependency.name == trigger.name
+                    && !dependency.referenced_owner_oracle_maintained
+                    && dependency.referenced_type == "TABLE"
+                    && dependency.referenced_owner == target_owner
+                    && dependency.referenced_name == target_name
+            })
+            .count();
+        if target_dependency_count != 1 {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle trigger {}.{} has {target_dependency_count} target-table dependency rows; expected exactly one",
+                trigger.owner, trigger.name
             )));
         }
     }
@@ -3724,7 +4216,7 @@ impl<'a> OracleSnapshotMapper<'a> {
         }
 
         for dependency in &raw.dependencies {
-            if dependency.object_type != "VIEW" {
+            if dependency.object_type != "VIEW" || dependency.referenced_owner_oracle_maintained {
                 continue;
             }
             let source_position = required(
@@ -3784,6 +4276,7 @@ impl<'a> OracleSnapshotMapper<'a> {
             .dependencies
             .iter()
             .filter(|dependency| dependency.object_type == "MATERIALIZED VIEW")
+            .filter(|dependency| !dependency.referenced_owner_oracle_maintained)
         {
             if dependency.referenced_type == "TABLE"
                 && dependency.owner == dependency.referenced_owner
@@ -4243,6 +4736,159 @@ impl<'a> OracleSnapshotMapper<'a> {
             });
         }
 
+        let mut triggers = Vec::new();
+        let mut trigger_keys = BTreeMap::new();
+        let mut trigger_targets = BTreeMap::new();
+        for trigger in &raw.triggers {
+            let table_owner = trigger.table_owner.as_deref().ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle trigger {}.{} has no target owner",
+                    trigger.owner, trigger.name
+                ))
+            })?;
+            let table_name = trigger.table_name.as_deref().ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle trigger {}.{} has no target table",
+                    trigger.owner, trigger.name
+                ))
+            })?;
+            let table_key = required(
+                table_keys.get(&(table_owner.to_owned(), table_name.to_owned())),
+                format!(
+                    "target table key for Oracle trigger {}.{}",
+                    trigger.owner, trigger.name
+                ),
+            )?;
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                table_owner,
+                ObjectKind::Trigger,
+                table_name,
+                Some(trigger.name.clone()),
+            );
+            trigger_keys.insert((trigger.owner.clone(), trigger.name.clone()), key.clone());
+            trigger_targets.insert(
+                (trigger.owner.clone(), trigger.name.clone()),
+                (table_owner.to_owned(), table_name.to_owned()),
+            );
+            triggers.push(TriggerObject {
+                key: key.clone(),
+                table_key: table_key.clone(),
+                name: trigger.name.clone(),
+                timing: Some(oracle_trigger_timing(&trigger.trigger_type)?),
+                events: oracle_trigger_events(&trigger.triggering_event)?,
+                definition: Some(oracle_trigger_definition(trigger)?),
+                executes_routine_key: None,
+            });
+            let inventory_object = required(
+                inventory.get(&(
+                    trigger.owner.clone(),
+                    "TRIGGER".to_owned(),
+                    trigger.name.clone(),
+                )),
+                format!(
+                    "inventory row for Oracle trigger {}.{}",
+                    trigger.owner, trigger.name
+                ),
+            )?;
+            metadata.annotations.push(ObjectAnnotation {
+                object_key: key,
+                definition: None,
+                properties: oracle_trigger_properties(trigger, inventory_object),
+            });
+        }
+        for dependency in raw
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.object_type == "TRIGGER")
+            .filter(|dependency| !dependency.referenced_owner_oracle_maintained)
+        {
+            let target = required(
+                trigger_targets.get(&(dependency.owner.clone(), dependency.name.clone())),
+                format!(
+                    "target identity for Oracle trigger {}.{}",
+                    dependency.owner, dependency.name
+                ),
+            )?;
+            if dependency.referenced_type == "TABLE"
+                && dependency.referenced_owner == target.0
+                && dependency.referenced_name == target.1
+            {
+                continue;
+            }
+            let source_key = required(
+                trigger_keys.get(&(dependency.owner.clone(), dependency.name.clone())),
+                format!(
+                    "source key for Oracle trigger dependency {}.{}",
+                    dependency.owner, dependency.name
+                ),
+            )?;
+            let target_key = match dependency.referenced_type.as_str() {
+                "TABLE" => match materialized_view_keys.get(&(
+                    dependency.referenced_owner.clone(),
+                    dependency.referenced_name.clone(),
+                )) {
+                    Some(key) => key,
+                    None => required(
+                        table_keys.get(&(
+                            dependency.referenced_owner.clone(),
+                            dependency.referenced_name.clone(),
+                        )),
+                        format!(
+                            "table target for Oracle trigger dependency {}.{}",
+                            dependency.referenced_owner, dependency.referenced_name
+                        ),
+                    )?,
+                },
+                "VIEW" => required(
+                    view_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )),
+                    format!(
+                        "view target for Oracle trigger dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
+                "MATERIALIZED VIEW" => required(
+                    materialized_view_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )),
+                    format!(
+                        "materialized-view target for Oracle trigger dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
+                "SEQUENCE" => required(
+                    sequence_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )),
+                    format!(
+                        "sequence target for Oracle trigger dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
+                other => {
+                    return Err(CatalogError::Mapping(format!(
+                        "unmapped Oracle trigger dependency target type '{other}'"
+                    )));
+                }
+            };
+            metadata.relationships.push(MetadataRelationship {
+                kind: MetadataRelationshipKind::DependsOn,
+                from_key: source_key.clone(),
+                to_key: target_key.clone(),
+                ordinal: None,
+                properties: BTreeMap::from([(
+                    "oracle_dependency_type".to_owned(),
+                    MetadataValue::String(dependency.dependency_type.clone()),
+                )]),
+            });
+        }
+
         let snapshot = CanonicalSchemaSnapshot {
             schema: SchemaSnapshot {
                 source_kind: ORACLE_SOURCE.to_owned(),
@@ -4254,7 +4900,7 @@ impl<'a> OracleSnapshotMapper<'a> {
                 constraints,
                 indexes,
                 views,
-                triggers: Vec::new(),
+                triggers,
                 routines: Vec::new(),
                 capabilities: oracle_complete_capabilities(&self.scope),
             },
@@ -4310,7 +4956,7 @@ impl<'a> OracleSnapshotMapper<'a> {
                 CapabilityCheck {
                     name: "independent_inventory_reconciliation".to_owned(),
                     evidence: format!(
-                        "{} non-secondary USER/DBA_OBJECTS rows reconciled against table, index, sequence, view, and materialized-view detail catalogs",
+                        "{} non-secondary USER/DBA_OBJECTS rows reconciled against table, index, sequence, view, materialized-view, and trigger detail catalogs",
                         raw.inventory.iter().filter(|object| !object.secondary).count()
                     ),
                 },
@@ -4322,8 +4968,12 @@ impl<'a> OracleSnapshotMapper<'a> {
                 CapabilityCheck {
                     name: "dependency_coverage".to_owned(),
                     evidence: format!(
-                        "{} unique USER/DBA_DEPENDENCIES row(s) were resolved for the accepted object set",
-                        raw.dependencies.len()
+                        "{} unique USER/DBA_DEPENDENCIES row(s) were resolved; {} Oracle-maintained target row(s) were explicitly collapsed",
+                        raw.dependencies.len(),
+                        raw.dependencies
+                            .iter()
+                            .filter(|dependency| dependency.referenced_owner_oracle_maintained)
+                            .count()
                     ),
                 },
                 CapabilityCheck {
@@ -4465,6 +5115,82 @@ fn oracle_index_properties(
                 .map(|column| column.name.clone())
                 .collect(),
         ),
+    );
+    properties
+}
+
+fn oracle_trigger_definition(trigger: &RawTrigger) -> Result<String, CatalogError> {
+    let description = trigger.description.as_deref().ok_or_else(|| {
+        CatalogError::Mapping(format!(
+            "Oracle trigger {}.{} has no complete description",
+            trigger.owner, trigger.name
+        ))
+    })?;
+    let body = trigger.body.as_deref().ok_or_else(|| {
+        CatalogError::Mapping(format!(
+            "Oracle trigger {}.{} has no complete body",
+            trigger.owner, trigger.name
+        ))
+    })?;
+    let definition = format!("CREATE OR REPLACE TRIGGER {description}\n{body}");
+    if definition.len() > MAX_DEFINITION_BYTES {
+        return Err(CatalogError::UnsupportedMetadata(format!(
+            "Oracle trigger definition exceeds the {MAX_DEFINITION_BYTES}-byte safety limit for {}.{}",
+            trigger.owner, trigger.name
+        )));
+    }
+    Ok(definition)
+}
+
+fn oracle_trigger_properties(
+    trigger: &RawTrigger,
+    inventory_object: &RawInventoryObject,
+) -> BTreeMap<String, MetadataValue> {
+    let mut properties = inventory_properties(inventory_object);
+    insert_string(&mut properties, "trigger_type", &trigger.trigger_type);
+    insert_string(
+        &mut properties,
+        "triggering_event",
+        &trigger.triggering_event,
+    );
+    insert_optional_string(
+        &mut properties,
+        "table_owner",
+        trigger.table_owner.as_deref(),
+    );
+    insert_string(
+        &mut properties,
+        "base_object_type",
+        &trigger.base_object_type,
+    );
+    insert_optional_string(&mut properties, "table_name", trigger.table_name.as_deref());
+    insert_optional_string(
+        &mut properties,
+        "column_name",
+        trigger.column_name.as_deref(),
+    );
+    insert_optional_string(
+        &mut properties,
+        "referencing_names",
+        trigger.referencing_names.as_deref(),
+    );
+    insert_optional_string(
+        &mut properties,
+        "when_clause",
+        trigger.when_clause.as_deref(),
+    );
+    insert_string(&mut properties, "status", &trigger.status);
+    insert_string(&mut properties, "action_type", &trigger.action_type);
+    insert_optional_string(
+        &mut properties,
+        "crossedition",
+        trigger.crossedition.as_deref(),
+    );
+    insert_optional_string(&mut properties, "fire_once", trigger.fire_once.as_deref());
+    insert_optional_string(
+        &mut properties,
+        "apply_server_only",
+        trigger.apply_server_only.as_deref(),
     );
     properties
 }
@@ -4626,10 +5352,39 @@ fn discovery_counts_from_catalog(
         .dependencies
         .iter()
         .filter(|dependency| dependency.object_type == "MATERIALIZED VIEW")
+        .filter(|dependency| !dependency.referenced_owner_oracle_maintained)
         .filter(|dependency| {
             !(dependency.referenced_type == "TABLE"
                 && dependency.owner == dependency.referenced_owner
                 && dependency.name == dependency.referenced_name)
+        })
+        .count();
+    let trigger_targets = raw
+        .triggers
+        .iter()
+        .filter_map(|trigger| {
+            Some((
+                (trigger.owner.as_str(), trigger.name.as_str()),
+                (
+                    trigger.table_owner.as_deref()?,
+                    trigger.table_name.as_deref()?,
+                ),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let trigger_dependency_count = raw
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.object_type == "TRIGGER")
+        .filter(|dependency| !dependency.referenced_owner_oracle_maintained)
+        .filter(|dependency| {
+            trigger_targets
+                .get(&(dependency.owner.as_str(), dependency.name.as_str()))
+                .is_none_or(|target| {
+                    !(dependency.referenced_type == "TABLE"
+                        && dependency.referenced_owner == target.0
+                        && dependency.referenced_name == target.1)
+                })
         })
         .count();
 
@@ -4640,6 +5395,7 @@ fn discovery_counts_from_catalog(
     set_object_count(&mut objects, ObjectCategory::Index, raw.indexes.len());
     set_object_count(&mut objects, ObjectCategory::Sequence, raw.sequences.len());
     set_object_count(&mut objects, ObjectCategory::View, raw.views.len());
+    set_object_count(&mut objects, ObjectCategory::Trigger, raw.triggers.len());
     set_object_count(
         &mut objects,
         ObjectCategory::ViewColumn,
@@ -4740,7 +5496,13 @@ fn discovery_counts_from_catalog(
         raw.dependencies
             .iter()
             .filter(|dependency| dependency.object_type == "VIEW")
+            .filter(|dependency| !dependency.referenced_owner_oracle_maintained)
             .count(),
+    );
+    set_relationship_count(
+        &mut relationships,
+        RelationshipCategory::TriggerTarget,
+        raw.triggers.len(),
     );
     set_relationship_count(
         &mut relationships,
@@ -4758,6 +5520,7 @@ fn discovery_counts_from_catalog(
         RelationshipCategory::MetadataRelationship,
         raw.identity_columns.len()
             + materialized_view_dependency_count
+            + trigger_dependency_count
             + raw
                 .constraints
                 .iter()
@@ -4946,6 +5709,27 @@ mod tests {
             require_stable_catalog(vec![1, 2], &vec![1, 3]),
             Err(CatalogError::CatalogChanged(_))
         ));
+    }
+
+    #[test]
+    fn dynamic_plsql_detection_ignores_literals_and_comments() {
+        reject_dynamic_plsql(
+            "trigger",
+            "STATIC_TRIGGER",
+            "BEGIN -- EXECUTE IMMEDIATE ignored\n :NEW.note := q'[DBMS_SQL.PARSE]'; END;",
+        )
+        .unwrap();
+        for body in [
+            "BEGIN EXECUTE IMMEDIATE statement_text; END;",
+            "BEGIN DBMS_SQL.PARSE(cursor_id, statement_text, DBMS_SQL.NATIVE); END;",
+            "BEGIN OPEN result_set FOR statement_text; END;",
+            "BEGIN DBMS_UTILITY.EXEC_DDL_STATEMENT(statement_text); END;",
+        ] {
+            assert!(matches!(
+                reject_dynamic_plsql("trigger", "DYNAMIC_TRIGGER", body),
+                Err(CatalogError::UnsupportedMetadata(_))
+            ));
+        }
     }
 
     #[test]
@@ -5146,10 +5930,41 @@ mod tests {
             .expect("reconnect as isolated Oracle test user");
         setup
             .execute(
-                "CREATE OR REPLACE TRIGGER UNSUPPORTED_TRIGGER BEFORE INSERT ON CHILD_ENTITY FOR EACH ROW BEGIN NULL; END;",
+                "CREATE OR REPLACE TRIGGER CHILD_LABEL_BIU BEFORE INSERT OR UPDATE ON CHILD_ENTITY FOR EACH ROW BEGIN :NEW.LABEL := UPPER(:NEW.LABEL); END;",
                 &[],
             )
-            .expect("create fail-closed fixture");
+            .expect("create static trigger");
+        drop(setup);
+
+        let complete = analyze_oracle(&user_url, "oracle-live", Vec::new(), Vec::new(), 30_000);
+        assert_eq!(
+            complete.status(),
+            AnalysisStatus::Complete,
+            "Oracle trigger analysis failed: {:?}",
+            complete.failure()
+        );
+        let certified = complete
+            .certified_snapshot()
+            .expect("Oracle trigger schema must be certified");
+        let trigger = certified
+            .snapshot
+            .schema
+            .triggers
+            .iter()
+            .find(|trigger| trigger.name == "CHILD_LABEL_BIU")
+            .expect("static trigger is mapped");
+        assert_eq!(trigger.timing.as_deref(), Some("BEFORE"));
+        assert_eq!(trigger.events, ["INSERT", "UPDATE"]);
+        assert_eq!(trigger.table_key.object_name, "CHILD_ENTITY");
+
+        let setup = Connection::connect(&cleanup.username, password, &connect_string)
+            .expect("reconnect as isolated Oracle test user");
+        setup
+            .execute(
+                "CREATE OR REPLACE TRIGGER DYNAMIC_TRIGGER BEFORE UPDATE ON CHILD_ENTITY FOR EACH ROW BEGIN EXECUTE IMMEDIATE 'BEGIN NULL; END;'; END;",
+                &[],
+            )
+            .expect("create fail-closed dynamic trigger fixture");
         drop(setup);
 
         let failed = analyze_oracle(&user_url, "oracle-live", Vec::new(), Vec::new(), 30_000);
