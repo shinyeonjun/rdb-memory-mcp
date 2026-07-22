@@ -1,11 +1,15 @@
+mod path_policy;
 mod tools;
 mod types;
 
 #[cfg(test)]
 mod tools_tests;
 
+pub use path_policy::{McpPathError, ALLOWED_ROOTS_ENV};
 pub use tools::graph_stats_for_cache_path;
 pub use types::*;
+
+use std::path::PathBuf;
 
 use rmcp::{handler::server::wrapper::Parameters, tool, tool_router};
 use tools::{
@@ -17,13 +21,64 @@ use tools::{
     query_graph_for_request, schema_diff_for_request, tool_json, trace_relationships_for_request,
 };
 
-#[derive(Debug, Clone, Default)]
-pub struct DatabaseMemoryMcp;
+use path_policy::{McpPathPolicy, DEFAULT_CACHE_PATH};
+
+#[derive(Debug, Clone)]
+pub struct DatabaseMemoryMcp {
+    path_policy: McpPathPolicy,
+}
+
+impl Default for DatabaseMemoryMcp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+macro_rules! guard_mcp_paths {
+    ($server:expr, $cache:expr) => {
+        guard_mcp_paths!($server, $cache, None)
+    };
+    ($server:expr, $cache:expr, $source:expr) => {
+        if let Err(error) = $server.validate_local_paths($cache, $source) {
+            return tool_json::<(), _>(Err(error));
+        }
+    };
+}
 
 #[tool_router(server_handler)]
 impl DatabaseMemoryMcp {
     pub fn new() -> Self {
-        Self
+        Self::try_new().expect("default MCP path policy must be valid")
+    }
+
+    pub fn try_new() -> Result<Self, McpPathError> {
+        Ok(Self {
+            path_policy: McpPathPolicy::from_environment()?,
+        })
+    }
+
+    pub fn with_allowed_roots<I, P>(roots: I) -> Result<Self, McpPathError>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        Ok(Self {
+            path_policy: McpPathPolicy::new(roots.into_iter().map(Into::into))?,
+        })
+    }
+
+    fn validate_local_paths(
+        &self,
+        cache_path: Option<&str>,
+        source_path: Option<&str>,
+    ) -> Result<(), McpPathError> {
+        self.path_policy
+            .validate(PathBuf::from(cache_path.unwrap_or(DEFAULT_CACHE_PATH)).as_path())?;
+        if let Some(source_path) = source_path {
+            self.path_policy
+                .validate(PathBuf::from(source_path).as_path())?;
+        }
+        Ok(())
     }
 
     #[tool(description = "Return the exact metadata-only product contract and support ledger")]
@@ -39,6 +94,7 @@ impl DatabaseMemoryMcp {
         &self,
         Parameters(request): Parameters<IndexDatabaseRequest>,
     ) -> Result<String, String> {
+        guard_mcp_paths!(self, request.cache_path.as_deref(), request.path.as_deref());
         tool_json(index_database_for_request(request))
     }
 
@@ -47,6 +103,7 @@ impl DatabaseMemoryMcp {
         &self,
         Parameters(request): Parameters<ListDatabasesRequest>,
     ) -> Result<String, String> {
+        guard_mcp_paths!(self, request.cache_path.as_deref());
         tool_json(list_databases_for_request(request))
     }
 
@@ -55,6 +112,7 @@ impl DatabaseMemoryMcp {
         &self,
         Parameters(request): Parameters<ListSnapshotsRequest>,
     ) -> Result<String, String> {
+        guard_mcp_paths!(self, request.cache_path.as_deref());
         tool_json(list_snapshots_for_request(request))
     }
 
@@ -65,6 +123,7 @@ impl DatabaseMemoryMcp {
         &self,
         Parameters(request): Parameters<DescribeSnapshotRequest>,
     ) -> Result<String, String> {
+        guard_mcp_paths!(self, request.cache_path.as_deref());
         tool_json(describe_snapshot_for_request(request))
     }
 
@@ -73,6 +132,7 @@ impl DatabaseMemoryMcp {
         &self,
         Parameters(request): Parameters<ListObjectsRequest>,
     ) -> Result<String, String> {
+        guard_mcp_paths!(self, request.cache_path.as_deref());
         tool_json(list_objects_for_request(request))
     }
 
@@ -81,6 +141,7 @@ impl DatabaseMemoryMcp {
         &self,
         Parameters(request): Parameters<FindObjectsRequest>,
     ) -> Result<String, String> {
+        guard_mcp_paths!(self, request.cache_path.as_deref());
         tool_json(find_objects_for_request(request))
     }
 
@@ -91,6 +152,7 @@ impl DatabaseMemoryMcp {
         &self,
         Parameters(request): Parameters<DescribeObjectRequest>,
     ) -> Result<String, String> {
+        guard_mcp_paths!(self, request.cache_path.as_deref());
         tool_json(describe_object_for_request(request))
     }
 
@@ -99,6 +161,7 @@ impl DatabaseMemoryMcp {
         &self,
         Parameters(request): Parameters<ListTablesRequest>,
     ) -> Result<String, String> {
+        guard_mcp_paths!(self, request.cache_path.as_deref());
         tool_json(list_tables_for_request(request))
     }
 
@@ -107,6 +170,7 @@ impl DatabaseMemoryMcp {
         &self,
         Parameters(request): Parameters<DescribeTableRequest>,
     ) -> Result<String, String> {
+        guard_mcp_paths!(self, request.cache_path.as_deref());
         tool_json(describe_table_for_request(request))
     }
 
@@ -115,6 +179,7 @@ impl DatabaseMemoryMcp {
         &self,
         Parameters(request): Parameters<FindTableRequest>,
     ) -> Result<String, String> {
+        guard_mcp_paths!(self, request.cache_path.as_deref());
         tool_json(find_table_for_request(request))
     }
 
@@ -123,6 +188,7 @@ impl DatabaseMemoryMcp {
         &self,
         Parameters(request): Parameters<FindColumnRequest>,
     ) -> Result<String, String> {
+        guard_mcp_paths!(self, request.cache_path.as_deref());
         tool_json(find_column_for_request(request))
     }
 
@@ -131,6 +197,7 @@ impl DatabaseMemoryMcp {
         &self,
         Parameters(request): Parameters<ImpactAnalysisRequest>,
     ) -> Result<String, String> {
+        guard_mcp_paths!(self, request.cache_path.as_deref());
         tool_json(impact_analysis_for_request(request))
     }
 
@@ -139,6 +206,7 @@ impl DatabaseMemoryMcp {
         &self,
         Parameters(request): Parameters<TraceRelationshipsRequest>,
     ) -> Result<String, String> {
+        guard_mcp_paths!(self, request.cache_path.as_deref());
         tool_json(trace_relationships_for_request(request))
     }
 
@@ -147,6 +215,7 @@ impl DatabaseMemoryMcp {
         &self,
         Parameters(request): Parameters<SchemaDiffRequest>,
     ) -> Result<String, String> {
+        guard_mcp_paths!(self, request.cache_path.as_deref());
         tool_json(schema_diff_for_request(request))
     }
 
@@ -155,6 +224,7 @@ impl DatabaseMemoryMcp {
         &self,
         Parameters(request): Parameters<QueryGraphRequest>,
     ) -> Result<String, String> {
+        guard_mcp_paths!(self, request.cache_path.as_deref());
         tool_json(query_graph_for_request(request))
     }
 
@@ -163,10 +233,8 @@ impl DatabaseMemoryMcp {
         &self,
         Parameters(request): Parameters<GraphStatsRequest>,
     ) -> Result<String, String> {
-        let cache_path = request
-            .cache_path
-            .as_deref()
-            .unwrap_or(".database-memory/graph.sqlite");
+        guard_mcp_paths!(self, request.cache_path.as_deref());
+        let cache_path = request.cache_path.as_deref().unwrap_or(DEFAULT_CACHE_PATH);
         tool_json::<_, String>(Ok(graph_stats(cache_path)))
     }
 }

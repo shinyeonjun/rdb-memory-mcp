@@ -48,7 +48,7 @@ fn cli_and_mcp_share_the_complete_object_contract() {
         display(&cache_path).as_str(),
         "--json",
     ]);
-    let server = DatabaseMemoryMcp::new();
+    let server = DatabaseMemoryMcp::with_allowed_roots([&root]).unwrap();
     let mcp_snapshot: SnapshotDetail = parse_tool(server.describe_snapshot(Parameters(
         DescribeSnapshotRequest {
             snapshot: "parity".to_owned(),

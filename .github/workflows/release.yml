@@ -41,6 +41,10 @@ jobs:
             throw "Release tag '$env:GITHUB_REF_NAME' does not match one shared crate version: $($versions -join ', ')"
           }
 
+      - name: Install Linux native build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libssl-dev pkg-config
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

@@ -622,6 +622,92 @@ mod tests {
     }
 
     #[test]
+    fn server_adapters_keep_their_read_only_session_guards() {
+        let guarded_sources = [
+            (
+                "postgres",
+                include_str!("adapters/postgres_catalog.rs"),
+                [".read_only(true)", "IsolationLevel::RepeatableRead"].as_slice(),
+            ),
+            (
+                "mysql",
+                include_str!("adapters/mysql_catalog.rs"),
+                [
+                    ".set_access_mode(Some(AccessMode::ReadOnly))",
+                    ".set_with_consistent_snapshot(true)",
+                ]
+                .as_slice(),
+            ),
+            (
+                "sqlserver",
+                include_str!("adapters/sqlserver_catalog.rs"),
+                ["config.readonly(true)"].as_slice(),
+            ),
+            (
+                "oracle",
+                include_str!("adapters/oracle_catalog.rs"),
+                ["SET TRANSACTION READ ONLY"].as_slice(),
+            ),
+            (
+                "odbc",
+                include_str!("adapters/odbc.rs"),
+                ["set_read_only_access", "verify_read_only_access"].as_slice(),
+            ),
+            (
+                "sqlite",
+                include_str!("adapters/sqlite_catalog.rs"),
+                ["SQLITE_OPEN_READ_ONLY"].as_slice(),
+            ),
+        ];
+
+        for (adapter, source, required_guards) in guarded_sources {
+            let production_source = source.split("#[cfg(test)]").next().unwrap_or(source);
+            for guard in required_guards {
+                assert!(
+                    production_source.contains(guard),
+                    "{adapter} adapter lost required read-only guard '{guard}'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn server_adapter_production_queries_contain_no_write_statements() {
+        let sources = [
+            ("postgres", include_str!("adapters/postgres_catalog.rs")),
+            ("mysql", include_str!("adapters/mysql_catalog.rs")),
+            ("sqlserver", include_str!("adapters/sqlserver_catalog.rs")),
+            ("oracle", include_str!("adapters/oracle_catalog.rs")),
+            ("odbc", include_str!("adapters/odbc.rs")),
+        ];
+        let forbidden = [
+            "insert into ",
+            "delete from ",
+            "merge into ",
+            "truncate table ",
+            "load data ",
+            " into outfile",
+            "drop table ",
+            "alter table ",
+            "create table ",
+        ];
+
+        for (adapter, source) in sources {
+            let production_source = source
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap_or(source)
+                .to_ascii_lowercase();
+            for statement in forbidden {
+                assert!(
+                    !production_source.contains(statement),
+                    "{adapter} production adapter contains forbidden write statement '{statement}'"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn every_native_adapter_honors_a_pre_cancelled_analysis() {
         let cancellation = introspection::CancellationToken::new();
         cancellation.cancel();

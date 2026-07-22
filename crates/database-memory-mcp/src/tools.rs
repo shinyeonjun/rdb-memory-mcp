@@ -30,9 +30,9 @@ use database_memory_core::{
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::path_policy::DEFAULT_CACHE_PATH;
 use crate::types::*;
 
-const DEFAULT_CACHE_PATH: &str = ".database-memory/graph.sqlite";
 const DEFAULT_PAGE_LIMIT: usize = 100;
 const MAX_PAGE_LIMIT: usize = 500;
 const DEFAULT_TRAVERSAL_DEPTH: u32 = 3;

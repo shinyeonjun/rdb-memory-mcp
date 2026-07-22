@@ -58,6 +58,43 @@ fn graph_stats_missing_cache_returns_zero() {
 }
 
 #[test]
+fn mcp_rejects_cache_and_source_paths_outside_its_allowed_roots() {
+    let base = temp_cache_path().with_extension("paths");
+    let allowed = base.join("allowed");
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&allowed).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let server = DatabaseMemoryMcp::with_allowed_roots([&allowed]).unwrap();
+
+    let cache_error = server
+        .graph_stats(Parameters(GraphStatsRequest {
+            cache_path: Some(outside.join("graph.sqlite").display().to_string()),
+        }))
+        .unwrap_err();
+    let cache_error: Value = serde_json::from_str(&cache_error).unwrap();
+    assert_eq!(cache_error["error"]["code"], "path_outside_allowed_roots");
+
+    let source_error = server
+        .index_database(Parameters(IndexDatabaseRequest {
+            source: "ddl-sqlite".to_owned(),
+            path: Some(outside.join("schema.sql").display().to_string()),
+            connection_string: None,
+            alias: "denied".to_owned(),
+            requested_catalogs: vec![],
+            requested_schemas: vec![],
+            timeout_ms: None,
+            cache_path: Some(allowed.join("graph.sqlite").display().to_string()),
+        }))
+        .unwrap_err();
+    let source_error: Value = serde_json::from_str(&source_error).unwrap();
+    assert_eq!(source_error["error"]["code"], "path_outside_allowed_roots");
+
+    std::fs::remove_dir(outside).unwrap();
+    std::fs::remove_dir(allowed).unwrap();
+    std::fs::remove_dir(base).unwrap();
+}
+
+#[test]
 fn mcp_lists_finds_and_describes_graph_metadata() {
     let path = temp_cache_path();
     write_snapshot(&path, SNAPSHOT, &snapshot("sample", true, true));

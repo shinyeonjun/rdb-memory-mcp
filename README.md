@@ -48,10 +48,12 @@ For installation and MCP client configuration, see [docs/install.md](docs/instal
 - SQLite DDL is evaluated in an isolated in-memory database. Row statements, external attachment, virtual tables, and extension loading are denied. Input is deadline-bound and capped at 64 MiB total.
 
 For the full product boundary and design history, see [docs/plans/database-memory-mcp.md](docs/plans/database-memory-mcp.md).
+The repository-wide security assumptions and residual risks are documented in
+[docs/security/threat-model.md](docs/security/threat-model.md); tracked upstream
+maintenance exceptions are in
+[docs/security/dependency-exceptions.md](docs/security/dependency-exceptions.md).
 
 ## Release Binaries
-
-Tagged releases build a Windows zip:
 
 Release tags publish both `rdb-memory-mcp-windows-amd64.zip` and
 `rdb-memory-mcp-linux-amd64.tar.gz`, each with a platform-specific SHA-256 file.
@@ -77,6 +79,24 @@ database-memory trace-relationships ddl-sqlite:shop sqlite:shop:main:main:table:
 The contract reports `metadata_only: true`, `row_data_access: false`, exact certified versions/scopes, ODBC build availability, bounded limits, and the intentionally deferred DB2 boundary.
 Inventory responses use stable table-key ordering and report `offset`, `has_more`, and `next_offset`, so callers can continue without treating the first page as the complete schema.
 
+For live databases, keep credentials out of shell history and process arguments.
+Define a profile with only its source in `.database-memory/config.toml`, then
+provide `DATABASE_MEMORY_<ALIAS>_CONNECTION_STRING` at runtime. Non-alphanumeric
+alias characters become `_` and the environment variable name is uppercase.
+
+~~~toml
+[warehouse]
+source = "postgres"
+~~~
+
+~~~powershell
+$env:DATABASE_MEMORY_WAREHOUSE_CONNECTION_STRING = "postgresql://user:password@host/database"
+database-memory index --alias warehouse --cache-path .database-memory/warehouse.sqlite
+~~~
+
+The explicit `--connection-string` flag remains available for disposable local
+development, but it can be exposed by shell history or process inspection.
+
 ## MCP Client Config
 
 Use the built MCP stdio server binary. Full platform notes and alternate client shapes are in [docs/install.md](docs/install.md).
@@ -86,13 +106,18 @@ Use the built MCP stdio server binary. Full platform notes and alternate client 
   "mcpServers": {
     "database-memory": {
       "command": "/absolute/path/to/target/release/database-memory-mcp",
-      "args": []
+      "args": [],
+      "env": {
+        "DATABASE_MEMORY_MCP_ALLOWED_ROOTS": "/absolute/project:/absolute/cache"
+      }
     }
   }
 }
 ~~~
 
-On Windows, point command at database-memory-mcp.exe.
+On Windows, point command at `database-memory-mcp.exe` and separate multiple
+allowed roots with `;`. Without this environment variable, the MCP server
+allows local schema and cache paths only beneath its working directory.
 
 ## Try The Example Schema
 
@@ -110,7 +135,8 @@ The complete index output includes the stable snapshot key, total object and rel
 snapshot indexed: ddl-sqlite:shop
 status: complete
 objects indexed: <verified total>
-relationships indexed: <verified total>
+graph edges indexed: <verified projection total>
+semantic relationships verified: <certified relationship total>
 cache path: examples/shop-cache.sqlite
 ~~~
 

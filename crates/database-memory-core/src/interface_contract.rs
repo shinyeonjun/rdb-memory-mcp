@@ -9,7 +9,9 @@ use crate::analysis_outcome::{
     AnalysisFailure, AnalysisFailureCode, AnalysisOutcome, AnalysisStage,
 };
 use crate::certification::{CompletenessProof, CompletionStatus, COMPLETE_CONTRACT_VERSION};
-use crate::graph_builder::insert_certified_schema_snapshot_graph;
+use crate::graph_builder::{
+    certified_graph_projection_counts, insert_certified_schema_snapshot_graph,
+};
 use crate::graph_store::{GraphEdgeRecord, GraphNodeRecord, GraphStore, SnapshotAuthority};
 use crate::introspection::CancellationToken;
 use crate::redact::redact_connection_string;
@@ -93,6 +95,7 @@ pub struct IndexResult {
     pub cache_path: String,
     pub objects_indexed: u64,
     pub relationships_indexed: u64,
+    pub semantic_relationships_verified: u64,
     pub tables_indexed: usize,
     pub columns_indexed: usize,
     pub constraints_indexed: usize,
@@ -369,18 +372,7 @@ pub fn index_complete_source(
         .map_err(|error| InterfaceError::storage("could not persist certified snapshot", error))?;
 
     let schema = &certified.snapshot.schema;
-    let objects_indexed = certified
-        .completeness
-        .object_counts
-        .iter()
-        .map(|count| count.emitted)
-        .sum();
-    let relationships_indexed = certified
-        .completeness
-        .relationship_counts
-        .iter()
-        .map(|count| count.emitted)
-        .sum();
+    let projection = certified_graph_projection_counts(&certified);
     Ok(IndexResult {
         contract_version: INTERFACE_CONTRACT_VERSION,
         status: CompletionStatus::Complete,
@@ -390,8 +382,9 @@ pub fn index_complete_source(
         connection_alias: schema.connection_alias.clone(),
         captured_at_unix_ms,
         cache_path: cache_path.into(),
-        objects_indexed,
-        relationships_indexed,
+        objects_indexed: projection.objects,
+        relationships_indexed: projection.graph_edges,
+        semantic_relationships_verified: projection.semantic_relationships,
         tables_indexed: schema.tables.len(),
         columns_indexed: schema.columns.len(),
         constraints_indexed: schema.constraints.len(),

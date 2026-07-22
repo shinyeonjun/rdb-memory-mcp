@@ -19,6 +19,12 @@ pub enum GraphStoreError {
     Payload(serde_json::Error),
     InvalidSnapshot(SnapshotValidationError),
     InvalidCertification(CertificationError),
+    ProjectionMismatch {
+        expected_nodes: u64,
+        actual_nodes: u64,
+        expected_edges: u64,
+        actual_edges: u64,
+    },
     UnsupportedSchemaVersion(i64),
 }
 
@@ -31,6 +37,15 @@ impl fmt::Display for GraphStoreError {
             Self::InvalidCertification(err) => {
                 write!(f, "graph store rejected uncertified snapshot: {err}")
             }
+            Self::ProjectionMismatch {
+                expected_nodes,
+                actual_nodes,
+                expected_edges,
+                actual_edges,
+            } => write!(
+                f,
+                "certified graph projection count mismatch: nodes expected {expected_nodes}, actual {actual_nodes}; edges expected {expected_edges}, actual {actual_edges}"
+            ),
             Self::UnsupportedSchemaVersion(version) => write!(
                 f,
                 "graph store schema version {version} is newer than supported version {GRAPH_STORE_SCHEMA_VERSION}"

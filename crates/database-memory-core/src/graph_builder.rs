@@ -3,12 +3,53 @@ use std::collections::BTreeMap;
 use crate::canonical::{CanonicalMetadata, MetadataObject, ObjectAnnotation};
 use crate::certification::{verify_certified_schema_snapshot, CertifiedSchemaSnapshot};
 use crate::graph_store::{
-    GraphEdgeRecord, GraphNodeRecord, GraphSnapshotRecord, GraphStore, GraphStoreResult,
+    GraphEdgeRecord, GraphNodeRecord, GraphSnapshotRecord, GraphStore, GraphStoreError,
+    GraphStoreResult,
 };
 use crate::snapshot_validation::validate_schema_snapshot;
 #[cfg(test)]
 use crate::ObjectKind;
 use crate::{ConstraintKind, ConstraintObject, ObjectKey, SchemaSnapshot};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CertifiedGraphProjectionCounts {
+    pub objects: u64,
+    pub semantic_relationships: u64,
+    pub graph_edges: u64,
+}
+
+pub fn certified_graph_projection_counts(
+    certified: &CertifiedSchemaSnapshot,
+) -> CertifiedGraphProjectionCounts {
+    let objects = certified
+        .completeness
+        .object_counts
+        .iter()
+        .map(|count| count.emitted)
+        .sum();
+    let semantic_relationships = certified
+        .completeness
+        .relationship_counts
+        .iter()
+        .map(|count| count.emitted)
+        .sum::<u64>();
+    let foreign_key_pairs = certified
+        .snapshot
+        .schema
+        .constraints
+        .iter()
+        .filter(|constraint| constraint.kind == ConstraintKind::ForeignKey)
+        .map(|constraint| constraint.columns.len() as u64)
+        .sum::<u64>();
+    let trigger_targets = certified.snapshot.schema.triggers.len() as u64;
+    CertifiedGraphProjectionCounts {
+        objects,
+        semantic_relationships,
+        // FK pairs and trigger targets each become two directed traversal
+        // edges around their relationship object instead of one semantic link.
+        graph_edges: semantic_relationships + foreign_key_pairs + trigger_targets,
+    }
+}
 
 pub fn insert_schema_snapshot_graph(
     store: &GraphStore,
@@ -36,6 +77,7 @@ pub fn insert_certified_schema_snapshot_graph(
     certified: &CertifiedSchemaSnapshot,
 ) -> GraphStoreResult<()> {
     verify_certified_schema_snapshot(certified)?;
+    let counts = certified_graph_projection_counts(certified);
     store.with_transaction(|store| {
         insert_schema_snapshot_graph_inner(
             store,
@@ -44,8 +86,28 @@ pub fn insert_certified_schema_snapshot_graph(
             &certified.snapshot.schema,
             certified,
             Some(&certified.snapshot.metadata),
-        )
+        )?;
+        verify_projection_counts(store, snapshot_key, counts.objects, counts.graph_edges)
     })
+}
+
+fn verify_projection_counts(
+    store: &GraphStore,
+    snapshot_key: &str,
+    expected_nodes: u64,
+    expected_edges: u64,
+) -> GraphStoreResult<()> {
+    let actual_nodes = store.node_count_for_snapshot(snapshot_key)?;
+    let actual_edges = store.edge_count_for_snapshot(snapshot_key)?;
+    if actual_nodes != expected_nodes || actual_edges != expected_edges {
+        return Err(GraphStoreError::ProjectionMismatch {
+            expected_nodes,
+            actual_nodes,
+            expected_edges,
+            actual_edges,
+        });
+    }
+    Ok(())
 }
 
 fn insert_schema_snapshot_graph_inner<T: serde::Serialize>(
@@ -417,7 +479,17 @@ fn insert_constraint_edges(
                 )?;
             }
         }
-        ConstraintKind::Check => {}
+        ConstraintKind::Check => {
+            for column_key in sorted_keys(&constraint.columns) {
+                insert_edge(
+                    store,
+                    snapshot_key,
+                    "COLUMN_IN_CHECK",
+                    column_key,
+                    &constraint.key,
+                )?;
+            }
+        }
     }
 
     Ok(())
@@ -634,6 +706,32 @@ mod graph_builder_tests {
     }
 
     #[test]
+    fn graph_builder_writes_check_constraint_edges() {
+        let store = GraphStore::in_memory().unwrap();
+        let mut snapshot = snapshot();
+        let total = key(ObjectKind::Column, "orders", Some("user_id"));
+        let check = key(
+            ObjectKind::CheckConstraint,
+            "orders",
+            Some("ck_orders_user_id"),
+        );
+        snapshot.constraints.push(ConstraintObject {
+            key: check.clone(),
+            table_key: key(ObjectKind::Table, "orders", None),
+            name: "ck_orders_user_id".to_owned(),
+            kind: ConstraintKind::Check,
+            columns: vec![total.clone()],
+            referenced_table_key: None,
+            referenced_columns: vec![],
+            expression: Some("user_id > 0".to_owned()),
+        });
+
+        insert_schema_snapshot_graph(&store, SNAPSHOT, 7, &snapshot).unwrap();
+
+        assert_edge(&store, "COLUMN_IN_CHECK", &total, &check);
+    }
+
+    #[test]
     fn graph_builder_writes_foreign_key_edges() {
         let store = built_store();
         let orders_user_id = key(ObjectKind::Column, "orders", Some("user_id"));
@@ -761,6 +859,19 @@ mod graph_builder_tests {
             }
         );
         assert!(store.get_certified_snapshot(SNAPSHOT).unwrap().is_some());
+        let counts = certified_graph_projection_counts(&certified);
+        assert_eq!(
+            store.node_count_for_snapshot(SNAPSHOT).unwrap(),
+            counts.objects
+        );
+        assert_eq!(
+            store.edge_count_for_snapshot(SNAPSHOT).unwrap(),
+            counts.graph_edges
+        );
+        assert!(matches!(
+            verify_projection_counts(&store, SNAPSHOT, counts.objects + 1, counts.graph_edges),
+            Err(GraphStoreError::ProjectionMismatch { .. })
+        ));
     }
 
     #[test]

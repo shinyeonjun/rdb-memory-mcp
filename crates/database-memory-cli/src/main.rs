@@ -82,7 +82,8 @@ fn execute(command: Command) -> Result<String, String> {
                     "snapshot indexed: {}
 status: complete
 objects indexed: {}
-relationships indexed: {}
+graph edges indexed: {}
+semantic relationships verified: {}
 adapter: {} {}
 server: {} {}
 cache path: {}
@@ -90,6 +91,7 @@ cache path: {}
                     indexed.snapshot_key,
                     indexed.objects_indexed,
                     indexed.relationships_indexed,
+                    indexed.semantic_relationships_verified,
                     indexed.completeness.adapter.name,
                     indexed.completeness.adapter.version,
                     indexed.completeness.server.product,

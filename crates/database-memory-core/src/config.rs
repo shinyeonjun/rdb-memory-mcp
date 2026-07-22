@@ -210,4 +210,28 @@ path = "db/app.sqlite"
 
         assert_eq!(profile.path, Some(PathBuf::from("override.sqlite")));
     }
+
+    #[test]
+    fn config_connection_string_env_var_supplies_secret_without_persisting_it() {
+        let alias = "security-env-secret-test";
+        let env_var = connection_string_env_var(alias);
+        std::env::set_var(&env_var, "postgresql://runtime-secret@localhost/app");
+
+        let config = parse_config_toml(
+            r#"
+[security-env-secret-test]
+source = "postgres"
+"#,
+        )
+        .unwrap();
+
+        let profile = config.profile(alias).unwrap();
+        std::env::remove_var(env_var);
+
+        assert_eq!(
+            profile.connection_string,
+            Some("postgresql://runtime-secret@localhost/app".to_owned())
+        );
+        assert!(!format!("{config:?}").contains("runtime-secret"));
+    }
 }

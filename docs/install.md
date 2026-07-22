@@ -41,7 +41,7 @@ Windows:
 
 - This project has been built with the MSVC Rust toolchain.
 - Install Rust with rustup and make sure an MSVC C/C++ build environment is available before running the release build.
-- Native/build-heavy dependencies include bundled SQLite through `rusqlite`, SQL Server support through `tiberius`/rustls/ring, Oracle support through `odpic-sys` vendored C sources, and MySQL support through the `mysql` crate dependency tree.
+- Native/build-heavy dependencies include bundled SQLite through `rusqlite`, SQL Server and MySQL TLS through the platform-native TLS stack, and Oracle support through `odpic-sys` vendored C sources.
 - To use Oracle, install an Oracle Instant Client matching the binary architecture and put the directory containing `oci.dll` on `PATH` before starting the CLI, MCP server, or desktop app.
 
 macOS:
@@ -62,6 +62,12 @@ For Oracle on macOS or Linux, install Oracle Client 11.2 or later and make its s
 
 Register `database-memory-mcp` as a stdio MCP server. The server does not need command-line arguments for stdio mode.
 
+MCP local-file access is fail-closed. By default, schema sources and graph caches
+must stay under the server process working directory. Set
+`DATABASE_MEMORY_MCP_ALLOWED_ROOTS` when the client starts the server to declare
+additional trusted project/cache roots. Use `;` between roots on Windows and `:`
+on macOS/Linux. Existing symlinks are resolved before the boundary check.
+
 Claude Code / Claude Desktop-style clients commonly use an `mcpServers` map:
 
 ```json
@@ -69,7 +75,10 @@ Claude Code / Claude Desktop-style clients commonly use an `mcpServers` map:
   "mcpServers": {
     "database-memory": {
       "command": "/absolute/path/to/target/release/database-memory-mcp",
-      "args": []
+      "args": [],
+      "env": {
+        "DATABASE_MEMORY_MCP_ALLOWED_ROOTS": "/absolute/project:/absolute/cache"
+      }
     }
   }
 }
@@ -89,3 +98,7 @@ Some MCP clients use a `servers` map instead:
 ```
 
 On Windows, point `command` at the built `.exe`, for example `C:\path\to\target\release\database-memory-mcp.exe`. Keep the path specific to your local checkout or copied release binary.
+
+On Windows, an allowed-root value can look like
+`D:\projects\backend;D:\database-memory-cache`. Grant only the roots the MCP
+host needs; this setting is the filesystem boundary for semi-trusted tool calls.
