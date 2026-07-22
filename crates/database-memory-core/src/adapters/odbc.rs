@@ -554,9 +554,11 @@ mod runtime {
     use odbc_api::handles::{
         slice_to_utf8, Connection, Diagnostics, Environment, Record, SqlResult, SqlText, Statement,
     };
+    #[cfg(target_os = "windows")]
+    use odbc_api::sys::SQLGetInfoW;
     use odbc_api::sys::{
         AttrOdbcVersion, ConnectionAttribute, HDbc, InfoType, Pointer, SQLGetConnectAttr,
-        SQLGetInfo, SQLGetInfoW, SQLSetConnectAttr, SqlReturn, IS_UINTEGER,
+        SQLGetInfo, SQLSetConnectAttr, SqlReturn, IS_UINTEGER,
     };
     use odbc_api::{Error, Preallocated};
 
