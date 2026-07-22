@@ -138,7 +138,9 @@ jobs:
               cargo test --locked -p database-memory-core adapters::postgres::tests -- --nocapture
               ;;
             yugabytedb)
-              cargo test --locked -p database-memory-core adapters::yugabytedb::tests -- --nocapture
+              # YugabyteDB invalidates the shared YSQL catalog during DDL. Keep
+              # live fixtures serial so their setup cannot race another test.
+              cargo test --locked -p database-memory-core adapters::yugabytedb::tests -- --nocapture --test-threads=1
               ;;
             mysql)
               cargo test --locked -p database-memory-core adapters::mysql_catalog::tests -- --nocapture
