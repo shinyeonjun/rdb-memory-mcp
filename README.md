@@ -48,6 +48,8 @@ For installation and MCP client configuration, see [docs/install.md](docs/instal
 - SQLite DDL is evaluated in an isolated in-memory database. Row statements, external attachment, virtual tables, and extension loading are denied. Input is deadline-bound and capped at 64 MiB total.
 
 For the full product boundary and design history, see [docs/plans/database-memory-mcp.md](docs/plans/database-memory-mcp.md).
+Contributor test tiers and live certification commands are documented in
+[docs/testing.md](docs/testing.md).
 The repository-wide security assumptions and residual risks are documented in
 [docs/security/threat-model.md](docs/security/threat-model.md); tracked upstream
 maintenance exceptions are in

@@ -63,36 +63,50 @@ jobs:
             family: mysql
             env_name: DATABASE_MEMORY_TEST_MYSQL80_URL
             url: mysql://dbmcp:dbmcp@127.0.0.1:13308/dbmcp
+            admin_env_name: DATABASE_MEMORY_TEST_MYSQL_ADMIN_URL
+            admin_url: mysql://root:root@127.0.0.1:13308/dbmcp
           - service: mysql
             container: dbmcp-mysql
             family: mysql
             env_name: DATABASE_MEMORY_TEST_MYSQL84_URL
             url: mysql://dbmcp:dbmcp@127.0.0.1:13306/dbmcp
+            admin_env_name: DATABASE_MEMORY_TEST_MYSQL_ADMIN_URL
+            admin_url: mysql://root:root@127.0.0.1:13306/dbmcp
           - service: mysql97
             container: dbmcp-mysql97
             family: mysql
             env_name: DATABASE_MEMORY_TEST_MYSQL97_URL
             url: mysql://dbmcp:dbmcp@127.0.0.1:13309/dbmcp
+            admin_env_name: DATABASE_MEMORY_TEST_MYSQL_ADMIN_URL
+            admin_url: mysql://root:root@127.0.0.1:13309/dbmcp
           - service: mariadb1011
             container: dbmcp-mariadb1011
             family: mysql
             env_name: DATABASE_MEMORY_TEST_MARIADB1011_URL
             url: mysql://dbmcp:dbmcp@127.0.0.1:13311/dbmcp
+            admin_env_name: DATABASE_MEMORY_TEST_MARIADB_ADMIN_URL
+            admin_url: mysql://root:root@127.0.0.1:13311/dbmcp
           - service: mariadb114
             container: dbmcp-mariadb114
             family: mysql
             env_name: DATABASE_MEMORY_TEST_MARIADB114_URL
             url: mysql://dbmcp:dbmcp@127.0.0.1:13314/dbmcp
+            admin_env_name: DATABASE_MEMORY_TEST_MARIADB_ADMIN_URL
+            admin_url: mysql://root:root@127.0.0.1:13314/dbmcp
           - service: mariadb118
             container: dbmcp-mariadb118
             family: mysql
             env_name: DATABASE_MEMORY_TEST_MARIADB118_URL
             url: mysql://dbmcp:dbmcp@127.0.0.1:13318/dbmcp
+            admin_env_name: DATABASE_MEMORY_TEST_MARIADB_ADMIN_URL
+            admin_url: mysql://root:root@127.0.0.1:13318/dbmcp
           - service: mariadb123
             container: dbmcp-mariadb123
             family: mysql
             env_name: DATABASE_MEMORY_TEST_MARIADB123_URL
             url: mysql://dbmcp:dbmcp@127.0.0.1:13323/dbmcp
+            admin_env_name: DATABASE_MEMORY_TEST_MARIADB_ADMIN_URL
+            admin_url: mysql://root:root@127.0.0.1:13323/dbmcp
     steps:
       - name: Check out source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -130,20 +144,34 @@ jobs:
         shell: bash
         run: echo '${{ matrix.env_name }}=${{ matrix.url }}' >> "$GITHUB_ENV"
 
+      - name: Export selected administrative connection
+        if: matrix.admin_env_name != null
+        shell: bash
+        run: echo '${{ matrix.admin_env_name }}=${{ matrix.admin_url }}' >> "$GITHUB_ENV"
+
+      - name: Prepare colocated YugabyteDB database
+        if: matrix.family == 'yugabytedb'
+        shell: bash
+        run: |
+          docker exec '${{ matrix.container }}' bin/ysqlsh -h 127.0.0.1 -p 5433 -U yugabyte -d yugabyte -v ON_ERROR_STOP=1 -c 'CREATE DATABASE dbmcp_colocated WITH COLOCATION = true;'
+          echo 'DATABASE_MEMORY_TEST_YUGABYTE_COLOCATED_URL=postgresql://yugabyte@127.0.0.1:15443/dbmcp_colocated?sslmode=disable' >> "$GITHUB_ENV"
+
       - name: Run product-specific live contract
         shell: bash
         run: |
           case '${{ matrix.family }}' in
             postgres)
-              cargo test --locked -p database-memory-core adapters::postgres::tests -- --nocapture
+              cargo test --locked -p database-memory-core adapters::postgres::tests -- --ignored --nocapture --skip postgres_entrypoint_rejects_yugabyte_identity
+              cargo test --locked -p database-memory-core yugabytedb_entrypoint_rejects_postgres_identity -- --ignored --nocapture
               ;;
             yugabytedb)
               # YugabyteDB invalidates the shared YSQL catalog during DDL. Keep
               # live fixtures serial so their setup cannot race another test.
-              cargo test --locked -p database-memory-core adapters::yugabytedb::tests -- --nocapture --test-threads=1
+              cargo test --locked -p database-memory-core adapters::yugabytedb::tests -- --ignored --nocapture --test-threads=1 --skip yugabytedb_entrypoint_rejects_postgres_identity
+              cargo test --locked -p database-memory-core postgres_entrypoint_rejects_yugabyte_identity -- --ignored --nocapture --test-threads=1
               ;;
             mysql)
-              cargo test --locked -p database-memory-core adapters::mysql_catalog::tests -- --nocapture
+              cargo test --locked -p database-memory-core adapters::mysql_catalog::tests -- --ignored --nocapture
               ;;
             *)
               exit 1
@@ -197,10 +225,10 @@ jobs:
           }
 
       - name: Run SQL Server native contract
-        run: cargo test --locked -p database-memory-core adapters::sqlserver_catalog::tests -- --nocapture
+        run: cargo test --locked -p database-memory-core adapters::sqlserver_catalog::tests -- --ignored --nocapture
 
       - name: Run Oracle native contract
-        run: cargo test --locked -p database-memory-core adapters::oracle_catalog::tests -- --nocapture
+        run: cargo test --locked -p database-memory-core adapters::oracle_catalog::tests -- --ignored --nocapture
 
       - name: Run SQL Server ODBC contract
-        run: cargo test --locked -p database-memory-core --features odbc adapters::odbc::tests -- --nocapture
+        run: cargo test --locked -p database-memory-core --features odbc adapters::odbc::tests -- --ignored --nocapture

@@ -25,10 +25,11 @@ diff for Backend Visual Map's later integration layer.
   failed analysis preserves the previous complete generation.
 - Generic CLI and MCP discovery covers all 26 canonical object kinds with
   bounded database-side pagination and structured errors.
-- The default workspace has 207 passing tests; the ODBC-enabled workspace has
-  209. The release-profile workspace also has 207 passing tests. Live network
-  cases remain environment-gated and fail closed when a
-  product/version or evidence requirement is not certified.
+- The default workspace has 180 deterministic passing tests and 27 explicitly
+  ignored live tests. The ODBC-enabled workspace has 181 deterministic passing
+  tests and 28 explicitly ignored live tests. Live network cases run only in
+  the dedicated certification tier and fail closed when their declared
+  connection input, product/version, or evidence requirement is unavailable.
 - Certified graph persistence reconciles both semantic relationship counts and
   the physical traversal projection inside the replacement transaction.
 - MCP local-file access is restricted to canonicalized startup-time allowed
@@ -260,7 +261,7 @@ Verification:
 
 ```powershell
 docker compose -f dev/docker-compose.db-test.yml up -d postgres
-cargo test --workspace postgres_adapter_live_introspection_is_env_gated -- --nocapture
+cargo test --workspace postgres_adapter_live_introspection_is_env_gated -- --ignored --nocapture
 ```
 
 Rollback:
@@ -286,7 +287,7 @@ Verification:
 
 ```powershell
 docker compose -f dev/docker-compose.db-test.yml up -d mysql mysql80 mysql97 mariadb1011 mariadb114 mariadb118 mariadb123
-cargo test -p database-memory-core adapters::mysql -- --nocapture
+cargo test -p database-memory-core adapters::mysql_catalog::tests -- --ignored --nocapture
 ```
 
 Rollback:
@@ -337,7 +338,7 @@ Verification:
 
 ```powershell
 docker compose -f dev/docker-compose.db-test.yml up -d sqlserver2017 sqlserver2019 sqlserver sqlserver2025
-cargo test -p database-memory-core sqlserver --no-fail-fast -- --nocapture
+cargo test --no-fail-fast -p database-memory-core adapters::sqlserver_catalog::tests -- --ignored --nocapture
 ```
 
 Rollback:
@@ -415,7 +416,7 @@ Verification:
 ```powershell
 docker compose -f dev/docker-compose.db-test.yml up -d oracle
 $env:DATABASE_MEMORY_TEST_ORACLE_URL='system/oracle@127.0.0.1:11521/FREEPDB1'
-cargo test -p database-memory-core oracle --no-fail-fast -- --nocapture
+cargo test --no-fail-fast -p database-memory-core adapters::oracle_catalog::tests -- --ignored --nocapture
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
@@ -463,9 +464,9 @@ Deferred boundary:
 Verification:
 
 ```powershell
-cargo test --workspace odbc -- --nocapture
+cargo test -p database-memory-core --features odbc sqlserver_capability_probe_is_live_and_env_gated -- --ignored --nocapture
 $env:DATABASE_MEMORY_TEST_YUGABYTE_URL='postgresql://yugabyte@127.0.0.1:15443/yugabyte?sslmode=disable'
-cargo test -p database-memory-core yugabytedb -- --nocapture --test-threads=1
+cargo test -p database-memory-core adapters::yugabytedb::tests -- --ignored --nocapture --test-threads=1
 ```
 
 Rollback:

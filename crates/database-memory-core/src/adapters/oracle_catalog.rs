@@ -14567,10 +14567,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_ORACLE_URL"]
     fn oracle_catalog_live_contract_is_env_gated() {
-        let Some(admin_url) = env::var("DATABASE_MEMORY_TEST_ORACLE_URL").ok() else {
-            return;
-        };
+        let admin_url = env::var("DATABASE_MEMORY_TEST_ORACLE_URL")
+            .expect("live Oracle test requires DATABASE_MEMORY_TEST_ORACLE_URL");
         let parsed = parse_oracle_connection_string(&admin_url).unwrap();
         let connect_string = parsed.connect_string.to_owned();
         let admin = Connection::connect(parsed.username, parsed.password, parsed.connect_string)
@@ -15796,10 +15796,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_ORACLE_URL"]
     fn oracle_multi_schema_contract_is_env_gated() {
-        let Some(admin_url) = env::var("DATABASE_MEMORY_TEST_ORACLE_URL").ok() else {
-            return;
-        };
+        let admin_url = env::var("DATABASE_MEMORY_TEST_ORACLE_URL")
+            .expect("Oracle multi-schema test requires DATABASE_MEMORY_TEST_ORACLE_URL");
         let parsed = parse_oracle_connection_string(&admin_url).unwrap();
         let connect_string = parsed.connect_string.to_owned();
         let password = "DbmcpTest1!";

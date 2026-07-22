@@ -96,11 +96,12 @@ services:
     container_name: dbmcp-mysql
     environment:
       MYSQL_ROOT_PASSWORD: root
+      MYSQL_ROOT_HOST: "%"
       MYSQL_DATABASE: dbmcp
       MYSQL_USER: dbmcp
       MYSQL_PASSWORD: dbmcp
     ports:
-      - "13306:3306"
+      - "127.0.0.1:13306:3306"
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-udbmcp", "-pdbmcp"]
       interval: 2s
@@ -112,11 +113,12 @@ services:
     container_name: dbmcp-mysql80
     environment:
       MYSQL_ROOT_PASSWORD: root
+      MYSQL_ROOT_HOST: "%"
       MYSQL_DATABASE: dbmcp
       MYSQL_USER: dbmcp
       MYSQL_PASSWORD: dbmcp
     ports:
-      - "13308:3306"
+      - "127.0.0.1:13308:3306"
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-udbmcp", "-pdbmcp"]
       interval: 2s
@@ -128,11 +130,12 @@ services:
     container_name: dbmcp-mysql97
     environment:
       MYSQL_ROOT_PASSWORD: root
+      MYSQL_ROOT_HOST: "%"
       MYSQL_DATABASE: dbmcp
       MYSQL_USER: dbmcp
       MYSQL_PASSWORD: dbmcp
     ports:
-      - "13309:3306"
+      - "127.0.0.1:13309:3306"
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-udbmcp", "-pdbmcp"]
       interval: 2s
@@ -144,11 +147,12 @@ services:
     container_name: dbmcp-mariadb1011
     environment:
       MARIADB_ROOT_PASSWORD: root
+      MARIADB_ROOT_HOST: "%"
       MARIADB_DATABASE: dbmcp
       MARIADB_USER: dbmcp
       MARIADB_PASSWORD: dbmcp
     ports:
-      - "13311:3306"
+      - "127.0.0.1:13311:3306"
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 2s
@@ -160,11 +164,12 @@ services:
     container_name: dbmcp-mariadb114
     environment:
       MARIADB_ROOT_PASSWORD: root
+      MARIADB_ROOT_HOST: "%"
       MARIADB_DATABASE: dbmcp
       MARIADB_USER: dbmcp
       MARIADB_PASSWORD: dbmcp
     ports:
-      - "13314:3306"
+      - "127.0.0.1:13314:3306"
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 2s
@@ -176,11 +181,12 @@ services:
     container_name: dbmcp-mariadb118
     environment:
       MARIADB_ROOT_PASSWORD: root
+      MARIADB_ROOT_HOST: "%"
       MARIADB_DATABASE: dbmcp
       MARIADB_USER: dbmcp
       MARIADB_PASSWORD: dbmcp
     ports:
-      - "13318:3306"
+      - "127.0.0.1:13318:3306"
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 2s
@@ -192,11 +198,12 @@ services:
     container_name: dbmcp-mariadb123
     environment:
       MARIADB_ROOT_PASSWORD: root
+      MARIADB_ROOT_HOST: "%"
       MARIADB_DATABASE: dbmcp
       MARIADB_USER: dbmcp
       MARIADB_PASSWORD: dbmcp
     ports:
-      - "13323:3306"
+      - "127.0.0.1:13323:3306"
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 2s

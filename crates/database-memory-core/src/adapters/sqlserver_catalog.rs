@@ -6849,14 +6849,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_SQLSERVER2022_URL"]
     fn sqlserver_2022_live_catalog_is_certified() {
         let _guard = live_test_guard();
-        let Ok(connection_string) = std::env::var("DATABASE_MEMORY_TEST_SQLSERVER2022_URL") else {
-            eprintln!(
-                "skipping SQL Server 2022 live test; configure DATABASE_MEMORY_TEST_SQLSERVER2022_URL"
-            );
-            return;
-        };
+        let connection_string = std::env::var("DATABASE_MEMORY_TEST_SQLSERVER2022_URL")
+            .expect("live SQL Server test requires DATABASE_MEMORY_TEST_SQLSERVER2022_URL");
 
         let outcome = analyze_sqlserver(
             &connection_string,
@@ -6879,13 +6876,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a DATABASE_MEMORY_TEST_SQLSERVER*_URL"]
     fn rich_sqlserver_catalog_is_certified_across_the_live_matrix() {
         let _guard = live_test_guard();
-        let configured = configured_sqlserver_matrix();
-        if configured.is_empty() {
-            eprintln!("skipping SQL Server rich matrix; configure SQL Server matrix URLs");
-            return;
-        }
+        let configured = required_sqlserver_matrix();
         for (strategy, connection_string) in configured {
             let schema = format!("dm_{}", unique_suffix());
             let fixture = SqlServerFixture::new(&schema);
@@ -7031,14 +7025,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_SQLSERVER2022_URL"]
     fn unprovable_sqlserver_metadata_fails_closed_on_the_live_server() {
         let _guard = live_test_guard();
-        let Ok(connection_string) = std::env::var("DATABASE_MEMORY_TEST_SQLSERVER2022_URL") else {
-            eprintln!(
-                "skipping SQL Server 2022 unsupported-metadata test; configure DATABASE_MEMORY_TEST_SQLSERVER2022_URL"
-            );
-            return;
-        };
+        let connection_string = std::env::var("DATABASE_MEMORY_TEST_SQLSERVER2022_URL").expect(
+            "SQL Server unsupported-metadata test requires DATABASE_MEMORY_TEST_SQLSERVER2022_URL",
+        );
         let schema = format!("dm_{}", unique_suffix());
         execute_admin_batches(
             &connection_string,
@@ -7108,13 +7100,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a DATABASE_MEMORY_TEST_SQLSERVER*_URL"]
     fn table_types_are_fully_mapped_across_the_live_matrix() {
         let _guard = live_test_guard();
-        let configured = configured_sqlserver_matrix();
-        if configured.is_empty() {
-            eprintln!("skipping SQL Server table-type matrix; configure SQL Server matrix URLs");
-            return;
-        }
+        let configured = required_sqlserver_matrix();
         for (strategy, connection_string) in configured {
             assert_table_type_catalog(strategy, &connection_string);
         }
@@ -7230,13 +7219,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a DATABASE_MEMORY_TEST_SQLSERVER*_URL"]
     fn xml_schema_and_extended_properties_are_certified_across_the_live_matrix() {
         let _guard = live_test_guard();
-        let configured = configured_sqlserver_matrix();
-        if configured.is_empty() {
-            eprintln!("skipping SQL Server XML metadata matrix; configure SQL Server matrix URLs");
-            return;
-        }
+        let configured = required_sqlserver_matrix();
         for (strategy, connection_string) in configured {
             assert_xml_metadata_catalog(strategy, &connection_string);
         }
@@ -7431,13 +7417,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a DATABASE_MEMORY_TEST_SQLSERVER*_URL"]
     fn cross_schema_foreign_keys_require_a_complete_scope_across_the_live_matrix() {
         let _guard = live_test_guard();
-        let configured = configured_sqlserver_matrix();
-        if configured.is_empty() {
-            eprintln!("skipping SQL Server scope matrix; configure SQL Server matrix URLs");
-            return;
-        }
+        let configured = required_sqlserver_matrix();
         for (strategy, connection_string) in configured {
             let suffix = unique_suffix();
             let child_schema = format!("dm_child_{suffix}");
@@ -7523,13 +7506,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a DATABASE_MEMORY_TEST_SQLSERVER*_URL"]
     fn timeout_never_emits_a_partial_snapshot_across_the_live_matrix() {
         let _guard = live_test_guard();
-        let configured = configured_sqlserver_matrix();
-        if configured.is_empty() {
-            eprintln!("skipping SQL Server timeout matrix; configure SQL Server matrix URLs");
-            return;
-        }
+        let configured = required_sqlserver_matrix();
         for (strategy, connection_string) in configured {
             let outcome = analyze_sqlserver(
                 &connection_string,
@@ -7548,14 +7528,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_SQLSERVER2022_URL"]
     fn metadata_visibility_is_required_and_sufficient_on_the_live_server() {
         let _guard = live_test_guard();
-        let Ok(admin_connection) = std::env::var("DATABASE_MEMORY_TEST_SQLSERVER2022_URL") else {
-            eprintln!(
-                "skipping SQL Server 2022 privilege test; configure DATABASE_MEMORY_TEST_SQLSERVER2022_URL"
-            );
-            return;
-        };
+        let admin_connection = std::env::var("DATABASE_MEMORY_TEST_SQLSERVER2022_URL")
+            .expect("SQL Server privilege test requires DATABASE_MEMORY_TEST_SQLSERVER2022_URL");
         let suffix = unique_suffix();
         let schema = format!("dm_{suffix}");
         let principal = format!("dm_reader_{suffix}");
@@ -7693,8 +7670,8 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn configured_sqlserver_matrix() -> Vec<(&'static str, String)> {
-        [
+    fn required_sqlserver_matrix() -> Vec<(&'static str, String)> {
+        let configured = [
             ("DATABASE_MEMORY_TEST_SQLSERVER2017_URL", "sqlserver-2017"),
             ("DATABASE_MEMORY_TEST_SQLSERVER2019_URL", "sqlserver-2019"),
             ("DATABASE_MEMORY_TEST_SQLSERVER2022_URL", "sqlserver-2022"),
@@ -7706,7 +7683,12 @@ mod tests {
                 .ok()
                 .map(|connection_string| (strategy, connection_string))
         })
-        .collect()
+        .collect::<Vec<_>>();
+        assert!(
+            !configured.is_empty(),
+            "live SQL Server matrix test requires at least one DATABASE_MEMORY_TEST_SQLSERVER*_URL"
+        );
+        configured
     }
 
     fn unique_suffix() -> String {

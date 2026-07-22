@@ -1730,10 +1730,10 @@ mod tests {
 
     #[cfg(feature = "odbc")]
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_ODBC_SQLSERVER_URL"]
     fn sqlserver_capability_probe_is_live_and_env_gated() {
-        let Ok(connection_string) = std::env::var("DATABASE_MEMORY_TEST_ODBC_SQLSERVER_URL") else {
-            return;
-        };
+        let connection_string = std::env::var("DATABASE_MEMORY_TEST_ODBC_SQLSERVER_URL")
+            .expect("live ODBC test requires DATABASE_MEMORY_TEST_ODBC_SQLSERVER_URL");
         let report = probe_odbc_capabilities(&connection_string, "odbc-sqlserver", 30_000)
             .expect("live ODBC capability probe must succeed");
         assert!(report

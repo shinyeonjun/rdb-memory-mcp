@@ -119,10 +119,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_POSTGRES_URL"]
     fn yugabytedb_entrypoint_rejects_postgres_identity() {
-        let Ok(connection_string) = std::env::var("DATABASE_MEMORY_TEST_POSTGRES_URL") else {
-            return;
-        };
+        let connection_string = std::env::var("DATABASE_MEMORY_TEST_POSTGRES_URL")
+            .expect("PostgreSQL identity test requires DATABASE_MEMORY_TEST_POSTGRES_URL");
         let outcome = introspect_yugabytedb_complete_scoped(
             &connection_string,
             "postgres-through-yugabyte",
@@ -139,10 +139,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_YUGABYTE_URL"]
     fn certified_yugabytedb_release_is_live_and_env_gated() {
-        let Ok(connection_string) = std::env::var("DATABASE_MEMORY_TEST_YUGABYTE_URL") else {
-            return;
-        };
+        let connection_string = std::env::var("DATABASE_MEMORY_TEST_YUGABYTE_URL")
+            .expect("live YugabyteDB test requires DATABASE_MEMORY_TEST_YUGABYTE_URL");
         let outcome = introspect_yugabytedb_complete_scoped(
             &connection_string,
             "yb-live",
@@ -171,10 +171,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_YUGABYTE_URL"]
     fn rich_yugabytedb_catalog_preserves_distributed_metadata_without_silent_drops() {
-        let Ok(connection_string) = std::env::var("DATABASE_MEMORY_TEST_YUGABYTE_URL") else {
-            return;
-        };
+        let connection_string = std::env::var("DATABASE_MEMORY_TEST_YUGABYTE_URL")
+            .expect("rich YugabyteDB test requires DATABASE_MEMORY_TEST_YUGABYTE_URL");
         let schema = unique_schema("rich");
         let mut client = Client::connect(&connection_string, NoTls).unwrap();
         client
@@ -357,10 +357,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_YUGABYTE_URL"]
     fn opaque_yugabytedb_routine_fails_instead_of_claiming_complete_dependencies() {
-        let Ok(connection_string) = std::env::var("DATABASE_MEMORY_TEST_YUGABYTE_URL") else {
-            return;
-        };
+        let connection_string = std::env::var("DATABASE_MEMORY_TEST_YUGABYTE_URL")
+            .expect("opaque YugabyteDB routine test requires DATABASE_MEMORY_TEST_YUGABYTE_URL");
         let schema = unique_schema("opaque");
         let mut client = Client::connect(&connection_string, NoTls).unwrap();
         client
@@ -397,11 +397,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_YUGABYTE_COLOCATED_URL"]
     fn colocated_yugabytedb_database_preserves_tablegroup_membership() {
-        let Ok(connection_string) = std::env::var("DATABASE_MEMORY_TEST_YUGABYTE_COLOCATED_URL")
-        else {
-            return;
-        };
+        let connection_string = std::env::var("DATABASE_MEMORY_TEST_YUGABYTE_COLOCATED_URL")
+            .expect(
+                "colocated YugabyteDB test requires DATABASE_MEMORY_TEST_YUGABYTE_COLOCATED_URL",
+            );
         let schema = unique_schema("colocated");
         let mut client = Client::connect(&connection_string, NoTls).unwrap();
         client
@@ -460,10 +461,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_YUGABYTE_URL"]
     fn yugabytedb_tablespace_placement_is_linked_to_its_relations() {
-        let Ok(connection_string) = std::env::var("DATABASE_MEMORY_TEST_YUGABYTE_URL") else {
-            return;
-        };
+        let connection_string = std::env::var("DATABASE_MEMORY_TEST_YUGABYTE_URL")
+            .expect("YugabyteDB tablespace test requires DATABASE_MEMORY_TEST_YUGABYTE_URL");
         let schema = unique_schema("placement");
         let tablespace = unique_schema("tablespace");
         let mut client = Client::connect(&connection_string, NoTls).unwrap();

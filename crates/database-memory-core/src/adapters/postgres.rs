@@ -127,13 +127,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_POSTGRES_URL"]
     fn postgres_adapter_live_introspection_is_env_gated() {
-        let Ok(connection_string) = std::env::var("DATABASE_MEMORY_TEST_POSTGRES_URL") else {
-            eprintln!(
-                "skipping live PostgreSQL adapter test; set DATABASE_MEMORY_TEST_POSTGRES_URL to run it"
-            );
-            return;
-        };
+        let connection_string = std::env::var("DATABASE_MEMORY_TEST_POSTGRES_URL")
+            .expect("live PostgreSQL test requires DATABASE_MEMORY_TEST_POSTGRES_URL");
         let outcome = introspect_postgres_complete_scoped(
             &connection_string,
             "pg-live",
@@ -152,13 +149,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_YUGABYTE_URL"]
     fn postgres_entrypoint_rejects_yugabyte_identity() {
-        let Ok(connection_string) = std::env::var("DATABASE_MEMORY_TEST_YUGABYTE_URL") else {
-            eprintln!(
-                "skipping YugabyteDB identity test; set DATABASE_MEMORY_TEST_YUGABYTE_URL to run it"
-            );
-            return;
-        };
+        let connection_string = std::env::var("DATABASE_MEMORY_TEST_YUGABYTE_URL")
+            .expect("YugabyteDB identity test requires DATABASE_MEMORY_TEST_YUGABYTE_URL");
         let outcome = introspect_postgres_complete_scoped(
             &connection_string,
             "yb-through-postgres",
@@ -175,13 +169,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_POSTGRES_URL"]
     fn rich_postgres_catalog_is_certified_without_silent_drops() {
-        let Ok(connection_string) = std::env::var("DATABASE_MEMORY_TEST_POSTGRES_URL") else {
-            eprintln!(
-                "skipping rich live PostgreSQL adapter test; set DATABASE_MEMORY_TEST_POSTGRES_URL to run it"
-            );
-            return;
-        };
+        let connection_string = std::env::var("DATABASE_MEMORY_TEST_POSTGRES_URL")
+            .expect("rich PostgreSQL test requires DATABASE_MEMORY_TEST_POSTGRES_URL");
         let schema = unique_schema("rich");
         let mut client = Client::connect(&connection_string, NoTls).unwrap();
         client
@@ -333,13 +324,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_POSTGRES_URL"]
     fn opaque_postgres_routine_fails_instead_of_claiming_complete_dependencies() {
-        let Ok(connection_string) = std::env::var("DATABASE_MEMORY_TEST_POSTGRES_URL") else {
-            eprintln!(
-                "skipping opaque routine live test; set DATABASE_MEMORY_TEST_POSTGRES_URL to run it"
-            );
-            return;
-        };
+        let connection_string = std::env::var("DATABASE_MEMORY_TEST_POSTGRES_URL")
+            .expect("opaque PostgreSQL routine test requires DATABASE_MEMORY_TEST_POSTGRES_URL");
         let schema = unique_schema("opaque");
         let mut client = Client::connect(&connection_string, NoTls).unwrap();
         client
@@ -376,13 +364,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_POSTGRES_URL"]
     fn postgres_schema_privilege_is_a_closed_completeness_gate() {
-        let Ok(connection_string) = std::env::var("DATABASE_MEMORY_TEST_POSTGRES_URL") else {
-            eprintln!(
-                "skipping live PostgreSQL privilege test; set DATABASE_MEMORY_TEST_POSTGRES_URL to run it"
-            );
-            return;
-        };
+        let connection_string = std::env::var("DATABASE_MEMORY_TEST_POSTGRES_URL")
+            .expect("PostgreSQL privilege test requires DATABASE_MEMORY_TEST_POSTGRES_URL");
         let schema = unique_schema("privilege");
         let role = unique_schema("role");
         let mut client = Client::connect(&connection_string, NoTls).unwrap();

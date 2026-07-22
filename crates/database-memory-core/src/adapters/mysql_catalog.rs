@@ -4345,29 +4345,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a DATABASE_MEMORY_TEST_MYSQL*_URL or DATABASE_MEMORY_TEST_MARIADB*_URL"]
     fn mysql_family_live_matrix_is_env_gated() {
         let _live_test_guard = live_test_guard();
-        let cases = [
-            ("DATABASE_MEMORY_TEST_MYSQL80_URL", "mysql"),
-            ("DATABASE_MEMORY_TEST_MYSQL84_URL", "mysql"),
-            ("DATABASE_MEMORY_TEST_MYSQL97_URL", "mysql"),
-            ("DATABASE_MEMORY_TEST_MARIADB1011_URL", "mariadb"),
-            ("DATABASE_MEMORY_TEST_MARIADB114_URL", "mariadb"),
-            ("DATABASE_MEMORY_TEST_MARIADB118_URL", "mariadb"),
-            ("DATABASE_MEMORY_TEST_MARIADB123_URL", "mariadb"),
-        ];
-        let configured = cases
-            .iter()
-            .filter_map(|(environment, source_kind)| {
-                std::env::var(environment)
-                    .ok()
-                    .map(|url| (*environment, *source_kind, url))
-            })
-            .collect::<Vec<_>>();
-        if configured.is_empty() {
-            eprintln!("skipping MySQL-family live matrix; configure its test URL variables");
-            return;
-        }
+        let configured = required_live_cases();
         for (environment, source_kind, url) in configured {
             let outcome = analyze_mysql_family(&url, environment, Vec::new(), 30_000);
             assert_eq!(
@@ -4383,13 +4364,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a DATABASE_MEMORY_TEST_MYSQL*_URL or DATABASE_MEMORY_TEST_MARIADB*_URL"]
     fn rich_mysql_family_catalog_is_certified_across_the_live_matrix() {
         let _live_test_guard = live_test_guard();
-        let configured = configured_live_cases();
-        if configured.is_empty() {
-            eprintln!("skipping rich MySQL-family matrix; configure its test URL variables");
-            return;
-        }
+        let configured = required_live_cases();
         for (environment, source_kind, url) in configured {
             let names = RichFixtureNames::new();
             let mut connection = Conn::new(url.as_str()).unwrap();
@@ -4460,9 +4438,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a DATABASE_MEMORY_TEST_MYSQL*_URL or DATABASE_MEMORY_TEST_MARIADB*_URL"]
     fn procedural_mysql_family_metadata_fails_closed() {
         let _live_test_guard = live_test_guard();
-        let configured = configured_live_cases();
+        let configured = required_live_cases();
         let mut exercised = BTreeSet::new();
         for (environment, source_kind, url) in configured {
             if !exercised.insert(source_kind) {
@@ -4493,23 +4472,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_MYSQL_ADMIN_URL or DATABASE_MEMORY_TEST_MARIADB_ADMIN_URL"]
     fn trigger_and_event_bodies_fail_closed_for_both_products() {
         let _live_test_guard = live_test_guard();
-        let configured = [
-            ("DATABASE_MEMORY_TEST_MYSQL_ADMIN_URL", "mysql"),
-            ("DATABASE_MEMORY_TEST_MARIADB_ADMIN_URL", "mariadb"),
-        ]
-        .into_iter()
-        .filter_map(|(environment, source_kind)| {
-            std::env::var(environment)
-                .ok()
-                .map(|url| (environment, source_kind, url))
-        })
-        .collect::<Vec<_>>();
-        if configured.is_empty() {
-            eprintln!("skipping procedural-body tests; configure MySQL-family admin URLs");
-            return;
-        }
+        let configured = required_admin_cases();
         for (environment, _source_kind, url) in configured {
             let suffix = unique_suffix();
             let table = format!("dm_trigger_table_{suffix}");
@@ -4570,24 +4536,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_MYSQL_ADMIN_URL or DATABASE_MEMORY_TEST_MARIADB_ADMIN_URL"]
     fn schema_wide_visibility_is_required_and_then_sufficient() {
         let _live_test_guard = live_test_guard();
-        let admin_cases = [
-            ("DATABASE_MEMORY_TEST_MYSQL_ADMIN_URL", "mysql"),
-            ("DATABASE_MEMORY_TEST_MARIADB_ADMIN_URL", "mariadb"),
-        ];
-        let configured = admin_cases
-            .into_iter()
-            .filter_map(|(environment, source_kind)| {
-                std::env::var(environment)
-                    .ok()
-                    .map(|url| (environment, source_kind, url))
-            })
-            .collect::<Vec<_>>();
-        if configured.is_empty() {
-            eprintln!("skipping MySQL-family privilege test; configure admin URL variables");
-            return;
-        }
+        let configured = required_admin_cases();
         for (environment, source_kind, admin_url) in configured {
             let opts = Opts::from_url(&admin_url).unwrap();
             let database = opts.get_db_name().unwrap().to_owned();
@@ -4653,24 +4605,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DATABASE_MEMORY_TEST_MYSQL_ADMIN_URL or DATABASE_MEMORY_TEST_MARIADB_ADMIN_URL"]
     fn active_role_privileges_are_part_of_the_visibility_proof() {
         let _live_test_guard = live_test_guard();
-        let admin_cases = [
-            ("DATABASE_MEMORY_TEST_MYSQL_ADMIN_URL", "mysql"),
-            ("DATABASE_MEMORY_TEST_MARIADB_ADMIN_URL", "mariadb"),
-        ];
-        let configured = admin_cases
-            .into_iter()
-            .filter_map(|(environment, source_kind)| {
-                std::env::var(environment)
-                    .ok()
-                    .map(|url| (environment, source_kind, url))
-            })
-            .collect::<Vec<_>>();
-        if configured.is_empty() {
-            eprintln!("skipping role visibility test; configure admin URL variables");
-            return;
-        }
+        let configured = required_admin_cases();
         for (environment, source_kind, admin_url) in configured {
             let opts = Opts::from_url(&admin_url).unwrap();
             let database = opts.get_db_name().unwrap().to_owned();
@@ -4771,8 +4709,8 @@ mod tests {
         }
     }
 
-    fn configured_live_cases() -> Vec<(&'static str, &'static str, String)> {
-        [
+    fn required_live_cases() -> Vec<(&'static str, &'static str, String)> {
+        let configured = [
             ("DATABASE_MEMORY_TEST_MYSQL80_URL", "mysql"),
             ("DATABASE_MEMORY_TEST_MYSQL84_URL", "mysql"),
             ("DATABASE_MEMORY_TEST_MYSQL97_URL", "mysql"),
@@ -4787,7 +4725,31 @@ mod tests {
                 .ok()
                 .map(|url| (environment, source_kind, url))
         })
-        .collect()
+        .collect::<Vec<_>>();
+        assert!(
+            !configured.is_empty(),
+            "live MySQL-family test requires at least one DATABASE_MEMORY_TEST_MYSQL*_URL or DATABASE_MEMORY_TEST_MARIADB*_URL"
+        );
+        configured
+    }
+
+    fn required_admin_cases() -> Vec<(&'static str, &'static str, String)> {
+        let configured = [
+            ("DATABASE_MEMORY_TEST_MYSQL_ADMIN_URL", "mysql"),
+            ("DATABASE_MEMORY_TEST_MARIADB_ADMIN_URL", "mariadb"),
+        ]
+        .into_iter()
+        .filter_map(|(environment, source_kind)| {
+            std::env::var(environment)
+                .ok()
+                .map(|url| (environment, source_kind, url))
+        })
+        .collect::<Vec<_>>();
+        assert!(
+            !configured.is_empty(),
+            "live MySQL-family privilege test requires DATABASE_MEMORY_TEST_MYSQL_ADMIN_URL or DATABASE_MEMORY_TEST_MARIADB_ADMIN_URL"
+        );
+        configured
     }
 
     fn live_test_guard() -> MutexGuard<'static, ()> {
