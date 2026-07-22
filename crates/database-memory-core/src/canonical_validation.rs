@@ -166,6 +166,7 @@ fn is_canonical_metadata_kind(kind: ObjectKind) -> bool {
             | ObjectKind::UniqueConstraint
             | ObjectKind::CheckConstraint
             | ObjectKind::Index
+            | ObjectKind::Routine
             | ObjectKind::MaterializedView
             | ObjectKind::ViewColumn
             | ObjectKind::Sequence
@@ -274,6 +275,7 @@ fn require_metadata_parent_kind(
         | ObjectKind::Synonym
         | ObjectKind::Package => &[ObjectKind::Schema],
         ObjectKind::PrimaryKey | ObjectKind::UniqueConstraint => &[ObjectKind::MaterializedView],
+        ObjectKind::Routine => &[ObjectKind::Package],
         ObjectKind::CheckConstraint => &[ObjectKind::Domain, ObjectKind::MaterializedView],
         ObjectKind::Index => &[ObjectKind::MaterializedView],
         ObjectKind::Event => &[ObjectKind::Database, ObjectKind::Schema],
@@ -591,6 +593,54 @@ mod tests {
                 properties: BTreeMap::new(),
             },
         ]);
+
+        assert!(validate_canonical_schema_snapshot(&snapshot).is_ok());
+    }
+
+    #[test]
+    fn accepts_packaged_routines_and_parameters() {
+        let mut snapshot = canonical_snapshot();
+        let schema_key = key(ObjectKind::Schema, "main", None);
+        let package_key = key(ObjectKind::Package, "account_api", None);
+        let routine_key = key(ObjectKind::Routine, "account_api", Some("find(number)"));
+        let parameter_key = key(
+            ObjectKind::RoutineParameter,
+            "account_api",
+            Some("find(number)#1:id"),
+        );
+        snapshot.metadata.objects.extend([
+            MetadataObject {
+                key: package_key.clone(),
+                parent_key: Some(schema_key),
+                name: "account_api".to_owned(),
+                extension_kind: None,
+                definition: Some("PACKAGE account_api AS END".to_owned()),
+                properties: BTreeMap::new(),
+            },
+            MetadataObject {
+                key: routine_key.clone(),
+                parent_key: Some(package_key),
+                name: "find".to_owned(),
+                extension_kind: None,
+                definition: None,
+                properties: BTreeMap::new(),
+            },
+            MetadataObject {
+                key: parameter_key.clone(),
+                parent_key: Some(routine_key.clone()),
+                name: "id".to_owned(),
+                extension_kind: None,
+                definition: None,
+                properties: BTreeMap::new(),
+            },
+        ]);
+        snapshot.metadata.relationships.push(MetadataRelationship {
+            kind: MetadataRelationshipKind::HasParameter,
+            from_key: routine_key,
+            to_key: parameter_key,
+            ordinal: Some(1),
+            properties: BTreeMap::new(),
+        });
 
         assert!(validate_canonical_schema_snapshot(&snapshot).is_ok());
     }
