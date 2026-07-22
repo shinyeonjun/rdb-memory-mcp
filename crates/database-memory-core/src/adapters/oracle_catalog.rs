@@ -833,6 +833,128 @@ struct RawSynonym {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct RawPartitionedTable {
+    owner: String,
+    table: String,
+    partitioning_type: String,
+    subpartitioning_type: String,
+    partition_count: i64,
+    default_subpartition_count: i64,
+    partitioning_key_count: i64,
+    subpartitioning_key_count: i64,
+    status: String,
+    default_tablespace: Option<String>,
+    interval: Option<String>,
+    autolist: Option<String>,
+    interval_subpartition: Option<String>,
+    autolist_subpartition: Option<String>,
+    automatic: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawTablePartition {
+    owner: String,
+    table: String,
+    composite: String,
+    name: String,
+    subpartition_count: i64,
+    high_value: Option<String>,
+    high_value_length: i64,
+    position: i64,
+    tablespace: Option<String>,
+    compression: String,
+    compress_for: Option<String>,
+    interval: String,
+    segment_created: String,
+    indexing: String,
+    read_only: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawTableSubpartition {
+    owner: String,
+    table: String,
+    partition: String,
+    name: String,
+    high_value: Option<String>,
+    high_value_length: i64,
+    partition_position: i64,
+    position: i64,
+    tablespace: Option<String>,
+    compression: String,
+    compress_for: Option<String>,
+    interval: String,
+    segment_created: String,
+    indexing: String,
+    read_only: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawPartitionedIndex {
+    owner: String,
+    index: String,
+    table: String,
+    partitioning_type: String,
+    subpartitioning_type: String,
+    partition_count: i64,
+    default_subpartition_count: i64,
+    partitioning_key_count: i64,
+    subpartitioning_key_count: i64,
+    locality: String,
+    alignment: String,
+    default_tablespace: Option<String>,
+    interval: Option<String>,
+    autolist: Option<String>,
+    interval_subpartition: Option<String>,
+    autolist_subpartition: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawIndexPartition {
+    owner: String,
+    index: String,
+    composite: String,
+    name: String,
+    subpartition_count: i64,
+    high_value: Option<String>,
+    high_value_length: i64,
+    position: i64,
+    status: String,
+    tablespace: Option<String>,
+    compression: String,
+    interval: String,
+    segment_created: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawIndexSubpartition {
+    owner: String,
+    index: String,
+    partition: String,
+    name: String,
+    high_value: Option<String>,
+    high_value_length: i64,
+    partition_position: i64,
+    position: i64,
+    status: String,
+    tablespace: Option<String>,
+    compression: String,
+    interval: String,
+    segment_created: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawPartitionKeyColumn {
+    owner: String,
+    name: String,
+    object_type: String,
+    column: String,
+    position: i64,
+    collated_column_id: Option<i64>,
+    subpartition: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RawUserType {
     owner: String,
     name: String,
@@ -1112,6 +1234,13 @@ struct RawOracleCatalog {
     package_arguments: Vec<RawRoutineArgument>,
     constraints: Vec<RawConstraint>,
     indexes: Vec<RawIndex>,
+    partitioned_tables: Vec<RawPartitionedTable>,
+    table_partitions: Vec<RawTablePartition>,
+    table_subpartitions: Vec<RawTableSubpartition>,
+    partitioned_indexes: Vec<RawPartitionedIndex>,
+    index_partitions: Vec<RawIndexPartition>,
+    index_subpartitions: Vec<RawIndexSubpartition>,
+    partition_key_columns: Vec<RawPartitionKeyColumn>,
     dependencies: Vec<RawDependency>,
 }
 
@@ -1177,6 +1306,20 @@ impl RawOracleCatalog {
             .map_err(|error| error.catalog_context("index"))?;
         attach_index_columns(connection, scope, &mut indexes, deadline)
             .map_err(|error| error.catalog_context("index-column"))?;
+        let partitioned_tables = read_partitioned_tables(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("partitioned-table"))?;
+        let table_partitions = read_table_partitions(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("table-partition"))?;
+        let table_subpartitions = read_table_subpartitions(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("table-subpartition"))?;
+        let partitioned_indexes = read_partitioned_indexes(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("partitioned-index"))?;
+        let index_partitions = read_index_partitions(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("index-partition"))?;
+        let index_subpartitions = read_index_subpartitions(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("index-subpartition"))?;
+        let partition_key_columns = read_partition_key_columns(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("partition-key-column"))?;
         let dependencies = read_dependencies(connection, scope, deadline)
             .map_err(|error| error.catalog_context("dependency"))?;
         if Instant::now() >= deadline {
@@ -1205,6 +1348,13 @@ impl RawOracleCatalog {
             package_arguments,
             constraints,
             indexes,
+            partitioned_tables,
+            table_partitions,
+            table_subpartitions,
+            partitioned_indexes,
+            index_partitions,
+            index_subpartitions,
+            partition_key_columns,
             dependencies,
         })
     }
@@ -4572,6 +4722,707 @@ fn attach_index_columns(
     Ok(())
 }
 
+fn read_partitioned_tables(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawPartitionedTable>, CatalogError> {
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let mut tables = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let (view, owner_expression, owner_filter) = match scope.mode {
+            DictionaryScopeMode::User => ("USER_PART_TABLES", ":1", ""),
+            DictionaryScopeMode::Dba => ("DBA_PART_TABLES", "OWNER", "WHERE OWNER = :1"),
+        };
+        let sql = format!(
+            "
+            SELECT {owner_expression},
+                   TABLE_NAME,
+                   PARTITIONING_TYPE,
+                   SUBPARTITIONING_TYPE,
+                   PARTITION_COUNT,
+                   DEF_SUBPARTITION_COUNT,
+                   PARTITIONING_KEY_COUNT,
+                   SUBPARTITIONING_KEY_COUNT,
+                   STATUS,
+                   DEF_TABLESPACE_NAME,
+                   INTERVAL,
+                   AUTOLIST,
+                   INTERVAL_SUBPARTITION,
+                   AUTOLIST_SUBPARTITION,
+                   AUTO
+            FROM {view}
+            {owner_filter}
+            ORDER BY TABLE_NAME
+            "
+        );
+        for row in connection.query_as::<Row>(&sql, &[owner])? {
+            let (
+                owner,
+                table,
+                partitioning_type,
+                subpartitioning_type,
+                partition_count,
+                default_subpartition_count,
+                partitioning_key_count,
+                subpartitioning_key_count,
+                status,
+                default_tablespace,
+                interval,
+                autolist,
+                interval_subpartition,
+                autolist_subpartition,
+                automatic,
+            ) = row?;
+            tables.push(RawPartitionedTable {
+                owner,
+                table,
+                partitioning_type: partitioning_type.trim().to_owned(),
+                subpartitioning_type: subpartitioning_type.trim().to_owned(),
+                partition_count,
+                default_subpartition_count,
+                partitioning_key_count,
+                subpartitioning_key_count,
+                status: status.trim().to_owned(),
+                default_tablespace: normalize_optional_token(default_tablespace),
+                interval: normalize_definition(interval)?,
+                autolist: normalize_optional_token(autolist),
+                interval_subpartition: normalize_definition(interval_subpartition)?,
+                autolist_subpartition: normalize_optional_token(autolist_subpartition),
+                automatic: normalize_optional_token(automatic),
+            });
+        }
+    }
+    tables.sort_by(|left, right| (&left.owner, &left.table).cmp(&(&right.owner, &right.table)));
+    Ok(tables)
+}
+
+fn read_table_partitions(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawTablePartition>, CatalogError> {
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        i64,
+        Option<String>,
+        i64,
+        i64,
+        Option<String>,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+    );
+    let mut partitions = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let (view, owner_expression, owner_filter) = match scope.mode {
+            DictionaryScopeMode::User => ("USER_TAB_PARTITIONS", ":1", ""),
+            DictionaryScopeMode::Dba => (
+                "DBA_TAB_PARTITIONS",
+                "TABLE_OWNER",
+                "WHERE TABLE_OWNER = :1",
+            ),
+        };
+        let sql = format!(
+            "
+            SELECT {owner_expression},
+                   TABLE_NAME,
+                   COMPOSITE,
+                   PARTITION_NAME,
+                   SUBPARTITION_COUNT,
+                   HIGH_VALUE_CLOB,
+                   HIGH_VALUE_LENGTH,
+                   PARTITION_POSITION,
+                   TABLESPACE_NAME,
+                   COMPRESSION,
+                   COMPRESS_FOR,
+                   INTERVAL,
+                   SEGMENT_CREATED,
+                   INDEXING,
+                   READ_ONLY
+            FROM {view}
+            {owner_filter}
+            ORDER BY TABLE_NAME, PARTITION_POSITION
+            "
+        );
+        for row in connection.query_as::<Row>(&sql, &[owner])? {
+            let (
+                owner,
+                table,
+                composite,
+                name,
+                subpartition_count,
+                high_value,
+                high_value_length,
+                position,
+                tablespace,
+                compression,
+                compress_for,
+                interval,
+                segment_created,
+                indexing,
+                read_only,
+            ) = row?;
+            let high_value = normalize_partition_high_value(
+                &owner,
+                &table,
+                &name,
+                high_value_length,
+                high_value,
+            )?;
+            partitions.push(RawTablePartition {
+                owner,
+                table,
+                composite: composite.trim().to_owned(),
+                name,
+                subpartition_count,
+                high_value,
+                high_value_length,
+                position,
+                tablespace: normalize_optional_token(tablespace),
+                compression: compression.trim().to_owned(),
+                compress_for: normalize_optional_token(compress_for),
+                interval: interval.trim().to_owned(),
+                segment_created: segment_created.trim().to_owned(),
+                indexing: indexing.trim().to_owned(),
+                read_only: read_only.trim().to_owned(),
+            });
+        }
+    }
+    partitions.sort_by(|left, right| {
+        (&left.owner, &left.table, left.position).cmp(&(&right.owner, &right.table, right.position))
+    });
+    Ok(partitions)
+}
+
+fn read_table_subpartitions(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawTableSubpartition>, CatalogError> {
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+    );
+    let mut subpartitions = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let (view, owner_expression, owner_filter) = match scope.mode {
+            DictionaryScopeMode::User => ("USER_TAB_SUBPARTITIONS", ":1", ""),
+            DictionaryScopeMode::Dba => (
+                "DBA_TAB_SUBPARTITIONS",
+                "TABLE_OWNER",
+                "WHERE TABLE_OWNER = :1",
+            ),
+        };
+        let sql = format!(
+            "
+            SELECT {owner_expression},
+                   TABLE_NAME,
+                   PARTITION_NAME,
+                   SUBPARTITION_NAME,
+                   HIGH_VALUE_CLOB,
+                   HIGH_VALUE_LENGTH,
+                   PARTITION_POSITION,
+                   SUBPARTITION_POSITION,
+                   TABLESPACE_NAME,
+                   COMPRESSION,
+                   COMPRESS_FOR,
+                   INTERVAL,
+                   SEGMENT_CREATED,
+                   INDEXING,
+                   READ_ONLY
+            FROM {view}
+            {owner_filter}
+            ORDER BY TABLE_NAME, PARTITION_POSITION, SUBPARTITION_POSITION
+            "
+        );
+        for row in connection.query_as::<Row>(&sql, &[owner])? {
+            let (
+                owner,
+                table,
+                partition,
+                name,
+                high_value,
+                high_value_length,
+                partition_position,
+                position,
+                tablespace,
+                compression,
+                compress_for,
+                interval,
+                segment_created,
+                indexing,
+                read_only,
+            ) = row?;
+            let high_value = normalize_partition_high_value(
+                &owner,
+                &table,
+                &name,
+                high_value_length,
+                high_value,
+            )?;
+            subpartitions.push(RawTableSubpartition {
+                owner,
+                table,
+                partition,
+                name,
+                high_value,
+                high_value_length,
+                partition_position,
+                position,
+                tablespace: normalize_optional_token(tablespace),
+                compression: compression.trim().to_owned(),
+                compress_for: normalize_optional_token(compress_for),
+                interval: interval.trim().to_owned(),
+                segment_created: segment_created.trim().to_owned(),
+                indexing: indexing.trim().to_owned(),
+                read_only: read_only.trim().to_owned(),
+            });
+        }
+    }
+    subpartitions.sort_by(|left, right| {
+        (
+            &left.owner,
+            &left.table,
+            left.partition_position,
+            left.position,
+        )
+            .cmp(&(
+                &right.owner,
+                &right.table,
+                right.partition_position,
+                right.position,
+            ))
+    });
+    Ok(subpartitions)
+}
+
+fn read_partitioned_indexes(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawPartitionedIndex>, CatalogError> {
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let mut indexes = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let (view, owner_expression, owner_filter) = match scope.mode {
+            DictionaryScopeMode::User => ("USER_PART_INDEXES", ":1", ""),
+            DictionaryScopeMode::Dba => ("DBA_PART_INDEXES", "OWNER", "WHERE OWNER = :1"),
+        };
+        let sql = format!(
+            "
+            SELECT {owner_expression},
+                   INDEX_NAME,
+                   TABLE_NAME,
+                   PARTITIONING_TYPE,
+                   SUBPARTITIONING_TYPE,
+                   PARTITION_COUNT,
+                   DEF_SUBPARTITION_COUNT,
+                   PARTITIONING_KEY_COUNT,
+                   SUBPARTITIONING_KEY_COUNT,
+                   LOCALITY,
+                   ALIGNMENT,
+                   DEF_TABLESPACE_NAME,
+                   INTERVAL,
+                   AUTOLIST,
+                   INTERVAL_SUBPARTITION,
+                   AUTOLIST_SUBPARTITION
+            FROM {view}
+            {owner_filter}
+            ORDER BY INDEX_NAME
+            "
+        );
+        for row in connection.query_as::<Row>(&sql, &[owner])? {
+            let (
+                owner,
+                index,
+                table,
+                partitioning_type,
+                subpartitioning_type,
+                partition_count,
+                default_subpartition_count,
+                partitioning_key_count,
+                subpartitioning_key_count,
+                locality,
+                alignment,
+                default_tablespace,
+                interval,
+                autolist,
+                interval_subpartition,
+                autolist_subpartition,
+            ) = row?;
+            indexes.push(RawPartitionedIndex {
+                owner,
+                index,
+                table,
+                partitioning_type: partitioning_type.trim().to_owned(),
+                subpartitioning_type: subpartitioning_type.trim().to_owned(),
+                partition_count,
+                default_subpartition_count,
+                partitioning_key_count,
+                subpartitioning_key_count,
+                locality: locality.trim().to_owned(),
+                alignment: alignment.trim().to_owned(),
+                default_tablespace: normalize_optional_token(default_tablespace),
+                interval: normalize_definition(interval)?,
+                autolist: normalize_optional_token(autolist),
+                interval_subpartition: normalize_definition(interval_subpartition)?,
+                autolist_subpartition: normalize_optional_token(autolist_subpartition),
+            });
+        }
+    }
+    indexes.sort_by(|left, right| (&left.owner, &left.index).cmp(&(&right.owner, &right.index)));
+    Ok(indexes)
+}
+
+fn read_index_partitions(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawIndexPartition>, CatalogError> {
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        i64,
+        Option<String>,
+        i64,
+        i64,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+    );
+    let mut partitions = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let (view, owner_expression, owner_filter) = match scope.mode {
+            DictionaryScopeMode::User => ("USER_IND_PARTITIONS", ":1", ""),
+            DictionaryScopeMode::Dba => (
+                "DBA_IND_PARTITIONS",
+                "INDEX_OWNER",
+                "WHERE INDEX_OWNER = :1",
+            ),
+        };
+        let sql = format!(
+            "
+            SELECT {owner_expression},
+                   INDEX_NAME,
+                   COMPOSITE,
+                   PARTITION_NAME,
+                   SUBPARTITION_COUNT,
+                   HIGH_VALUE_CLOB,
+                   HIGH_VALUE_LENGTH,
+                   PARTITION_POSITION,
+                   STATUS,
+                   TABLESPACE_NAME,
+                   COMPRESSION,
+                   INTERVAL,
+                   SEGMENT_CREATED
+            FROM {view}
+            {owner_filter}
+            ORDER BY INDEX_NAME, PARTITION_POSITION
+            "
+        );
+        for row in connection.query_as::<Row>(&sql, &[owner])? {
+            let (
+                owner,
+                index,
+                composite,
+                name,
+                subpartition_count,
+                high_value,
+                high_value_length,
+                position,
+                status,
+                tablespace,
+                compression,
+                interval,
+                segment_created,
+            ) = row?;
+            let high_value = normalize_partition_high_value(
+                &owner,
+                &index,
+                &name,
+                high_value_length,
+                high_value,
+            )?;
+            partitions.push(RawIndexPartition {
+                owner,
+                index,
+                composite: composite.trim().to_owned(),
+                name,
+                subpartition_count,
+                high_value,
+                high_value_length,
+                position,
+                status: status.trim().to_owned(),
+                tablespace: normalize_optional_token(tablespace),
+                compression: compression.trim().to_owned(),
+                interval: interval.trim().to_owned(),
+                segment_created: segment_created.trim().to_owned(),
+            });
+        }
+    }
+    partitions.sort_by(|left, right| {
+        (&left.owner, &left.index, left.position).cmp(&(&right.owner, &right.index, right.position))
+    });
+    Ok(partitions)
+}
+
+fn read_index_subpartitions(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawIndexSubpartition>, CatalogError> {
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+    );
+    let mut subpartitions = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let (view, owner_expression, owner_filter) = match scope.mode {
+            DictionaryScopeMode::User => ("USER_IND_SUBPARTITIONS", ":1", ""),
+            DictionaryScopeMode::Dba => (
+                "DBA_IND_SUBPARTITIONS",
+                "INDEX_OWNER",
+                "WHERE INDEX_OWNER = :1",
+            ),
+        };
+        let sql = format!(
+            "
+            SELECT {owner_expression},
+                   INDEX_NAME,
+                   PARTITION_NAME,
+                   SUBPARTITION_NAME,
+                   HIGH_VALUE_CLOB,
+                   HIGH_VALUE_LENGTH,
+                   PARTITION_POSITION,
+                   SUBPARTITION_POSITION,
+                   STATUS,
+                   TABLESPACE_NAME,
+                   COMPRESSION,
+                   INTERVAL,
+                   SEGMENT_CREATED
+            FROM {view}
+            {owner_filter}
+            ORDER BY INDEX_NAME, PARTITION_POSITION, SUBPARTITION_POSITION
+            "
+        );
+        for row in connection.query_as::<Row>(&sql, &[owner])? {
+            let (
+                owner,
+                index,
+                partition,
+                name,
+                high_value,
+                high_value_length,
+                partition_position,
+                position,
+                status,
+                tablespace,
+                compression,
+                interval,
+                segment_created,
+            ) = row?;
+            let high_value = normalize_partition_high_value(
+                &owner,
+                &index,
+                &name,
+                high_value_length,
+                high_value,
+            )?;
+            subpartitions.push(RawIndexSubpartition {
+                owner,
+                index,
+                partition,
+                name,
+                high_value,
+                high_value_length,
+                partition_position,
+                position,
+                status: status.trim().to_owned(),
+                tablespace: normalize_optional_token(tablespace),
+                compression: compression.trim().to_owned(),
+                interval: interval.trim().to_owned(),
+                segment_created: segment_created.trim().to_owned(),
+            });
+        }
+    }
+    subpartitions.sort_by(|left, right| {
+        (
+            &left.owner,
+            &left.index,
+            left.partition_position,
+            left.position,
+        )
+            .cmp(&(
+                &right.owner,
+                &right.index,
+                right.partition_position,
+                right.position,
+            ))
+    });
+    Ok(subpartitions)
+}
+
+fn read_partition_key_columns(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawPartitionKeyColumn>, CatalogError> {
+    let mut columns = Vec::new();
+    for subpartition in [false, true] {
+        for owner in &scope.owners {
+            prepare_call(connection, deadline)?;
+            let (view, owner_expression, owner_filter) = match (scope.mode, subpartition) {
+                (DictionaryScopeMode::User, false) => ("USER_PART_KEY_COLUMNS", ":1", ""),
+                (DictionaryScopeMode::User, true) => ("USER_SUBPART_KEY_COLUMNS", ":1", ""),
+                (DictionaryScopeMode::Dba, false) => {
+                    ("DBA_PART_KEY_COLUMNS", "OWNER", "WHERE OWNER = :1")
+                }
+                (DictionaryScopeMode::Dba, true) => {
+                    ("DBA_SUBPART_KEY_COLUMNS", "OWNER", "WHERE OWNER = :1")
+                }
+            };
+            let sql = format!(
+                "
+                SELECT {owner_expression},
+                       NAME,
+                       OBJECT_TYPE,
+                       COLUMN_NAME,
+                       COLUMN_POSITION,
+                       COLLATED_COLUMN_ID
+                FROM {view}
+                {owner_filter}
+                ORDER BY NAME, OBJECT_TYPE, COLUMN_POSITION
+                "
+            );
+            let rows = connection
+                .query_as::<(String, String, String, String, i64, Option<i64>)>(&sql, &[owner])?;
+            for row in rows {
+                let (owner, name, object_type, column, position, collated_column_id) = row?;
+                columns.push(RawPartitionKeyColumn {
+                    owner,
+                    name,
+                    object_type: object_type.trim().to_owned(),
+                    column,
+                    position,
+                    collated_column_id,
+                    subpartition,
+                });
+            }
+        }
+    }
+    columns.sort_by(|left, right| {
+        (
+            &left.owner,
+            &left.name,
+            &left.object_type,
+            left.subpartition,
+            left.position,
+        )
+            .cmp(&(
+                &right.owner,
+                &right.name,
+                &right.object_type,
+                right.subpartition,
+                right.position,
+            ))
+    });
+    Ok(columns)
+}
+
+fn normalize_partition_high_value(
+    owner: &str,
+    object: &str,
+    partition: &str,
+    length: i64,
+    value: Option<String>,
+) -> Result<Option<String>, CatalogError> {
+    if length < 0 {
+        return Err(CatalogError::Mapping(format!(
+            "Oracle partition {owner}.{object}.{partition} has negative high-value length"
+        )));
+    }
+    if length > MAX_DEFINITION_BYTES as i64 {
+        return Err(CatalogError::UnsupportedMetadata(format!(
+            "Oracle partition boundary exceeds the {MAX_DEFINITION_BYTES}-byte safety limit for {owner}.{object}.{partition}"
+        )));
+    }
+    normalize_definition(value)
+}
+
 fn read_dependencies(
     connection: &Connection,
     scope: &DictionaryScope,
@@ -4751,12 +5602,12 @@ fn validate_raw_catalog(
     raw: &RawOracleCatalog,
     scope: &DictionaryScope,
 ) -> Result<(), CatalogError> {
-    let inventory = raw
+    let inventory_all = raw
         .inventory
         .iter()
         .filter(|object| !object.secondary)
         .collect::<Vec<_>>();
-    let unsupported = inventory
+    let unsupported = inventory_all
         .iter()
         .filter(|object| {
             !matches!(
@@ -4774,6 +5625,10 @@ fn validate_raw_catalog(
                     | "SYNONYM"
                     | "TYPE"
                     | "TYPE BODY"
+                    | "TABLE PARTITION"
+                    | "TABLE SUBPARTITION"
+                    | "INDEX PARTITION"
+                    | "INDEX SUBPARTITION"
             )
         })
         .take(8)
@@ -4785,18 +5640,15 @@ fn validate_raw_catalog(
             unsupported.join(", ")
         )));
     }
-    if let Some(object) = inventory.iter().find(|object| object.subobject.is_some()) {
-        return Err(CatalogError::UnsupportedMetadata(format!(
-            "Oracle subobject inventory is not yet covered: {}.{} ({}, subobject {})",
-            object.owner,
-            object.name,
-            object.object_type,
-            object.subobject.as_deref().unwrap_or_default()
-        )));
-    }
+    let inventory = inventory_all
+        .iter()
+        .copied()
+        .filter(|object| object.subobject.is_none())
+        .collect::<Vec<_>>();
     let mut inventory_ids = BTreeSet::new();
     let mut inventory_keys = BTreeSet::new();
-    for object in &inventory {
+    let mut inventory_subobject_keys = BTreeSet::new();
+    for object in &inventory_all {
         ensure_owner(scope, &object.owner, "inventory object")?;
         if object.status != "VALID" {
             return Err(CatalogError::UnsupportedMetadata(format!(
@@ -4810,16 +5662,44 @@ fn validate_raw_catalog(
                 object.object_id
             )));
         }
-        let identity = (
-            object.owner.clone(),
-            object.object_type.clone(),
-            object.name.clone(),
+        let partition_subobject = matches!(
+            object.object_type.as_str(),
+            "TABLE PARTITION" | "TABLE SUBPARTITION" | "INDEX PARTITION" | "INDEX SUBPARTITION"
         );
-        if !inventory_keys.insert(identity.clone()) {
+        if partition_subobject != object.subobject.is_some() {
             return Err(CatalogError::Mapping(format!(
-                "duplicate Oracle inventory identity {}.{} ({})",
-                identity.0, identity.2, identity.1
+                "Oracle inventory subobject identity is inconsistent for {}.{} ({})",
+                object.owner, object.name, object.object_type
             )));
+        }
+        match object.subobject.as_deref() {
+            Some(subobject) => {
+                let identity = (
+                    object.owner.clone(),
+                    object.object_type.clone(),
+                    object.name.clone(),
+                    subobject.to_owned(),
+                );
+                if !inventory_subobject_keys.insert(identity.clone()) {
+                    return Err(CatalogError::Mapping(format!(
+                        "duplicate Oracle subobject inventory identity {}.{} ({}, {})",
+                        identity.0, identity.2, identity.1, identity.3
+                    )));
+                }
+            }
+            None => {
+                let identity = (
+                    object.owner.clone(),
+                    object.object_type.clone(),
+                    object.name.clone(),
+                );
+                if !inventory_keys.insert(identity.clone()) {
+                    return Err(CatalogError::Mapping(format!(
+                        "duplicate Oracle inventory identity {}.{} ({})",
+                        identity.0, identity.2, identity.1
+                    )));
+                }
+            }
         }
     }
 
@@ -4832,7 +5712,7 @@ fn validate_raw_catalog(
                 table.owner, table.name
             )));
         }
-        if table.partitioned || table.iot_type.is_some() || table.nested || table.external {
+        if table.iot_type.is_some() || table.nested || table.external {
             return Err(CatalogError::UnsupportedMetadata(format!(
                 "Oracle table shape is not yet covered for {}.{} (partitioned={}, iot_type={}, nested={}, external={})",
                 table.owner,
@@ -6593,7 +7473,7 @@ fn validate_raw_catalog(
                 index.owner, index.name, index.table_owner, index.table
             )));
         }
-        if index.index_type != "NORMAL" || index.partitioned || index.secondary {
+        if index.index_type != "NORMAL" || index.secondary {
             return Err(CatalogError::UnsupportedMetadata(format!(
                 "Oracle index shape is not yet covered for {}.{} (type={}, partitioned={}, secondary={})",
                 index.owner, index.name, index.index_type, index.partitioned, index.secondary
@@ -6650,7 +7530,730 @@ fn validate_raw_catalog(
         )));
     }
 
+    validate_partition_catalog(
+        raw,
+        scope,
+        &inventory_subobject_keys,
+        &tables,
+        &column_keys,
+        &indexes,
+    )?;
+
     Ok(())
+}
+
+fn validate_partition_catalog(
+    raw: &RawOracleCatalog,
+    scope: &DictionaryScope,
+    inventory_subobject_keys: &BTreeSet<(String, String, String, String)>,
+    tables: &BTreeSet<(String, String)>,
+    column_keys: &BTreeSet<(String, String, String)>,
+    indexes: &BTreeSet<(String, String)>,
+) -> Result<(), CatalogError> {
+    let raw_tables = raw
+        .tables
+        .iter()
+        .map(|table| ((table.owner.clone(), table.name.clone()), table))
+        .collect::<BTreeMap<_, _>>();
+    let expected_partitioned_tables = raw
+        .tables
+        .iter()
+        .filter(|table| table.partitioned)
+        .map(|table| (table.owner.clone(), table.name.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut partitioned_tables = BTreeMap::new();
+    for table in &raw.partitioned_tables {
+        ensure_owner(scope, &table.owner, "partitioned table")?;
+        if !tables.contains(&(table.owner.clone(), table.table.clone()))
+            || !raw_tables
+                .get(&(table.owner.clone(), table.table.clone()))
+                .is_some_and(|raw_table| raw_table.partitioned)
+        {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle partition metadata references non-partitioned table {}.{}",
+                table.owner, table.table
+            )));
+        }
+        ensure_partitioning_type(
+            &table.partitioning_type,
+            false,
+            &format!("Oracle table {}.{}", table.owner, table.table),
+        )?;
+        ensure_partitioning_type(
+            &table.subpartitioning_type,
+            true,
+            &format!("Oracle table {}.{}", table.owner, table.table),
+        )?;
+        if table.status != "VALID"
+            || table.partition_count <= 0
+            || table.partitioning_key_count <= 0
+            || table.default_subpartition_count < 0
+            || table.subpartitioning_key_count < 0
+        {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle partition header is malformed for {}.{}",
+                table.owner, table.table
+            )));
+        }
+        let has_subpartitions = table.subpartitioning_type != "NONE";
+        if has_subpartitions
+            != (table.default_subpartition_count > 0 && table.subpartitioning_key_count > 0)
+        {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle subpartition header is inconsistent for {}.{}",
+                table.owner, table.table
+            )));
+        }
+        for (name, value) in [
+            ("autolist", table.autolist.as_deref()),
+            (
+                "autolist_subpartition",
+                table.autolist_subpartition.as_deref(),
+            ),
+            ("auto", table.automatic.as_deref()),
+        ] {
+            if let Some(value) = value {
+                ensure_yes_no(
+                    value,
+                    &format!("Oracle table {}.{} {name}", table.owner, table.table),
+                )?;
+            }
+        }
+        let identity = (table.owner.clone(), table.table.clone());
+        if partitioned_tables.insert(identity.clone(), table).is_some() {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle partitioned-table header {}.{}",
+                identity.0, identity.1
+            )));
+        }
+    }
+    if partitioned_tables.keys().cloned().collect::<BTreeSet<_>>() != expected_partitioned_tables {
+        return Err(CatalogError::Mapping(
+            "Oracle USER/DBA_PART_TABLES does not exactly match partitioned USER/DBA_TABLES rows"
+                .to_owned(),
+        ));
+    }
+
+    let mut table_partitions_by_table =
+        BTreeMap::<(String, String), Vec<&RawTablePartition>>::new();
+    let mut table_partition_identities = BTreeMap::new();
+    for partition in &raw.table_partitions {
+        ensure_owner(scope, &partition.owner, "table partition")?;
+        let header = partitioned_tables
+            .get(&(partition.owner.clone(), partition.table.clone()))
+            .copied()
+            .ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle table partition {}.{}.{} has no partitioned-table header",
+                    partition.owner, partition.table, partition.name
+                ))
+            })?;
+        positive_u32(partition.position, "Oracle table partition position")?;
+        if partition.subpartition_count < 0
+            || !matches!(partition.composite.as_str(), "YES" | "NO")
+            || (partition.composite == "YES") != (header.subpartitioning_type != "NONE")
+        {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle table partition metadata is malformed for {}.{}.{}",
+                partition.owner, partition.table, partition.name
+            )));
+        }
+        if !inventory_subobject_keys.contains(&(
+            partition.owner.clone(),
+            "TABLE PARTITION".to_owned(),
+            partition.table.clone(),
+            partition.name.clone(),
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle table partition {}.{}.{} is missing from the independent object inventory",
+                partition.owner, partition.table, partition.name
+            )));
+        }
+        let identity = (
+            partition.owner.clone(),
+            partition.table.clone(),
+            partition.name.clone(),
+        );
+        if table_partition_identities
+            .insert(identity.clone(), partition)
+            .is_some()
+        {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle table partition {}.{}.{}",
+                identity.0, identity.1, identity.2
+            )));
+        }
+        table_partitions_by_table
+            .entry((partition.owner.clone(), partition.table.clone()))
+            .or_default()
+            .push(partition);
+    }
+    for (identity, header) in &partitioned_tables {
+        let partitions = table_partitions_by_table
+            .get(identity)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if partitions.len() != header.partition_count as usize {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle table partition count mismatch for {}.{}",
+                identity.0, identity.1
+            )));
+        }
+        ensure_contiguous_positions(
+            partitions.iter().map(|partition| partition.position),
+            &format!("Oracle table partitions {}.{}", identity.0, identity.1),
+        )?;
+    }
+    let inventory_table_partition_count = inventory_subobject_keys
+        .iter()
+        .filter(|key| key.1 == "TABLE PARTITION")
+        .count();
+    if inventory_table_partition_count != raw.table_partitions.len() {
+        return Err(CatalogError::Mapping(format!(
+            "Oracle table-partition inventory mismatch: USER/DBA_OBJECTS reports {inventory_table_partition_count}, USER/DBA_TAB_PARTITIONS reports {}",
+            raw.table_partitions.len()
+        )));
+    }
+
+    let mut table_subpartitions_by_partition =
+        BTreeMap::<(String, String, String), Vec<&RawTableSubpartition>>::new();
+    let mut table_subpartition_identities = BTreeSet::new();
+    for subpartition in &raw.table_subpartitions {
+        ensure_owner(scope, &subpartition.owner, "table subpartition")?;
+        let parent = table_partition_identities
+            .get(&(
+                subpartition.owner.clone(),
+                subpartition.table.clone(),
+                subpartition.partition.clone(),
+            ))
+            .copied()
+            .ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle table subpartition {}.{}.{} has no parent partition {}",
+                    subpartition.owner,
+                    subpartition.table,
+                    subpartition.name,
+                    subpartition.partition
+                ))
+            })?;
+        positive_u32(subpartition.position, "Oracle table subpartition position")?;
+        if subpartition.partition_position != parent.position {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle table subpartition parent position mismatch for {}.{}.{}",
+                subpartition.owner, subpartition.table, subpartition.name
+            )));
+        }
+        if !inventory_subobject_keys.contains(&(
+            subpartition.owner.clone(),
+            "TABLE SUBPARTITION".to_owned(),
+            subpartition.table.clone(),
+            subpartition.name.clone(),
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle table subpartition {}.{}.{} is missing from the independent object inventory",
+                subpartition.owner, subpartition.table, subpartition.name
+            )));
+        }
+        let identity = (
+            subpartition.owner.clone(),
+            subpartition.table.clone(),
+            subpartition.name.clone(),
+        );
+        if !table_subpartition_identities.insert(identity.clone()) {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle table subpartition {}.{}.{}",
+                identity.0, identity.1, identity.2
+            )));
+        }
+        table_subpartitions_by_partition
+            .entry((
+                subpartition.owner.clone(),
+                subpartition.table.clone(),
+                subpartition.partition.clone(),
+            ))
+            .or_default()
+            .push(subpartition);
+    }
+    for (identity, parent) in &table_partition_identities {
+        let subpartitions = table_subpartitions_by_partition
+            .get(identity)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if subpartitions.len() != parent.subpartition_count as usize {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle table subpartition count mismatch for {}.{}.{}",
+                identity.0, identity.1, identity.2
+            )));
+        }
+        ensure_contiguous_positions(
+            subpartitions
+                .iter()
+                .map(|subpartition| subpartition.position),
+            &format!(
+                "Oracle table subpartitions {}.{}.{}",
+                identity.0, identity.1, identity.2
+            ),
+        )?;
+    }
+    let inventory_table_subpartition_count = inventory_subobject_keys
+        .iter()
+        .filter(|key| key.1 == "TABLE SUBPARTITION")
+        .count();
+    if inventory_table_subpartition_count != raw.table_subpartitions.len() {
+        return Err(CatalogError::Mapping(format!(
+            "Oracle table-subpartition inventory mismatch: USER/DBA_OBJECTS reports {inventory_table_subpartition_count}, USER/DBA_TAB_SUBPARTITIONS reports {}",
+            raw.table_subpartitions.len()
+        )));
+    }
+
+    let raw_indexes = raw
+        .indexes
+        .iter()
+        .map(|index| ((index.owner.clone(), index.name.clone()), index))
+        .collect::<BTreeMap<_, _>>();
+    let expected_partitioned_indexes = raw
+        .indexes
+        .iter()
+        .filter(|index| index.partitioned)
+        .map(|index| (index.owner.clone(), index.name.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut partitioned_indexes = BTreeMap::new();
+    for index in &raw.partitioned_indexes {
+        ensure_owner(scope, &index.owner, "partitioned index")?;
+        if !indexes.contains(&(index.owner.clone(), index.index.clone())) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle partition metadata references missing index {}.{}",
+                index.owner, index.index
+            )));
+        }
+        let raw_index = raw_indexes
+            .get(&(index.owner.clone(), index.index.clone()))
+            .copied()
+            .ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle partitioned-index header has no index {}.{}",
+                    index.owner, index.index
+                ))
+            })?;
+        if !raw_index.partitioned || raw_index.table != index.table {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle partitioned-index header disagrees with USER/DBA_INDEXES for {}.{}",
+                index.owner, index.index
+            )));
+        }
+        ensure_partitioning_type(
+            &index.partitioning_type,
+            false,
+            &format!("Oracle index {}.{}", index.owner, index.index),
+        )?;
+        ensure_partitioning_type(
+            &index.subpartitioning_type,
+            true,
+            &format!("Oracle index {}.{}", index.owner, index.index),
+        )?;
+        if index.partition_count <= 0
+            || index.partitioning_key_count <= 0
+            || index.default_subpartition_count < 0
+            || index.subpartitioning_key_count < 0
+            || !matches!(index.locality.as_str(), "LOCAL" | "GLOBAL")
+            || !matches!(index.alignment.as_str(), "PREFIXED" | "NON_PREFIXED")
+        {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle partitioned-index header is malformed for {}.{}",
+                index.owner, index.index
+            )));
+        }
+        let has_subpartitions = index.subpartitioning_type != "NONE";
+        if has_subpartitions
+            != (index.default_subpartition_count > 0 && index.subpartitioning_key_count > 0)
+        {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle index subpartition header is inconsistent for {}.{}",
+                index.owner, index.index
+            )));
+        }
+        for (name, value) in [
+            ("autolist", index.autolist.as_deref()),
+            (
+                "autolist_subpartition",
+                index.autolist_subpartition.as_deref(),
+            ),
+        ] {
+            if let Some(value) = value {
+                ensure_yes_no(
+                    value,
+                    &format!("Oracle index {}.{} {name}", index.owner, index.index),
+                )?;
+            }
+        }
+        let identity = (index.owner.clone(), index.index.clone());
+        if partitioned_indexes
+            .insert(identity.clone(), index)
+            .is_some()
+        {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle partitioned-index header {}.{}",
+                identity.0, identity.1
+            )));
+        }
+    }
+    if partitioned_indexes.keys().cloned().collect::<BTreeSet<_>>() != expected_partitioned_indexes
+    {
+        return Err(CatalogError::Mapping(
+            "Oracle USER/DBA_PART_INDEXES does not exactly match partitioned USER/DBA_INDEXES rows"
+                .to_owned(),
+        ));
+    }
+
+    let mut index_partitions_by_index =
+        BTreeMap::<(String, String), Vec<&RawIndexPartition>>::new();
+    let mut index_partition_identities = BTreeMap::new();
+    for partition in &raw.index_partitions {
+        ensure_owner(scope, &partition.owner, "index partition")?;
+        let header = partitioned_indexes
+            .get(&(partition.owner.clone(), partition.index.clone()))
+            .copied()
+            .ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle index partition {}.{}.{} has no partitioned-index header",
+                    partition.owner, partition.index, partition.name
+                ))
+            })?;
+        positive_u32(partition.position, "Oracle index partition position")?;
+        if partition.subpartition_count < 0
+            || !matches!(partition.composite.as_str(), "YES" | "NO")
+            || (partition.composite == "YES") != (header.subpartitioning_type != "NONE")
+        {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle index partition metadata is malformed for {}.{}.{}",
+                partition.owner, partition.index, partition.name
+            )));
+        }
+        if !inventory_subobject_keys.contains(&(
+            partition.owner.clone(),
+            "INDEX PARTITION".to_owned(),
+            partition.index.clone(),
+            partition.name.clone(),
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle index partition {}.{}.{} is missing from the independent object inventory",
+                partition.owner, partition.index, partition.name
+            )));
+        }
+        let identity = (
+            partition.owner.clone(),
+            partition.index.clone(),
+            partition.name.clone(),
+        );
+        if index_partition_identities
+            .insert(identity.clone(), partition)
+            .is_some()
+        {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle index partition {}.{}.{}",
+                identity.0, identity.1, identity.2
+            )));
+        }
+        index_partitions_by_index
+            .entry((partition.owner.clone(), partition.index.clone()))
+            .or_default()
+            .push(partition);
+    }
+    for (identity, header) in &partitioned_indexes {
+        let partitions = index_partitions_by_index
+            .get(identity)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if partitions.len() != header.partition_count as usize {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle index partition count mismatch for {}.{}",
+                identity.0, identity.1
+            )));
+        }
+        ensure_contiguous_positions(
+            partitions.iter().map(|partition| partition.position),
+            &format!("Oracle index partitions {}.{}", identity.0, identity.1),
+        )?;
+    }
+    let inventory_index_partition_count = inventory_subobject_keys
+        .iter()
+        .filter(|key| key.1 == "INDEX PARTITION")
+        .count();
+    if inventory_index_partition_count != raw.index_partitions.len() {
+        return Err(CatalogError::Mapping(format!(
+            "Oracle index-partition inventory mismatch: USER/DBA_OBJECTS reports {inventory_index_partition_count}, USER/DBA_IND_PARTITIONS reports {}",
+            raw.index_partitions.len()
+        )));
+    }
+
+    let mut index_subpartitions_by_partition =
+        BTreeMap::<(String, String, String), Vec<&RawIndexSubpartition>>::new();
+    let mut index_subpartition_identities = BTreeSet::new();
+    for subpartition in &raw.index_subpartitions {
+        ensure_owner(scope, &subpartition.owner, "index subpartition")?;
+        let parent = index_partition_identities
+            .get(&(
+                subpartition.owner.clone(),
+                subpartition.index.clone(),
+                subpartition.partition.clone(),
+            ))
+            .copied()
+            .ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle index subpartition {}.{}.{} has no parent partition {}",
+                    subpartition.owner,
+                    subpartition.index,
+                    subpartition.name,
+                    subpartition.partition
+                ))
+            })?;
+        positive_u32(subpartition.position, "Oracle index subpartition position")?;
+        if subpartition.partition_position != parent.position {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle index subpartition parent position mismatch for {}.{}.{}",
+                subpartition.owner, subpartition.index, subpartition.name
+            )));
+        }
+        if !inventory_subobject_keys.contains(&(
+            subpartition.owner.clone(),
+            "INDEX SUBPARTITION".to_owned(),
+            subpartition.index.clone(),
+            subpartition.name.clone(),
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle index subpartition {}.{}.{} is missing from the independent object inventory",
+                subpartition.owner, subpartition.index, subpartition.name
+            )));
+        }
+        let identity = (
+            subpartition.owner.clone(),
+            subpartition.index.clone(),
+            subpartition.name.clone(),
+        );
+        if !index_subpartition_identities.insert(identity.clone()) {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle index subpartition {}.{}.{}",
+                identity.0, identity.1, identity.2
+            )));
+        }
+        index_subpartitions_by_partition
+            .entry((
+                subpartition.owner.clone(),
+                subpartition.index.clone(),
+                subpartition.partition.clone(),
+            ))
+            .or_default()
+            .push(subpartition);
+    }
+    for (identity, parent) in &index_partition_identities {
+        let subpartitions = index_subpartitions_by_partition
+            .get(identity)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if subpartitions.len() != parent.subpartition_count as usize {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle index subpartition count mismatch for {}.{}.{}",
+                identity.0, identity.1, identity.2
+            )));
+        }
+        ensure_contiguous_positions(
+            subpartitions
+                .iter()
+                .map(|subpartition| subpartition.position),
+            &format!(
+                "Oracle index subpartitions {}.{}.{}",
+                identity.0, identity.1, identity.2
+            ),
+        )?;
+    }
+    let inventory_index_subpartition_count = inventory_subobject_keys
+        .iter()
+        .filter(|key| key.1 == "INDEX SUBPARTITION")
+        .count();
+    if inventory_index_subpartition_count != raw.index_subpartitions.len() {
+        return Err(CatalogError::Mapping(format!(
+            "Oracle index-subpartition inventory mismatch: USER/DBA_OBJECTS reports {inventory_index_subpartition_count}, USER/DBA_IND_SUBPARTITIONS reports {}",
+            raw.index_subpartitions.len()
+        )));
+    }
+
+    let mut keys_by_object =
+        BTreeMap::<(String, String, String, bool), Vec<&RawPartitionKeyColumn>>::new();
+    let mut key_identities = BTreeSet::new();
+    for key_column in &raw.partition_key_columns {
+        ensure_owner(scope, &key_column.owner, "partition key column")?;
+        if !matches!(key_column.object_type.as_str(), "TABLE" | "INDEX") {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle partition key {}.{} has unsupported object type '{}'",
+                key_column.owner, key_column.name, key_column.object_type
+            )));
+        }
+        positive_u32(key_column.position, "Oracle partition key column position")?;
+        if key_column.collated_column_id.is_some_and(|id| id <= 0) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle partition key {}.{}.{} has invalid collated column id",
+                key_column.owner, key_column.name, key_column.column
+            )));
+        }
+        let target_table = if key_column.object_type == "TABLE" {
+            key_column.name.as_str()
+        } else {
+            raw_indexes
+                .get(&(key_column.owner.clone(), key_column.name.clone()))
+                .map(|index| index.table.as_str())
+                .ok_or_else(|| {
+                    CatalogError::Mapping(format!(
+                        "Oracle index partition key references missing index {}.{}",
+                        key_column.owner, key_column.name
+                    ))
+                })?
+        };
+        if !column_keys.contains(&(
+            key_column.owner.clone(),
+            target_table.to_owned(),
+            key_column.column.clone(),
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle partition key {}.{}.{} references a missing column",
+                key_column.owner, key_column.name, key_column.column
+            )));
+        }
+        let identity = (
+            key_column.owner.clone(),
+            key_column.name.clone(),
+            key_column.object_type.clone(),
+            key_column.subpartition,
+            key_column.position,
+        );
+        if !key_identities.insert(identity) {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle partition key position for {}.{}",
+                key_column.owner, key_column.name
+            )));
+        }
+        keys_by_object
+            .entry((
+                key_column.owner.clone(),
+                key_column.name.clone(),
+                key_column.object_type.clone(),
+                key_column.subpartition,
+            ))
+            .or_default()
+            .push(key_column);
+    }
+    for table in &raw.partitioned_tables {
+        for (subpartition, expected) in [
+            (false, table.partitioning_key_count),
+            (true, table.subpartitioning_key_count),
+        ] {
+            let key = (
+                table.owner.clone(),
+                table.table.clone(),
+                "TABLE".to_owned(),
+                subpartition,
+            );
+            let columns = keys_by_object
+                .get(&key)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if columns.len() != expected as usize {
+                return Err(CatalogError::Mapping(format!(
+                    "Oracle table partition-key count mismatch for {}.{}",
+                    table.owner, table.table
+                )));
+            }
+            ensure_contiguous_positions(
+                columns.iter().map(|column| column.position),
+                &format!(
+                    "Oracle table partition keys {}.{}",
+                    table.owner, table.table
+                ),
+            )?;
+        }
+    }
+    for index in &raw.partitioned_indexes {
+        for (subpartition, expected) in [
+            (false, index.partitioning_key_count),
+            (true, index.subpartitioning_key_count),
+        ] {
+            let key = (
+                index.owner.clone(),
+                index.index.clone(),
+                "INDEX".to_owned(),
+                subpartition,
+            );
+            let columns = keys_by_object
+                .get(&key)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if columns.len() != expected as usize {
+                return Err(CatalogError::Mapping(format!(
+                    "Oracle index partition-key count mismatch for {}.{}",
+                    index.owner, index.index
+                )));
+            }
+            ensure_contiguous_positions(
+                columns.iter().map(|column| column.position),
+                &format!(
+                    "Oracle index partition keys {}.{}",
+                    index.owner, index.index
+                ),
+            )?;
+        }
+    }
+    let expected_key_count = raw
+        .partitioned_tables
+        .iter()
+        .map(|table| table.partitioning_key_count + table.subpartitioning_key_count)
+        .chain(
+            raw.partitioned_indexes
+                .iter()
+                .map(|index| index.partitioning_key_count + index.subpartitioning_key_count),
+        )
+        .sum::<i64>();
+    if expected_key_count < 0 || raw.partition_key_columns.len() != expected_key_count as usize {
+        return Err(CatalogError::Mapping(
+            "Oracle partition-key catalogs contain unclaimed or missing rows".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn ensure_partitioning_type(
+    value: &str,
+    allow_none: bool,
+    subject: &str,
+) -> Result<(), CatalogError> {
+    if matches!(
+        value,
+        "RANGE" | "HASH" | "LIST" | "REFERENCE" | "SYSTEM" | "CONSISTENT HASH"
+    ) || (allow_none && value == "NONE")
+    {
+        Ok(())
+    } else {
+        Err(CatalogError::UnsupportedMetadata(format!(
+            "{subject} has unsupported partitioning type '{value}'"
+        )))
+    }
+}
+
+fn ensure_contiguous_positions(
+    positions: impl Iterator<Item = i64>,
+    subject: &str,
+) -> Result<(), CatalogError> {
+    let positions = positions.collect::<Vec<_>>();
+    if positions
+        .iter()
+        .enumerate()
+        .all(|(offset, position)| *position == (offset + 1) as i64)
+    {
+        Ok(())
+    } else {
+        Err(CatalogError::Mapping(format!(
+            "{subject} do not have contiguous 1-based positions"
+        )))
+    }
 }
 
 fn ensure_owner(scope: &DictionaryScope, owner: &str, subject: &str) -> Result<(), CatalogError> {
@@ -6759,7 +8362,7 @@ impl<'a> OracleSnapshotMapper<'a> {
         let inventory = raw
             .inventory
             .iter()
-            .filter(|object| !object.secondary)
+            .filter(|object| !object.secondary && object.subobject.is_none())
             .map(|object| {
                 (
                     (
@@ -6770,6 +8373,32 @@ impl<'a> OracleSnapshotMapper<'a> {
                     object,
                 )
             })
+            .collect::<BTreeMap<_, _>>();
+        let subobject_inventory = raw
+            .inventory
+            .iter()
+            .filter(|object| !object.secondary)
+            .filter_map(|object| {
+                Some((
+                    (
+                        object.owner.clone(),
+                        object.object_type.clone(),
+                        object.name.clone(),
+                        object.subobject.clone()?,
+                    ),
+                    object,
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let partitioned_tables = raw
+            .partitioned_tables
+            .iter()
+            .map(|table| ((table.owner.clone(), table.table.clone()), table))
+            .collect::<BTreeMap<_, _>>();
+        let partitioned_indexes = raw
+            .partitioned_indexes
+            .iter()
+            .map(|index| ((index.owner.clone(), index.index.clone()), index))
             .collect::<BTreeMap<_, _>>();
 
         let collection_by_type = raw
@@ -7247,7 +8876,9 @@ impl<'a> OracleSnapshotMapper<'a> {
                 key: key.clone(),
                 schema_key: schema_key.clone(),
                 name: table.name.clone(),
-                kind: if table.temporary {
+                kind: if table.partitioned {
+                    TableKind::Partitioned
+                } else if table.temporary {
                     TableKind::Temporary
                 } else {
                     TableKind::BaseTable
@@ -7266,6 +8897,15 @@ impl<'a> OracleSnapshotMapper<'a> {
             insert_bool(&mut properties, "read_only", table.read_only);
             insert_bool(&mut properties, "has_identity", table.has_identity);
             insert_optional_string(&mut properties, "duration", table.duration.as_deref());
+            if let Some(partitioning) =
+                partitioned_tables.get(&(table.owner.clone(), table.name.clone()))
+            {
+                add_oracle_partitioned_table_properties(
+                    &mut properties,
+                    partitioning,
+                    &raw.partition_key_columns,
+                );
+            }
             metadata.annotations.push(ObjectAnnotation {
                 object_key: key,
                 definition: None,
@@ -8815,6 +10455,7 @@ impl<'a> OracleSnapshotMapper<'a> {
             })
             .collect::<BTreeSet<_>>();
         let mut indexes = Vec::new();
+        let mut index_keys = BTreeMap::new();
         for index in &raw.indexes {
             let inventory_object = required(
                 inventory.get(&(index.owner.clone(), "INDEX".to_owned(), index.name.clone())),
@@ -8823,7 +10464,16 @@ impl<'a> OracleSnapshotMapper<'a> {
                     index.owner, index.name
                 ),
             )?;
-            let properties = oracle_index_properties(index, inventory_object);
+            let mut properties = oracle_index_properties(index, inventory_object);
+            if let Some(partitioning) =
+                partitioned_indexes.get(&(index.owner.clone(), index.name.clone()))
+            {
+                add_oracle_partitioned_index_properties(
+                    &mut properties,
+                    partitioning,
+                    &raw.partition_key_columns,
+                );
+            }
             if let Some(materialized_view_key) =
                 materialized_view_keys.get(&(index.table_owner.clone(), index.table.clone()))
             {
@@ -8835,6 +10485,7 @@ impl<'a> OracleSnapshotMapper<'a> {
                     &index.table,
                     Some(index.name.clone()),
                 );
+                index_keys.insert((index.owner.clone(), index.name.clone()), key.clone());
                 metadata.objects.push(MetadataObject {
                     key: key.clone(),
                     parent_key: Some(materialized_view_key.clone()),
@@ -8883,6 +10534,7 @@ impl<'a> OracleSnapshotMapper<'a> {
                 &index.table,
                 Some(index.name.clone()),
             );
+            index_keys.insert((index.owner.clone(), index.name.clone()), key.clone());
             let index_columns = resolve_named_columns(
                 &index.table_owner,
                 &index.table,
@@ -8904,6 +10556,196 @@ impl<'a> OracleSnapshotMapper<'a> {
                 object_key: key,
                 definition: None,
                 properties,
+            });
+        }
+
+        let mut table_partition_keys = BTreeMap::new();
+        for partition in &raw.table_partitions {
+            let parent_key = match materialized_view_keys
+                .get(&(partition.owner.clone(), partition.table.clone()))
+            {
+                Some(key) => key,
+                None => required(
+                    table_keys.get(&(partition.owner.clone(), partition.table.clone())),
+                    format!(
+                        "parent table for Oracle partition {}.{}.{}",
+                        partition.owner, partition.table, partition.name
+                    ),
+                )?,
+            };
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &partition.owner,
+                ObjectKind::Extension,
+                &partition.table,
+                Some(format!("partition:{}", partition.name)),
+            );
+            let inventory_object = required(
+                subobject_inventory.get(&(
+                    partition.owner.clone(),
+                    "TABLE PARTITION".to_owned(),
+                    partition.table.clone(),
+                    partition.name.clone(),
+                )),
+                format!(
+                    "inventory row for Oracle table partition {}.{}.{}",
+                    partition.owner, partition.table, partition.name
+                ),
+            )?;
+            table_partition_keys.insert(
+                (
+                    partition.owner.clone(),
+                    partition.table.clone(),
+                    partition.name.clone(),
+                ),
+                key.clone(),
+            );
+            metadata.objects.push(MetadataObject {
+                key,
+                parent_key: Some(parent_key.clone()),
+                name: partition.name.clone(),
+                extension_kind: Some("oracle_table_partition".to_owned()),
+                definition: partition.high_value.clone(),
+                properties: oracle_table_partition_properties(partition, inventory_object),
+            });
+        }
+        for subpartition in &raw.table_subpartitions {
+            let parent_key = required(
+                table_partition_keys.get(&(
+                    subpartition.owner.clone(),
+                    subpartition.table.clone(),
+                    subpartition.partition.clone(),
+                )),
+                format!(
+                    "parent partition for Oracle table subpartition {}.{}.{}",
+                    subpartition.owner, subpartition.table, subpartition.name
+                ),
+            )?;
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &subpartition.owner,
+                ObjectKind::Extension,
+                &subpartition.table,
+                Some(format!(
+                    "partition:{}:subpartition:{}",
+                    subpartition.partition, subpartition.name
+                )),
+            );
+            let inventory_object = required(
+                subobject_inventory.get(&(
+                    subpartition.owner.clone(),
+                    "TABLE SUBPARTITION".to_owned(),
+                    subpartition.table.clone(),
+                    subpartition.name.clone(),
+                )),
+                format!(
+                    "inventory row for Oracle table subpartition {}.{}.{}",
+                    subpartition.owner, subpartition.table, subpartition.name
+                ),
+            )?;
+            metadata.objects.push(MetadataObject {
+                key,
+                parent_key: Some(parent_key.clone()),
+                name: subpartition.name.clone(),
+                extension_kind: Some("oracle_table_subpartition".to_owned()),
+                definition: subpartition.high_value.clone(),
+                properties: oracle_table_subpartition_properties(subpartition, inventory_object),
+            });
+        }
+
+        let mut index_partition_keys = BTreeMap::new();
+        for partition in &raw.index_partitions {
+            let parent_key = required(
+                index_keys.get(&(partition.owner.clone(), partition.index.clone())),
+                format!(
+                    "parent index for Oracle partition {}.{}.{}",
+                    partition.owner, partition.index, partition.name
+                ),
+            )?;
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &partition.owner,
+                ObjectKind::Extension,
+                &parent_key.object_name,
+                Some(format!(
+                    "index:{}:partition:{}",
+                    partition.index, partition.name
+                )),
+            );
+            let inventory_object = required(
+                subobject_inventory.get(&(
+                    partition.owner.clone(),
+                    "INDEX PARTITION".to_owned(),
+                    partition.index.clone(),
+                    partition.name.clone(),
+                )),
+                format!(
+                    "inventory row for Oracle index partition {}.{}.{}",
+                    partition.owner, partition.index, partition.name
+                ),
+            )?;
+            index_partition_keys.insert(
+                (
+                    partition.owner.clone(),
+                    partition.index.clone(),
+                    partition.name.clone(),
+                ),
+                key.clone(),
+            );
+            metadata.objects.push(MetadataObject {
+                key,
+                parent_key: Some(parent_key.clone()),
+                name: partition.name.clone(),
+                extension_kind: Some("oracle_index_partition".to_owned()),
+                definition: partition.high_value.clone(),
+                properties: oracle_index_partition_properties(partition, inventory_object),
+            });
+        }
+        for subpartition in &raw.index_subpartitions {
+            let parent_key = required(
+                index_partition_keys.get(&(
+                    subpartition.owner.clone(),
+                    subpartition.index.clone(),
+                    subpartition.partition.clone(),
+                )),
+                format!(
+                    "parent partition for Oracle index subpartition {}.{}.{}",
+                    subpartition.owner, subpartition.index, subpartition.name
+                ),
+            )?;
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &subpartition.owner,
+                ObjectKind::Extension,
+                &parent_key.object_name,
+                Some(format!(
+                    "index:{}:partition:{}:subpartition:{}",
+                    subpartition.index, subpartition.partition, subpartition.name
+                )),
+            );
+            let inventory_object = required(
+                subobject_inventory.get(&(
+                    subpartition.owner.clone(),
+                    "INDEX SUBPARTITION".to_owned(),
+                    subpartition.index.clone(),
+                    subpartition.name.clone(),
+                )),
+                format!(
+                    "inventory row for Oracle index subpartition {}.{}.{}",
+                    subpartition.owner, subpartition.index, subpartition.name
+                ),
+            )?;
+            metadata.objects.push(MetadataObject {
+                key,
+                parent_key: Some(parent_key.clone()),
+                name: subpartition.name.clone(),
+                extension_kind: Some("oracle_index_subpartition".to_owned()),
+                definition: subpartition.high_value.clone(),
+                properties: oracle_index_subpartition_properties(subpartition, inventory_object),
             });
         }
 
@@ -9234,7 +11076,7 @@ impl<'a> OracleSnapshotMapper<'a> {
                 CapabilityCheck {
                     name: "independent_inventory_reconciliation".to_owned(),
                     evidence: format!(
-                        "{} non-secondary USER/DBA_OBJECTS rows reconciled against table, index, sequence, view, materialized-view, synonym, type, trigger, routine, and package detail catalogs",
+                        "{} non-secondary USER/DBA_OBJECTS rows reconciled against table, index, partition, sequence, view, materialized-view, synonym, type, trigger, routine, and package detail catalogs",
                         raw.inventory.iter().filter(|object| !object.secondary).count()
                     ),
                 },
@@ -9393,6 +11235,317 @@ fn oracle_index_properties(
                 .map(|column| column.name.clone())
                 .collect(),
         ),
+    );
+    properties
+}
+
+fn add_oracle_partitioned_table_properties(
+    properties: &mut BTreeMap<String, MetadataValue>,
+    table: &RawPartitionedTable,
+    key_columns: &[RawPartitionKeyColumn],
+) {
+    insert_bool(properties, "partitioned", true);
+    insert_string(properties, "partitioning_type", &table.partitioning_type);
+    insert_string(
+        properties,
+        "subpartitioning_type",
+        &table.subpartitioning_type,
+    );
+    insert_i64(properties, "partition_count", table.partition_count);
+    insert_i64(
+        properties,
+        "default_subpartition_count",
+        table.default_subpartition_count,
+    );
+    insert_optional_string(
+        properties,
+        "default_partition_tablespace",
+        table.default_tablespace.as_deref(),
+    );
+    insert_optional_string(properties, "partition_interval", table.interval.as_deref());
+    insert_optional_string(properties, "autolist", table.autolist.as_deref());
+    insert_optional_string(
+        properties,
+        "subpartition_interval",
+        table.interval_subpartition.as_deref(),
+    );
+    insert_optional_string(
+        properties,
+        "subpartition_autolist",
+        table.autolist_subpartition.as_deref(),
+    );
+    insert_optional_string(properties, "automatic", table.automatic.as_deref());
+    properties.insert(
+        "partition_key_columns".to_owned(),
+        MetadataValue::StringList(oracle_partition_key_names(
+            key_columns,
+            &table.owner,
+            &table.table,
+            "TABLE",
+            false,
+        )),
+    );
+    properties.insert(
+        "subpartition_key_columns".to_owned(),
+        MetadataValue::StringList(oracle_partition_key_names(
+            key_columns,
+            &table.owner,
+            &table.table,
+            "TABLE",
+            true,
+        )),
+    );
+    let collated =
+        oracle_partition_collated_columns(key_columns, &table.owner, &table.table, "TABLE");
+    if !collated.is_empty() {
+        properties.insert(
+            "collated_partition_key_columns".to_owned(),
+            MetadataValue::StringList(collated),
+        );
+    }
+}
+
+fn add_oracle_partitioned_index_properties(
+    properties: &mut BTreeMap<String, MetadataValue>,
+    index: &RawPartitionedIndex,
+    key_columns: &[RawPartitionKeyColumn],
+) {
+    insert_bool(properties, "partitioned", true);
+    insert_string(properties, "partitioning_type", &index.partitioning_type);
+    insert_string(
+        properties,
+        "subpartitioning_type",
+        &index.subpartitioning_type,
+    );
+    insert_i64(properties, "partition_count", index.partition_count);
+    insert_i64(
+        properties,
+        "default_subpartition_count",
+        index.default_subpartition_count,
+    );
+    insert_string(properties, "locality", &index.locality);
+    insert_string(properties, "alignment", &index.alignment);
+    insert_optional_string(
+        properties,
+        "default_partition_tablespace",
+        index.default_tablespace.as_deref(),
+    );
+    insert_optional_string(properties, "partition_interval", index.interval.as_deref());
+    insert_optional_string(properties, "autolist", index.autolist.as_deref());
+    insert_optional_string(
+        properties,
+        "subpartition_interval",
+        index.interval_subpartition.as_deref(),
+    );
+    insert_optional_string(
+        properties,
+        "subpartition_autolist",
+        index.autolist_subpartition.as_deref(),
+    );
+    properties.insert(
+        "partition_key_columns".to_owned(),
+        MetadataValue::StringList(oracle_partition_key_names(
+            key_columns,
+            &index.owner,
+            &index.index,
+            "INDEX",
+            false,
+        )),
+    );
+    properties.insert(
+        "subpartition_key_columns".to_owned(),
+        MetadataValue::StringList(oracle_partition_key_names(
+            key_columns,
+            &index.owner,
+            &index.index,
+            "INDEX",
+            true,
+        )),
+    );
+    let collated =
+        oracle_partition_collated_columns(key_columns, &index.owner, &index.index, "INDEX");
+    if !collated.is_empty() {
+        properties.insert(
+            "collated_partition_key_columns".to_owned(),
+            MetadataValue::StringList(collated),
+        );
+    }
+}
+
+fn oracle_partition_key_names(
+    key_columns: &[RawPartitionKeyColumn],
+    owner: &str,
+    name: &str,
+    object_type: &str,
+    subpartition: bool,
+) -> Vec<String> {
+    key_columns
+        .iter()
+        .filter(|column| {
+            column.owner == owner
+                && column.name == name
+                && column.object_type == object_type
+                && column.subpartition == subpartition
+        })
+        .map(|column| column.column.clone())
+        .collect()
+}
+
+fn oracle_partition_collated_columns(
+    key_columns: &[RawPartitionKeyColumn],
+    owner: &str,
+    name: &str,
+    object_type: &str,
+) -> Vec<String> {
+    key_columns
+        .iter()
+        .filter(|column| {
+            column.owner == owner && column.name == name && column.object_type == object_type
+        })
+        .filter_map(|column| Some(format!("{}={}", column.column, column.collated_column_id?)))
+        .collect()
+}
+
+fn oracle_table_partition_properties(
+    partition: &RawTablePartition,
+    inventory: &RawInventoryObject,
+) -> BTreeMap<String, MetadataValue> {
+    let mut properties = inventory_properties(inventory);
+    insert_i64(&mut properties, "position", partition.position);
+    insert_bool(&mut properties, "composite", partition.composite == "YES");
+    insert_i64(
+        &mut properties,
+        "subpartition_count",
+        partition.subpartition_count,
+    );
+    insert_i64(
+        &mut properties,
+        "high_value_length",
+        partition.high_value_length,
+    );
+    insert_optional_string(
+        &mut properties,
+        "tablespace",
+        partition.tablespace.as_deref(),
+    );
+    insert_string(&mut properties, "compression", &partition.compression);
+    insert_optional_string(
+        &mut properties,
+        "compress_for",
+        partition.compress_for.as_deref(),
+    );
+    insert_string(&mut properties, "interval", &partition.interval);
+    insert_string(
+        &mut properties,
+        "segment_created",
+        &partition.segment_created,
+    );
+    insert_string(&mut properties, "indexing", &partition.indexing);
+    insert_string(&mut properties, "read_only", &partition.read_only);
+    properties
+}
+
+fn oracle_table_subpartition_properties(
+    subpartition: &RawTableSubpartition,
+    inventory: &RawInventoryObject,
+) -> BTreeMap<String, MetadataValue> {
+    let mut properties = inventory_properties(inventory);
+    insert_string(&mut properties, "partition", &subpartition.partition);
+    insert_i64(
+        &mut properties,
+        "partition_position",
+        subpartition.partition_position,
+    );
+    insert_i64(&mut properties, "position", subpartition.position);
+    insert_i64(
+        &mut properties,
+        "high_value_length",
+        subpartition.high_value_length,
+    );
+    insert_optional_string(
+        &mut properties,
+        "tablespace",
+        subpartition.tablespace.as_deref(),
+    );
+    insert_string(&mut properties, "compression", &subpartition.compression);
+    insert_optional_string(
+        &mut properties,
+        "compress_for",
+        subpartition.compress_for.as_deref(),
+    );
+    insert_string(&mut properties, "interval", &subpartition.interval);
+    insert_string(
+        &mut properties,
+        "segment_created",
+        &subpartition.segment_created,
+    );
+    insert_string(&mut properties, "indexing", &subpartition.indexing);
+    insert_string(&mut properties, "read_only", &subpartition.read_only);
+    properties
+}
+
+fn oracle_index_partition_properties(
+    partition: &RawIndexPartition,
+    inventory: &RawInventoryObject,
+) -> BTreeMap<String, MetadataValue> {
+    let mut properties = inventory_properties(inventory);
+    insert_i64(&mut properties, "position", partition.position);
+    insert_bool(&mut properties, "composite", partition.composite == "YES");
+    insert_i64(
+        &mut properties,
+        "subpartition_count",
+        partition.subpartition_count,
+    );
+    insert_i64(
+        &mut properties,
+        "high_value_length",
+        partition.high_value_length,
+    );
+    insert_string(&mut properties, "partition_status", &partition.status);
+    insert_optional_string(
+        &mut properties,
+        "tablespace",
+        partition.tablespace.as_deref(),
+    );
+    insert_string(&mut properties, "compression", &partition.compression);
+    insert_string(&mut properties, "interval", &partition.interval);
+    insert_string(
+        &mut properties,
+        "segment_created",
+        &partition.segment_created,
+    );
+    properties
+}
+
+fn oracle_index_subpartition_properties(
+    subpartition: &RawIndexSubpartition,
+    inventory: &RawInventoryObject,
+) -> BTreeMap<String, MetadataValue> {
+    let mut properties = inventory_properties(inventory);
+    insert_string(&mut properties, "partition", &subpartition.partition);
+    insert_i64(
+        &mut properties,
+        "partition_position",
+        subpartition.partition_position,
+    );
+    insert_i64(&mut properties, "position", subpartition.position);
+    insert_i64(
+        &mut properties,
+        "high_value_length",
+        subpartition.high_value_length,
+    );
+    insert_string(&mut properties, "partition_status", &subpartition.status);
+    insert_optional_string(
+        &mut properties,
+        "tablespace",
+        subpartition.tablespace.as_deref(),
+    );
+    insert_string(&mut properties, "compression", &subpartition.compression);
+    insert_string(&mut properties, "interval", &subpartition.interval);
+    insert_string(
+        &mut properties,
+        "segment_created",
+        &subpartition.segment_created,
     );
     properties
 }
@@ -10173,7 +12326,11 @@ fn discovery_counts_from_catalog(
     set_object_count(
         &mut objects,
         ObjectCategory::Extension,
-        raw.type_attributes.len(),
+        raw.type_attributes.len()
+            + raw.table_partitions.len()
+            + raw.table_subpartitions.len()
+            + raw.index_partitions.len()
+            + raw.index_subpartitions.len(),
     );
     set_object_count(&mut objects, ObjectCategory::Trigger, raw.triggers.len());
     set_object_count(
@@ -10316,6 +12473,10 @@ fn discovery_counts_from_catalog(
             + raw.synonyms.len()
             + raw.user_types.len()
             + raw.type_attributes.len()
+            + raw.table_partitions.len()
+            + raw.table_subpartitions.len()
+            + raw.index_partitions.len()
+            + raw.index_subpartitions.len()
             + raw.type_methods.len()
             + raw.type_method_parameters.len()
             + raw.view_columns.len()
@@ -10659,6 +12820,24 @@ mod tests {
             .expect("create typed-column table");
         setup
             .execute(
+                "CREATE TABLE PARTITIONED_EVENTS (ID NUMBER, EVENT_DATE DATE, REGION VARCHAR2(10), PAYLOAD VARCHAR2(50)) PARTITION BY RANGE (EVENT_DATE) SUBPARTITION BY HASH (REGION) SUBPARTITIONS 2 (PARTITION P_2025 VALUES LESS THAN (DATE '2026-01-01'), PARTITION P_MAX VALUES LESS THAN (MAXVALUE))",
+                &[],
+            )
+            .expect("create composite-partitioned table");
+        setup
+            .execute(
+                "CREATE INDEX IX_PART_EVENTS_LOCAL ON PARTITIONED_EVENTS (EVENT_DATE) LOCAL",
+                &[],
+            )
+            .expect("create local composite-partitioned index");
+        setup
+            .execute(
+                "CREATE INDEX IX_PART_EVENTS_GLOBAL ON PARTITIONED_EVENTS (ID) GLOBAL PARTITION BY RANGE (ID) (PARTITION IP_LOW VALUES LESS THAN (1000), PARTITION IP_MAX VALUES LESS THAN (MAXVALUE))",
+                &[],
+            )
+            .expect("create global partitioned index");
+        setup
+            .execute(
                 "CREATE VIEW ACTIVE_PARENT AS SELECT ID, CODE FROM PARENT_ENTITY WHERE ID > 0",
                 &[],
             )
@@ -10715,7 +12894,7 @@ mod tests {
         let certified = complete
             .certified_snapshot()
             .expect("simple Oracle schema must be certified");
-        assert_eq!(certified.snapshot.schema.tables.len(), 3);
+        assert_eq!(certified.snapshot.schema.tables.len(), 4);
         assert!(certified
             .snapshot
             .schema
@@ -10931,6 +13110,113 @@ mod tests {
                 .count(),
             2
         );
+        let partitioned_table = certified
+            .snapshot
+            .schema
+            .tables
+            .iter()
+            .find(|table| table.name == "PARTITIONED_EVENTS")
+            .expect("partitioned table is mapped");
+        assert_eq!(partitioned_table.kind, TableKind::Partitioned);
+        let partitioned_table_annotation = certified
+            .snapshot
+            .metadata
+            .annotations
+            .iter()
+            .find(|annotation| annotation.object_key == partitioned_table.key)
+            .expect("partitioned table annotation is mapped");
+        assert!(matches!(
+            partitioned_table_annotation
+                .properties
+                .get("partition_key_columns"),
+            Some(MetadataValue::StringList(columns)) if columns == &["EVENT_DATE"]
+        ));
+        assert!(matches!(
+            partitioned_table_annotation
+                .properties
+                .get("subpartition_key_columns"),
+            Some(MetadataValue::StringList(columns)) if columns == &["REGION"]
+        ));
+        let table_partitions = certified
+            .snapshot
+            .metadata
+            .objects
+            .iter()
+            .filter(|object| {
+                object.extension_kind.as_deref() == Some("oracle_table_partition")
+                    && object.parent_key.as_ref() == Some(&partitioned_table.key)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(table_partitions.len(), 2);
+        assert!(table_partitions.iter().any(|partition| {
+            partition.name == "P_MAX" && partition.definition.as_deref() == Some("MAXVALUE")
+        }));
+        assert_eq!(
+            certified
+                .snapshot
+                .metadata
+                .objects
+                .iter()
+                .filter(|object| {
+                    object.extension_kind.as_deref() == Some("oracle_table_subpartition")
+                        && object.parent_key.as_ref().is_some_and(|parent| {
+                            table_partitions
+                                .iter()
+                                .any(|partition| partition.key == *parent)
+                        })
+                })
+                .count(),
+            4
+        );
+        for (index_name, locality, partition_count, subpartition_count) in [
+            ("IX_PART_EVENTS_LOCAL", "LOCAL", 2, 4),
+            ("IX_PART_EVENTS_GLOBAL", "GLOBAL", 2, 0),
+        ] {
+            let index = certified
+                .snapshot
+                .schema
+                .indexes
+                .iter()
+                .find(|index| index.name == index_name)
+                .expect("partitioned index is mapped");
+            let annotation = certified
+                .snapshot
+                .metadata
+                .annotations
+                .iter()
+                .find(|annotation| annotation.object_key == index.key)
+                .expect("partitioned index annotation is mapped");
+            assert!(matches!(
+                annotation.properties.get("locality"),
+                Some(MetadataValue::String(value)) if value == locality
+            ));
+            let partitions = certified
+                .snapshot
+                .metadata
+                .objects
+                .iter()
+                .filter(|object| {
+                    object.extension_kind.as_deref() == Some("oracle_index_partition")
+                        && object.parent_key.as_ref() == Some(&index.key)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(partitions.len(), partition_count);
+            assert_eq!(
+                certified
+                    .snapshot
+                    .metadata
+                    .objects
+                    .iter()
+                    .filter(|object| {
+                        object.extension_kind.as_deref() == Some("oracle_index_subpartition")
+                            && object.parent_key.as_ref().is_some_and(|parent| {
+                                partitions.iter().any(|partition| partition.key == *parent)
+                            })
+                    })
+                    .count(),
+                subpartition_count
+            );
+        }
         let package = certified
             .snapshot
             .metadata
@@ -11033,7 +13319,7 @@ mod tests {
         let certified = complete
             .certified_snapshot()
             .expect("Oracle materialized-view schema must be certified");
-        assert_eq!(certified.snapshot.schema.tables.len(), 3);
+        assert_eq!(certified.snapshot.schema.tables.len(), 4);
         assert!(certified
             .snapshot
             .schema
