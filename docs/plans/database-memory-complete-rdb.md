@@ -312,14 +312,15 @@ Completed:
   type, display value, and raw value preservation.
 - Cross-schema foreign-key scope rejection/acceptance and live bounded-timeout
   proof across the four-version matrix.
+- A shared cooperative `CancellationToken` at the introspection port. Every
+  native adapter checks cancellation at lifecycle boundaries, SQLite interrupts
+  VM work through its progress handler, and SQL Server races its async discovery
+  future against cancellation. Cancelled work emits no snapshot.
 
 Remaining before Phase 6 completion:
 
 - Live certification for selected Azure SQL Database and Azure SQL Managed
   Instance variants; unsupported engine editions continue to fail closed.
-- A shared cancellation signal in the cross-product introspection port; the
-  SQL Server timeout path is already live-certified and never emits partial
-  snapshots.
 
 Verification:
 
@@ -333,6 +334,8 @@ Rollback:
 - Disable SQL Server v2 certification.
 
 ### Phase 7: Oracle Completeness
+
+Status: Complete (2026-07-22)
 
 Goal:
 
