@@ -229,7 +229,7 @@ fn parse_index_args(
 
     match source.as_str() {
         "sqlite" | "ddl-sqlite" if path.is_none() => return Err("missing --path".to_owned()),
-        "postgres" | "mysql" | "mariadb" | "sqlserver" | "oracle"
+        "postgres" | "yugabytedb" | "mysql" | "mariadb" | "sqlserver" | "oracle"
             if connection_string.is_none() =>
         {
             return Err("missing --connection-string".to_owned());
@@ -538,6 +538,7 @@ fn inventory_usage() -> &'static str {
 fn usage() -> &'static str {
     "usage: database-memory contract [--format text|json]\n       database-memory index --source sqlite --path <db> --alias <name> [--format text|json] [--cache-path <path>] [--config-path <path>]\n       database-memory index --source ddl-sqlite --path <sql-file-or-dir> --alias <name> [--format text|json] [--cache-path <path>]
        database-memory index --source postgres --connection-string <url> --alias <name> [--format text|json] [--cache-path <path>]
+       database-memory index --source yugabytedb --connection-string <url> --alias <name> [--format text|json] [--cache-path <path>]
        database-memory index --source mysql --connection-string <url> --alias <name> [--format text|json] [--cache-path <path>]
        database-memory index --source mariadb --connection-string <url> --alias <name> [--format text|json] [--cache-path <path>]
        database-memory index --source sqlserver --connection-string <ado-connection-string> --alias <name> [--format text|json] [--cache-path <path>]
@@ -592,6 +593,31 @@ mod tests {
                 path: Some(PathBuf::from("sample.sqlite")),
                 connection_string: None,
                 alias: "sample".to_owned(),
+                format: OutputFormat::Text,
+                cache_path: PathBuf::from(".database-memory").join("graph.sqlite"),
+            }
+        );
+
+        assert_eq!(
+            parse_args(
+                [
+                    "index",
+                    "--source",
+                    "yugabytedb",
+                    "--connection-string",
+                    "postgresql://yugabyte@localhost:5433/yugabyte",
+                    "--alias",
+                    "yb-local",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+            )
+            .unwrap(),
+            Command::Index {
+                source: "yugabytedb".to_owned(),
+                path: None,
+                connection_string: Some("postgresql://yugabyte@localhost:5433/yugabyte".to_owned()),
+                alias: "yb-local".to_owned(),
                 format: OutputFormat::Text,
                 cache_path: PathBuf::from(".database-memory").join("graph.sqlite"),
             }

@@ -49,6 +49,11 @@ pub fn introspect_schema_source(
             adapters::postgres::introspect_postgres(connection_string, alias)
                 .map_err(|err| redact::redact_error_with_connection_string(err, connection_string))
         }
+        "yugabytedb" => {
+            let connection_string = connection_string.ok_or("missing connection_string")?;
+            adapters::yugabytedb::introspect_yugabytedb(connection_string, alias)
+                .map_err(|err| redact::redact_error_with_connection_string(err, connection_string))
+        }
         "mysql" | "mariadb" => {
             let connection_string = connection_string.ok_or("missing connection_string")?;
             adapters::mysql::introspect_mysql(connection_string, alias)
@@ -65,7 +70,7 @@ pub fn introspect_schema_source(
                 .map_err(|err| redact::redact_error_with_connection_string(err, connection_string))
         }
         unsupported_source => Err(format!(
-            "source '{unsupported_source}' is not supported; supported sources: sqlite, ddl-sqlite, postgres, mysql, mariadb, sqlserver, oracle"
+            "source '{unsupported_source}' is not supported; supported sources: sqlite, ddl-sqlite, postgres, yugabytedb, mysql, mariadb, sqlserver, oracle"
         )),
     }
 }
@@ -576,6 +581,7 @@ mod tests {
                 "postgres-catalog",
                 include_str!("adapters/postgres_catalog.rs"),
             ),
+            ("yugabytedb", include_str!("adapters/yugabytedb.rs")),
             ("mysql", include_str!("adapters/mysql.rs")),
             ("mysql-catalog", include_str!("adapters/mysql_catalog.rs")),
             ("odbc", include_str!("adapters/odbc.rs")),
@@ -627,6 +633,13 @@ mod tests {
             adapters::postgres::introspect_postgres_complete_scoped_with_cancellation(
                 "not-a-postgres-url",
                 "postgres-cancelled",
+                Vec::new(),
+                30_000,
+                &cancellation,
+            ),
+            adapters::yugabytedb::introspect_yugabytedb_complete_scoped_with_cancellation(
+                "not-a-yugabytedb-url",
+                "yugabytedb-cancelled",
                 Vec::new(),
                 30_000,
                 &cancellation,

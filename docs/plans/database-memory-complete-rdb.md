@@ -416,6 +416,9 @@ Rollback:
 
 ### Phase 8: Generic ODBC And Additional RDB Certification
 
+Status: In Progress (ODBC capability negotiation and the SQL Server bridge are
+complete; YugabyteDB YSQL 2025.2.3.2 is complete; DB2 is deferred)
+
 Goal:
 
 - Make the support boundary open-ended without false universal claims.
@@ -427,10 +430,31 @@ Deliverables:
 - Native extension hook and certification fixtures for additional products,
   beginning with DB2 and one PostgreSQL-compatible distributed RDB.
 
+Completed slices:
+
+- Generic ODBC support reports exact driver-declared versus runtime-call-verified
+  capabilities and fails closed for an unprovable common contract.
+- The SQL Server ODBC strategy delegates authoritative discovery to the native
+  certified SQL Server adapter after runtime metadata-call verification.
+- YugabyteDB YSQL `15.12-YB-2025.2.3.2-b0` (container image
+  `yugabytedb/yugabyte:2025.2.3.2-b1`) has its own product Strategy. It preserves
+  tablet/hash-key facts, range split clauses, database/table colocation,
+  tablegroups, tablespaces, and placement options without treating
+  PostgreSQL-wire compatibility as PostgreSQL certification.
+
+Deferred boundary:
+
+- DB2 certification has not started because available runtime/container paths
+  require a separate IBM license/EULA decision. The owner declined accepting
+  that responsibility. No DB2 driver, image, or license terms are accepted by
+  this project until the owner explicitly changes that decision.
+
 Verification:
 
 ```powershell
 cargo test --workspace odbc -- --nocapture
+$env:DATABASE_MEMORY_TEST_YUGABYTE_URL='postgresql://yugabyte@127.0.0.1:15443/yugabyte?sslmode=disable'
+cargo test -p database-memory-core yugabytedb -- --nocapture --test-threads=1
 ```
 
 Rollback:

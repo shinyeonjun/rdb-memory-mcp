@@ -35,29 +35,67 @@ const MAX_SUPPORTED_MAJOR: i32 = 18;
 const MAX_INTROSPECTION_TIMEOUT_MS: u64 = 86_400_000;
 const MAX_DEFINITION_BYTES: i32 = 1_048_576;
 const MAX_PROPERTY_STRING_BYTES: i32 = 65_536;
+const YUGABYTEDB_SOURCE: &str = "yugabytedb";
+const CERTIFIED_YUGABYTEDB_VERSION: &str = "15.12-YB-2025.2.3.2-b0";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PgWireProduct {
+    PostgreSql,
+    YugabyteDb,
+}
+
+impl PgWireProduct {
+    const fn source_kind(self) -> &'static str {
+        match self {
+            Self::PostgreSql => POSTGRES_SOURCE,
+            Self::YugabyteDb => YUGABYTEDB_SOURCE,
+        }
+    }
+
+    const fn display_name(self) -> &'static str {
+        match self {
+            Self::PostgreSql => "PostgreSQL",
+            Self::YugabyteDb => "YugabyteDB YSQL",
+        }
+    }
+}
 
 pub(crate) struct PostgresCatalogAdapter {
     connection_string: String,
+    expected_product: PgWireProduct,
 }
 
 impl PostgresCatalogAdapter {
     pub(crate) fn new(connection_string: impl Into<String>) -> Self {
         Self {
             connection_string: connection_string.into(),
+            expected_product: PgWireProduct::PostgreSql,
+        }
+    }
+
+    pub(crate) fn new_yugabytedb(connection_string: impl Into<String>) -> Self {
+        Self {
+            connection_string: connection_string.into(),
+            expected_product: PgWireProduct::YugabyteDb,
         }
     }
 }
 
 impl CatalogIntrospector for PostgresCatalogAdapter {
     fn source_kind(&self) -> &'static str {
-        POSTGRES_SOURCE
+        self.expected_product.source_kind()
     }
 
     fn discover(
         &mut self,
         request: &IntrospectionRequest,
     ) -> Result<CatalogDiscovery, AnalysisFailure> {
-        discover_postgres(&self.connection_string, request, &CancellationToken::new())
+        discover_postgres(
+            &self.connection_string,
+            request,
+            &CancellationToken::new(),
+            self.expected_product,
+        )
     }
 
     fn discover_with_cancellation(
@@ -65,7 +103,12 @@ impl CatalogIntrospector for PostgresCatalogAdapter {
         request: &IntrospectionRequest,
         cancellation: &CancellationToken,
     ) -> Result<CatalogDiscovery, AnalysisFailure> {
-        discover_postgres(&self.connection_string, request, cancellation)
+        discover_postgres(
+            &self.connection_string,
+            request,
+            cancellation,
+            self.expected_product,
+        )
     }
 }
 
@@ -73,27 +116,48 @@ fn discover_postgres(
     connection_string: &str,
     request: &IntrospectionRequest,
     cancellation: &CancellationToken,
+    expected_product: PgWireProduct,
 ) -> Result<CatalogDiscovery, AnalysisFailure> {
+    let source_kind = expected_product.source_kind();
     cancellation.checkpoint(
-        POSTGRES_SOURCE,
+        source_kind,
         &request.connection_alias,
         AnalysisStage::Configuration,
     )?;
-    validate_request(request)?;
-    let mut config = Config::from_str(connection_string)
-        .map_err(|error| connection_failure(request, connection_string, error.to_string()))?;
-    validate_transport_policy(request, connection_string, &config)?;
+    validate_request(request, expected_product)?;
+    let mut config = Config::from_str(connection_string).map_err(|error| {
+        connection_failure(
+            request,
+            connection_string,
+            error.to_string(),
+            expected_product,
+        )
+    })?;
+    validate_transport_policy(request, connection_string, &config, expected_product)?;
     config.connect_timeout(Duration::from_millis(request.timeout_ms));
     let tls = native_tls::TlsConnector::builder()
         .build()
-        .map_err(|error| connection_failure(request, connection_string, error.to_string()))?;
+        .map_err(|error| {
+            connection_failure(
+                request,
+                connection_string,
+                error.to_string(),
+                expected_product,
+            )
+        })?;
     let mut client = config
         .connect(MakeTlsConnector::new(tls))
         .map_err(|error| {
-            classify_postgres_error(request, connection_string, error, AnalysisStage::Connection)
+            classify_postgres_error(
+                request,
+                connection_string,
+                error,
+                AnalysisStage::Connection,
+                expected_product,
+            )
         })?;
     cancellation.checkpoint(
-        POSTGRES_SOURCE,
+        source_kind,
         &request.connection_alias,
         AnalysisStage::Connection,
     )?;
@@ -108,6 +172,7 @@ fn discover_postgres(
                 connection_string,
                 error,
                 AnalysisStage::CapabilityProbe,
+                expected_product,
             )
         })?;
     let timeout = format!("{}ms", request.timeout_ms);
@@ -122,6 +187,7 @@ fn discover_postgres(
                 connection_string,
                 error,
                 AnalysisStage::CapabilityProbe,
+                expected_product,
             )
         })?;
     transaction
@@ -132,31 +198,38 @@ fn discover_postgres(
                 connection_string,
                 error,
                 AnalysisStage::CapabilityProbe,
+                expected_product,
             )
         })?;
     cancellation.checkpoint(
-        POSTGRES_SOURCE,
+        source_kind,
         &request.connection_alias,
         AnalysisStage::CapabilityProbe,
     )?;
 
-    let raw = RawPostgresCatalog::read(&mut transaction, request)
-        .map_err(|error| catalog_failure(request, connection_string, error))?;
+    let raw = RawPostgresCatalog::read(&mut transaction, request, expected_product)
+        .map_err(|error| catalog_failure(request, connection_string, error, expected_product))?;
     cancellation.checkpoint(
-        POSTGRES_SOURCE,
+        source_kind,
         &request.connection_alias,
         AnalysisStage::Discovery,
     )?;
-    let discovery = PostgresSnapshotMapper::new(&request.connection_alias)
+    let discovery = PostgresSnapshotMapper::new(&request.connection_alias, source_kind)
         .map(raw)
-        .map_err(|error| catalog_failure(request, connection_string, error))?;
+        .map_err(|error| catalog_failure(request, connection_string, error, expected_product))?;
     cancellation.checkpoint(
-        POSTGRES_SOURCE,
+        source_kind,
         &request.connection_alias,
         AnalysisStage::Mapping,
     )?;
     transaction.commit().map_err(|error| {
-        classify_postgres_error(request, connection_string, error, AnalysisStage::Discovery)
+        classify_postgres_error(
+            request,
+            connection_string,
+            error,
+            AnalysisStage::Discovery,
+            expected_product,
+        )
     })?;
     Ok(discovery)
 }
@@ -193,6 +266,38 @@ pub(crate) fn analyze_postgres_with_cancellation(
         .analyze_with_cancellation(&request, cancellation)
 }
 
+pub(crate) fn analyze_yugabytedb(
+    connection_string: &str,
+    connection_alias: &str,
+    requested_schemas: Vec<String>,
+    timeout_ms: u64,
+) -> AnalysisOutcome {
+    analyze_yugabytedb_with_cancellation(
+        connection_string,
+        connection_alias,
+        requested_schemas,
+        timeout_ms,
+        &CancellationToken::new(),
+    )
+}
+
+pub(crate) fn analyze_yugabytedb_with_cancellation(
+    connection_string: &str,
+    connection_alias: &str,
+    requested_schemas: Vec<String>,
+    timeout_ms: u64,
+    cancellation: &CancellationToken,
+) -> AnalysisOutcome {
+    let request = IntrospectionRequest {
+        connection_alias: connection_alias.to_owned(),
+        requested_catalogs: Vec::new(),
+        requested_schemas,
+        timeout_ms,
+    };
+    DatabaseAnalysisService::new(PostgresCatalogAdapter::new_yugabytedb(connection_string))
+        .analyze_with_cancellation(&request, cancellation)
+}
+
 #[derive(Debug)]
 enum CatalogError {
     Query(postgres::Error),
@@ -200,6 +305,7 @@ enum CatalogError {
     PermissionDenied(String),
     UnsupportedProduct(String),
     UnsupportedVersion(i32),
+    UnsupportedRelease(String),
     UnsupportedMetadata(String),
     Mapping(String),
 }
@@ -210,15 +316,20 @@ impl From<postgres::Error> for CatalogError {
     }
 }
 
-fn validate_request(request: &IntrospectionRequest) -> Result<(), AnalysisFailure> {
+fn validate_request(
+    request: &IntrospectionRequest,
+    product: PgWireProduct,
+) -> Result<(), AnalysisFailure> {
+    let source_kind = product.source_kind();
+    let product_name = product.display_name();
     if request.timeout_ms > MAX_INTROSPECTION_TIMEOUT_MS {
         return Err(AnalysisFailure::redacted(
             AnalysisFailureCode::InvalidConfiguration,
             AnalysisStage::Configuration,
-            POSTGRES_SOURCE,
+            source_kind,
             &request.connection_alias,
             format!(
-                "PostgreSQL introspection timeout exceeds the {MAX_INTROSPECTION_TIMEOUT_MS} ms safety limit"
+                "{product_name} introspection timeout exceeds the {MAX_INTROSPECTION_TIMEOUT_MS} ms safety limit"
             ),
             "choose a timeout between 1 ms and 86400000 ms",
             false,
@@ -241,9 +352,9 @@ fn validate_request(request: &IntrospectionRequest) -> Result<(), AnalysisFailur
         return Err(AnalysisFailure::redacted(
             AnalysisFailureCode::InvalidConfiguration,
             AnalysisStage::Configuration,
-            POSTGRES_SOURCE,
+            source_kind,
             &request.connection_alias,
-            "PostgreSQL scope contains duplicate catalog or schema names",
+            format!("{product_name} scope contains duplicate catalog or schema names"),
             "provide each requested catalog and schema exactly once",
             false,
             None,
@@ -256,6 +367,7 @@ fn validate_transport_policy(
     request: &IntrospectionRequest,
     connection_string: &str,
     config: &Config,
+    product: PgWireProduct,
 ) -> Result<(), AnalysisFailure> {
     let has_remote_tcp_host = config.get_hosts().iter().any(|host| match host {
         Host::Tcp(host) => !is_loopback_host(host),
@@ -266,9 +378,12 @@ fn validate_transport_policy(
         return Err(AnalysisFailure::redacted(
             AnalysisFailureCode::UnsafeSource,
             AnalysisStage::Configuration,
-            POSTGRES_SOURCE,
+            product.source_kind(),
             &request.connection_alias,
-            "remote PostgreSQL connections require sslmode=require to prevent plaintext fallback",
+            format!(
+                "remote {} connections require sslmode=require to prevent plaintext fallback",
+                product.display_name()
+            ),
             "set sslmode=require and use a certificate trusted by the operating system",
             false,
             Some(connection_string),
@@ -289,14 +404,18 @@ fn connection_failure(
     request: &IntrospectionRequest,
     connection_string: &str,
     message: String,
+    product: PgWireProduct,
 ) -> AnalysisFailure {
     AnalysisFailure::redacted(
         AnalysisFailureCode::ConnectionFailed,
         AnalysisStage::Connection,
-        POSTGRES_SOURCE,
+        product.source_kind(),
         &request.connection_alias,
         message,
-        "verify the PostgreSQL connection settings, network path, and TLS policy",
+        format!(
+            "verify the {} connection settings, network path, and TLS policy",
+            product.display_name()
+        ),
         true,
         Some(connection_string),
     )
@@ -307,13 +426,14 @@ fn classify_postgres_error(
     connection_string: &str,
     error: postgres::Error,
     stage: AnalysisStage,
+    product: PgWireProduct,
 ) -> AnalysisFailure {
     let message = postgres_error_message(&error);
     let (code, retryable, remediation) = match error.code() {
         Some(code) if code == &SqlState::INVALID_PASSWORD => (
             AnalysisFailureCode::AuthenticationFailed,
             false,
-            "verify the PostgreSQL principal and secret",
+            "verify the database principal and secret",
         ),
         Some(code) if code == &SqlState::INSUFFICIENT_PRIVILEGE => (
             AnalysisFailureCode::PermissionDenied,
@@ -328,18 +448,18 @@ fn classify_postgres_error(
         _ if stage == AnalysisStage::Connection => (
             AnalysisFailureCode::ConnectionFailed,
             true,
-            "verify the PostgreSQL endpoint and retry",
+            "verify the database endpoint and retry",
         ),
         _ => (
             AnalysisFailureCode::MetadataQueryFailed,
             true,
-            "inspect the PostgreSQL server state and retry the metadata-only analysis",
+            "inspect the database server state and retry the metadata-only analysis",
         ),
     };
     AnalysisFailure::redacted(
         code,
         stage,
-        POSTGRES_SOURCE,
+        product.source_kind(),
         &request.connection_alias,
         message,
         remediation,
@@ -374,6 +494,7 @@ fn catalog_failure(
     request: &IntrospectionRequest,
     connection_string: &str,
     error: CatalogError,
+    product: PgWireProduct,
 ) -> AnalysisFailure {
     match error {
         CatalogError::Query(error) => classify_postgres_error(
@@ -381,11 +502,12 @@ fn catalog_failure(
             connection_string,
             error,
             AnalysisStage::Discovery,
+            product,
         ),
         CatalogError::InvalidScope(message) => AnalysisFailure::redacted(
             AnalysisFailureCode::InvalidConfiguration,
             AnalysisStage::CapabilityProbe,
-            POSTGRES_SOURCE,
+            product.source_kind(),
             &request.connection_alias,
             message,
             "request the current database and existing non-system schemas",
@@ -395,7 +517,7 @@ fn catalog_failure(
         CatalogError::PermissionDenied(message) => AnalysisFailure::redacted(
             AnalysisFailureCode::PermissionDenied,
             AnalysisStage::CapabilityProbe,
-            POSTGRES_SOURCE,
+            product.source_kind(),
             &request.connection_alias,
             message,
             "grant metadata visibility for every requested schema and retry",
@@ -405,7 +527,7 @@ fn catalog_failure(
         CatalogError::UnsupportedProduct(message) => AnalysisFailure::redacted(
             AnalysisFailureCode::UnsupportedProduct,
             AnalysisStage::CapabilityProbe,
-            POSTGRES_SOURCE,
+            product.source_kind(),
             &request.connection_alias,
             message,
             "select the matching product adapter; PostgreSQL compatibility is not PostgreSQL certification",
@@ -415,19 +537,29 @@ fn catalog_failure(
         CatalogError::UnsupportedVersion(major) => AnalysisFailure::redacted(
             AnalysisFailureCode::UnsupportedVersion,
             AnalysisStage::CapabilityProbe,
-            POSTGRES_SOURCE,
+            product.source_kind(),
             &request.connection_alias,
             format!(
                 "PostgreSQL major version {major} is outside the certified {MIN_SUPPORTED_MAJOR}-{MAX_SUPPORTED_MAJOR} range"
             ),
-            "use a certified PostgreSQL version or add and verify a version strategy",
+            "use a certified product version or add and verify a product-specific version strategy",
+            false,
+            Some(connection_string),
+        ),
+        CatalogError::UnsupportedRelease(message) => AnalysisFailure::redacted(
+            AnalysisFailureCode::UnsupportedVersion,
+            AnalysisStage::CapabilityProbe,
+            product.source_kind(),
+            &request.connection_alias,
+            message,
+            "use an exact live-certified product release or add and verify a new release strategy",
             false,
             Some(connection_string),
         ),
         CatalogError::UnsupportedMetadata(message) => AnalysisFailure::redacted(
             AnalysisFailureCode::UnsupportedMetadata,
             AnalysisStage::CapabilityProbe,
-            POSTGRES_SOURCE,
+            product.source_kind(),
             &request.connection_alias,
             message,
             "remove the unprovable construct or use a catalog-tracked definition, then re-index",
@@ -437,10 +569,13 @@ fn catalog_failure(
         CatalogError::Mapping(message) => AnalysisFailure::redacted(
             AnalysisFailureCode::MetadataMappingFailed,
             AnalysisStage::Mapping,
-            POSTGRES_SOURCE,
+            product.source_kind(),
             &request.connection_alias,
             message,
-            "fix the adapter mapping for every discovered PostgreSQL object before retrying",
+            format!(
+                "fix the adapter mapping for every discovered {} object before retrying",
+                product.display_name()
+            ),
             false,
             Some(connection_string),
         ),
@@ -500,7 +635,7 @@ impl PostgresCatalogVersion {
         }
     }
 
-    fn strategy_name(self) -> &'static str {
+    const fn strategy_name(self) -> &'static str {
         match self {
             Self::V14 => "postgresql-14",
             Self::V15 => "postgresql-15",
@@ -535,6 +670,86 @@ impl PostgresCatalogVersion {
                 "{} returned unsupported pg_attribute.attstattarget value {value}",
                 self.strategy_name()
             ))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PgCatalogStrategy {
+    PostgreSql(PostgresCatalogVersion),
+    YugabyteDb2025_2_3_2,
+}
+
+impl PgCatalogStrategy {
+    fn detect(product: PgWireProduct, server: &ServerFacts) -> Result<Self, CatalogError> {
+        let version = server.version.trim();
+        let banner = server.version_banner.trim();
+        let yugabyte = version.to_ascii_uppercase().contains("-YB-")
+            || banner.to_ascii_uppercase().contains("-YB-");
+
+        match product {
+            PgWireProduct::PostgreSql if yugabyte => Err(CatalogError::UnsupportedProduct(
+                format!(
+                    "connected product is YugabyteDB YSQL ({version}), not certified PostgreSQL"
+                ),
+            )),
+            PgWireProduct::PostgreSql if !banner.starts_with("PostgreSQL ") => {
+                let reported = banner.split_whitespace().next().unwrap_or("unknown");
+                Err(CatalogError::UnsupportedProduct(format!(
+                    "connected product reports '{reported}', not certified PostgreSQL"
+                )))
+            }
+            PgWireProduct::PostgreSql => Ok(Self::PostgreSql(
+                PostgresCatalogVersion::detect(server.version_num)?,
+            )),
+            PgWireProduct::YugabyteDb if !yugabyte => {
+                Err(CatalogError::UnsupportedProduct(format!(
+                    "connected product reports '{banner}', not YugabyteDB YSQL"
+                )))
+            }
+            PgWireProduct::YugabyteDb
+                if version != CERTIFIED_YUGABYTEDB_VERSION || server.version_num != 150_012 =>
+            {
+                Err(CatalogError::UnsupportedRelease(format!(
+                    "YugabyteDB YSQL release '{version}' is not the certified {CERTIFIED_YUGABYTEDB_VERSION} release"
+                )))
+            }
+            PgWireProduct::YugabyteDb => Ok(Self::YugabyteDb2025_2_3_2),
+        }
+    }
+
+    const fn catalog_version(self) -> PostgresCatalogVersion {
+        match self {
+            Self::PostgreSql(version) => version,
+            Self::YugabyteDb2025_2_3_2 => PostgresCatalogVersion::V15,
+        }
+    }
+
+    const fn strategy_name(self) -> &'static str {
+        match self {
+            Self::PostgreSql(version) => version.strategy_name(),
+            Self::YugabyteDb2025_2_3_2 => "yugabytedb-2025.2.3.2-pg15",
+        }
+    }
+
+    const fn source_kind(self) -> &'static str {
+        match self {
+            Self::PostgreSql(_) => POSTGRES_SOURCE,
+            Self::YugabyteDb2025_2_3_2 => YUGABYTEDB_SOURCE,
+        }
+    }
+
+    const fn product_name(self) -> &'static str {
+        match self {
+            Self::PostgreSql(_) => "PostgreSQL",
+            Self::YugabyteDb2025_2_3_2 => "YugabyteDB",
+        }
+    }
+
+    const fn adapter_name(self) -> &'static str {
+        match self {
+            Self::PostgreSql(_) => "database-memory-postgres-catalog",
+            Self::YugabyteDb2025_2_3_2 => "database-memory-yugabytedb-catalog",
         }
     }
 }
@@ -836,9 +1051,51 @@ struct RawEventTrigger {
 }
 
 #[derive(Clone, Debug)]
+struct RawYugabyteRelationProperties {
+    relation_oid: i64,
+    relation_kind: char,
+    tablespace_oid: i64,
+    num_tablets: Option<i64>,
+    num_hash_key_columns: Option<i64>,
+    is_colocated: Option<bool>,
+    tablegroup_oid: Option<i64>,
+    colocation_id: Option<i64>,
+    range_split_clause: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RawYugabyteTablegroup {
+    oid: i64,
+    name: String,
+    owner_oid: i64,
+    tablespace_oid: i64,
+    acl: Vec<String>,
+    options: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RawYugabyteTablespace {
+    oid: i64,
+    name: String,
+    owner_oid: i64,
+    acl: Vec<String>,
+    options: Vec<String>,
+    comment: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RawYugabyteCatalog {
+    database_colocated: bool,
+    database_default_tablespace_oid: i64,
+    relation_properties: Vec<RawYugabyteRelationProperties>,
+    tablegroups: Vec<RawYugabyteTablegroup>,
+    tablespaces: Vec<RawYugabyteTablespace>,
+}
+
+#[derive(Clone, Debug)]
 struct RawPostgresCatalog {
     server: ServerFacts,
-    catalog_version: PostgresCatalogVersion,
+    strategy: PgCatalogStrategy,
     schemas: Vec<RawSchema>,
     principals: Vec<RawPrincipal>,
     relations: Vec<RawRelation>,
@@ -859,26 +1116,31 @@ struct RawPostgresCatalog {
     policies: Vec<RawPolicy>,
     extensions: Vec<RawExtension>,
     event_triggers: Vec<RawEventTrigger>,
+    yugabyte: Option<RawYugabyteCatalog>,
 }
 
 struct PostgresSnapshotMapper<'a> {
     connection_alias: &'a str,
+    source_kind: &'static str,
 }
 
 impl RawPostgresCatalog {
     fn read(
         client: &mut impl GenericClient,
         request: &IntrospectionRequest,
+        expected_product: PgWireProduct,
     ) -> Result<Self, CatalogError> {
         let server = read_server_facts(client)?;
-        validate_postgres_product_identity(&server.version, &server.version_banner)?;
-        let catalog_version = PostgresCatalogVersion::detect(server.version_num)?;
+        let strategy = PgCatalogStrategy::detect(expected_product, &server)?;
+        let catalog_version = strategy.catalog_version();
         if !request.requested_catalogs.is_empty()
             && request.requested_catalogs != [server.database.clone()]
         {
             return Err(CatalogError::InvalidScope(format!(
-                "this PostgreSQL connection can certify only current database '{}', requested {:?}",
-                server.database, request.requested_catalogs
+                "this {} connection can certify only current database '{}', requested {:?}",
+                strategy.product_name(),
+                server.database,
+                request.requested_catalogs
             )));
         }
 
@@ -898,7 +1160,8 @@ impl RawPostgresCatalog {
             .collect::<Vec<_>>();
         if !missing.is_empty() {
             return Err(CatalogError::InvalidScope(format!(
-                "requested PostgreSQL schemas do not exist or are system schemas: {}",
+                "requested {} schemas do not exist or are system schemas: {}",
+                strategy.product_name(),
                 missing.join(", ")
             )));
         }
@@ -911,9 +1174,10 @@ impl RawPostgresCatalog {
                 .collect()
         };
         if schemas.is_empty() {
-            return Err(CatalogError::InvalidScope(
-                "PostgreSQL scope contains no non-system schemas".to_owned(),
-            ));
+            return Err(CatalogError::InvalidScope(format!(
+                "{} scope contains no non-system schemas",
+                strategy.product_name()
+            )));
         }
         let inaccessible = schemas
             .iter()
@@ -931,11 +1195,17 @@ impl RawPostgresCatalog {
             .map(|schema| schema.name.clone())
             .collect::<Vec<_>>();
 
-        reject_unsupported_relations(client, &schema_names)?;
+        reject_unsupported_relations(client, &schema_names, strategy.product_name())?;
+        let yugabyte = match strategy {
+            PgCatalogStrategy::YugabyteDb2025_2_3_2 => {
+                Some(read_yugabyte_catalog(client, &schema_names)?)
+            }
+            PgCatalogStrategy::PostgreSql(_) => None,
+        };
 
         Ok(Self {
             server,
-            catalog_version,
+            strategy,
             schemas,
             principals: read_principals(client)?,
             relations: read_relations(client, &schema_names)?,
@@ -956,8 +1226,125 @@ impl RawPostgresCatalog {
             policies: read_policies(client, &schema_names)?,
             extensions: read_extensions(client)?,
             event_triggers: read_event_triggers(client)?,
+            yugabyte,
         })
     }
+}
+
+fn read_yugabyte_catalog(
+    client: &mut impl GenericClient,
+    schemas: &[String],
+) -> Result<RawYugabyteCatalog, CatalogError> {
+    let database = client.query_one(
+        "
+        SELECT pg_catalog.yb_is_database_colocated(),
+               db.dattablespace::bigint
+        FROM pg_catalog.pg_database db
+        WHERE db.datname = pg_catalog.current_database()
+        ",
+        &[],
+    )?;
+
+    let relation_properties = client
+        .query(
+            "
+            SELECT cls.oid::bigint,
+                   cls.relkind::text,
+                   cls.reltablespace::bigint,
+                   properties.num_tablets,
+                   properties.num_hash_key_columns,
+                   properties.is_colocated,
+                   properties.tablegroup_oid::bigint,
+                   properties.colocation_id::bigint,
+                   CASE WHEN properties.num_hash_key_columns = 0
+                        THEN NULLIF(pg_catalog.yb_get_range_split_clause(cls.oid)::text, '')
+                        ELSE NULL END
+            FROM pg_catalog.pg_class cls
+            JOIN pg_catalog.pg_namespace ns ON ns.oid = cls.relnamespace
+            LEFT JOIN LATERAL pg_catalog.yb_table_properties(cls.oid) properties ON true
+            WHERE ns.nspname = ANY($1::text[])
+              AND cls.relkind IN ('r', 'p', 'f', 'm', 'S', 'i', 'I')
+            ORDER BY ns.nspname, cls.relname, cls.oid
+            ",
+            &[&schemas],
+        )?
+        .into_iter()
+        .map(|row| RawYugabyteRelationProperties {
+            relation_oid: row.get(0),
+            relation_kind: one_char(&row.get::<_, String>(1)),
+            tablespace_oid: row.get(2),
+            num_tablets: row.get(3),
+            num_hash_key_columns: row.get(4),
+            is_colocated: row.get(5),
+            tablegroup_oid: row.get(6),
+            colocation_id: row.get(7),
+            range_split_clause: row.get(8),
+        })
+        .collect();
+
+    let tablegroups = client
+        .query(
+            "
+            SELECT grp.oid::bigint,
+                   grp.grpname::text,
+                   grp.grpowner::bigint,
+                   grp.grptablespace::bigint,
+                   ARRAY(
+                       SELECT acl::text
+                       FROM pg_catalog.unnest(grp.grpacl) acl
+                   ),
+                   COALESCE(grp.grpoptions, ARRAY[]::text[])
+            FROM pg_catalog.pg_yb_tablegroup grp
+            ORDER BY grp.grpname, grp.oid
+            ",
+            &[],
+        )?
+        .into_iter()
+        .map(|row| RawYugabyteTablegroup {
+            oid: row.get(0),
+            name: row.get(1),
+            owner_oid: row.get(2),
+            tablespace_oid: row.get(3),
+            acl: row.get(4),
+            options: row.get(5),
+        })
+        .collect();
+
+    let tablespaces = client
+        .query(
+            "
+            SELECT spc.oid::bigint,
+                   spc.spcname::text,
+                   spc.spcowner::bigint,
+                   ARRAY(
+                       SELECT acl::text
+                       FROM pg_catalog.unnest(spc.spcacl) acl
+                   ),
+                   COALESCE(spc.spcoptions, ARRAY[]::text[]),
+                   pg_catalog.shobj_description(spc.oid, 'pg_tablespace')
+            FROM pg_catalog.pg_tablespace spc
+            ORDER BY spc.spcname, spc.oid
+            ",
+            &[],
+        )?
+        .into_iter()
+        .map(|row| RawYugabyteTablespace {
+            oid: row.get(0),
+            name: row.get(1),
+            owner_oid: row.get(2),
+            acl: row.get(3),
+            options: row.get(4),
+            comment: row.get(5),
+        })
+        .collect();
+
+    Ok(RawYugabyteCatalog {
+        database_colocated: database.get(0),
+        database_default_tablespace_oid: database.get(1),
+        relation_properties,
+        tablegroups,
+        tablespaces,
+    })
 }
 
 fn read_server_facts(client: &mut impl GenericClient) -> Result<ServerFacts, CatalogError> {
@@ -990,25 +1377,6 @@ fn read_server_facts(client: &mut impl GenericClient) -> Result<ServerFacts, Cat
         tls_cipher: row.get(9),
         version_banner: row.get(10),
     })
-}
-
-fn validate_postgres_product_identity(version: &str, banner: &str) -> Result<(), CatalogError> {
-    let version = version.trim();
-    let banner = banner.trim();
-    let yugabyte = version.to_ascii_uppercase().contains("-YB-")
-        || banner.to_ascii_uppercase().contains("-YB-");
-    if yugabyte {
-        return Err(CatalogError::UnsupportedProduct(format!(
-            "connected product is YugabyteDB YSQL ({version}), not certified PostgreSQL"
-        )));
-    }
-    if !banner.starts_with("PostgreSQL ") {
-        let product = banner.split_whitespace().next().unwrap_or("unknown");
-        return Err(CatalogError::UnsupportedProduct(format!(
-            "connected product reports '{product}', not certified PostgreSQL"
-        )));
-    }
-    Ok(())
 }
 
 fn read_schemas(client: &mut impl GenericClient) -> Result<Vec<RawSchema>, CatalogError> {
@@ -1076,6 +1444,7 @@ fn read_principals(client: &mut impl GenericClient) -> Result<Vec<RawPrincipal>,
 fn reject_unsupported_relations(
     client: &mut impl GenericClient,
     schemas: &[String],
+    product_name: &str,
 ) -> Result<(), CatalogError> {
     let rows = client.query(
         "
@@ -1090,7 +1459,7 @@ fn reject_unsupported_relations(
     )?;
     if let Some(row) = rows.first() {
         return Err(CatalogError::UnsupportedMetadata(format!(
-            "unsupported PostgreSQL relation kind '{}' discovered at {}.{}",
+            "unsupported {product_name} pg_catalog relation kind '{}' discovered at {}.{}",
             row.get::<_, String>(2),
             row.get::<_, String>(0),
             row.get::<_, String>(1)
@@ -2066,15 +2435,27 @@ fn read_event_triggers(
 }
 
 impl<'a> PostgresSnapshotMapper<'a> {
-    fn new(connection_alias: &'a str) -> Self {
-        Self { connection_alias }
+    fn new(connection_alias: &'a str, source_kind: &'static str) -> Self {
+        Self {
+            connection_alias,
+            source_kind,
+        }
     }
 
     fn map(&self, raw: RawPostgresCatalog) -> Result<CatalogDiscovery, CatalogError> {
         validate_raw_catalog(&raw)?;
+        let strategy = raw.strategy;
+        if self.source_kind != strategy.source_kind() {
+            return Err(CatalogError::Mapping(format!(
+                "mapper source '{}' does not match selected strategy {}",
+                self.source_kind,
+                strategy.strategy_name()
+            )));
+        }
 
         let database_name = raw.server.database.clone();
         let database_key = pg_key(
+            self.source_kind,
             self.connection_alias,
             &database_name,
             &database_name,
@@ -2092,6 +2473,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
             .iter()
             .map(|schema| SchemaObject {
                 key: pg_key(
+                    self.source_kind,
                     self.connection_alias,
                     &database_name,
                     &schema.name,
@@ -2112,6 +2494,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
         let mut principal_keys = BTreeMap::new();
         for principal in &raw.principals {
             let key = pg_key(
+                self.source_kind,
                 self.connection_alias,
                 &database_name,
                 &database_name,
@@ -2173,7 +2556,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
         for raw_type in &raw.types {
             let parent = required(
                 schema_keys.get(&raw_type.schema),
-                format!("schema key for PostgreSQL type {}", raw_type.name),
+                format!("schema key for pg_catalog type {}", raw_type.name),
             )?;
             let kind = if raw_type.kind == 'd' {
                 ObjectKind::Domain
@@ -2181,6 +2564,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                 ObjectKind::UserDefinedType
             };
             let key = pg_key(
+                self.source_kind,
                 self.connection_alias,
                 &database_name,
                 &raw_type.schema,
@@ -2190,7 +2574,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
             );
             if type_keys.insert(raw_type.oid, key.clone()).is_some() {
                 return Err(CatalogError::Mapping(format!(
-                    "duplicate PostgreSQL type oid {}",
+                    "duplicate pg_catalog type oid {}",
                     raw_type.oid
                 )));
             }
@@ -2238,6 +2622,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                 format!("enum parent type oid {}", enum_value.type_oid),
             )?;
             let key = pg_key(
+                self.source_kind,
                 self.connection_alias,
                 &database_name,
                 &type_key.schema,
@@ -2284,6 +2669,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
             match relation.relkind {
                 'r' | 'p' | 'f' => {
                     let key = pg_key(
+                        self.source_kind,
                         self.connection_alias,
                         &database_name,
                         &relation.schema,
@@ -2312,6 +2698,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                 }
                 'v' => {
                     let key = pg_key(
+                        self.source_kind,
                         self.connection_alias,
                         &database_name,
                         &relation.schema,
@@ -2341,6 +2728,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                 }
                 'm' => {
                     let key = pg_key(
+                        self.source_kind,
                         self.connection_alias,
                         &database_name,
                         &relation.schema,
@@ -2368,6 +2756,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                 }
                 'S' => {
                     let key = pg_key(
+                        self.source_kind,
                         self.connection_alias,
                         &database_name,
                         &relation.schema,
@@ -2408,12 +2797,13 @@ impl<'a> PostgresSnapshotMapper<'a> {
                 'c' => {}
                 other => {
                     return Err(CatalogError::Mapping(format!(
-                        "unmapped PostgreSQL relation kind '{other}' for {}.{}",
+                        "unmapped pg_catalog relation kind '{other}' for {}.{}",
                         relation.schema, relation.name
                     )));
                 }
             }
         }
+        let mut physical_relation_keys = relation_keys.clone();
 
         let mut columns = Vec::new();
         let mut column_keys = BTreeMap::new();
@@ -2429,6 +2819,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                         ),
                     )?;
                     let key = pg_key(
+                        self.source_kind,
                         self.connection_alias,
                         &database_name,
                         &column.schema,
@@ -2465,6 +2856,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                         ),
                     )?;
                     let key = pg_key(
+                        self.source_kind,
                         self.connection_alias,
                         &database_name,
                         &column.schema,
@@ -2506,6 +2898,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                         ),
                     )?;
                     let key = pg_key(
+                        self.source_kind,
                         self.connection_alias,
                         &database_name,
                         &column.schema,
@@ -2541,7 +2934,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                 }
                 other => {
                     return Err(CatalogError::Mapping(format!(
-                        "unmapped PostgreSQL column relation kind '{other}' for {}.{}.{}",
+                        "unmapped pg_catalog column relation kind '{other}' for {}.{}.{}",
                         column.schema, column.relation, column.name
                     )));
                 }
@@ -2565,6 +2958,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                     ),
                 )?;
                 let key = pg_key(
+                    self.source_kind,
                     self.connection_alias,
                     &database_name,
                     &constraint.schema,
@@ -2598,6 +2992,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
             )?;
             if constraint.kind == 'x' {
                 let key = pg_key(
+                    self.source_kind,
                     self.connection_alias,
                     &database_name,
                     &constraint.schema,
@@ -2643,7 +3038,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                 'c' => (ConstraintKind::Check, ObjectKind::CheckConstraint),
                 other => {
                     return Err(CatalogError::Mapping(format!(
-                        "unmapped PostgreSQL constraint kind '{other}' for {}",
+                        "unmapped pg_catalog constraint kind '{other}' for {}",
                         constraint.name
                     )));
                 }
@@ -2679,6 +3074,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                 (None, Vec::new())
             };
             let key = pg_key(
+                self.source_kind,
                 self.connection_alias,
                 &database_name,
                 &constraint.schema,
@@ -2731,6 +3127,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                         format!("indexed table oid {}", index.relation_oid),
                     )?;
                     let key = pg_key(
+                        self.source_kind,
                         self.connection_alias,
                         &database_name,
                         &index.schema,
@@ -2738,6 +3135,15 @@ impl<'a> PostgresSnapshotMapper<'a> {
                         &index.relation,
                         Some(index.name.clone()),
                     );
+                    if physical_relation_keys
+                        .insert(index.oid, key.clone())
+                        .is_some()
+                    {
+                        return Err(CatalogError::Mapping(format!(
+                            "duplicate physical relation oid {} for index {}",
+                            index.oid, index.name
+                        )));
+                    }
                     let mut key_columns = Vec::new();
                     for term in &terms {
                         if term.is_key && term.column_number > 0 {
@@ -2785,6 +3191,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                         format!("materialized view parent for index {}", index.name),
                     )?;
                     let key = pg_key(
+                        self.source_kind,
                         self.connection_alias,
                         &database_name,
                         &index.schema,
@@ -2792,6 +3199,15 @@ impl<'a> PostgresSnapshotMapper<'a> {
                         &index.relation,
                         Some(index.name.clone()),
                     );
+                    if physical_relation_keys
+                        .insert(index.oid, key.clone())
+                        .is_some()
+                    {
+                        return Err(CatalogError::Mapping(format!(
+                            "duplicate physical relation oid {} for index {}",
+                            index.oid, index.name
+                        )));
+                    }
                     metadata.objects.push(MetadataObject {
                         key: key.clone(),
                         parent_key: Some(parent.clone()),
@@ -2816,6 +3232,19 @@ impl<'a> PostgresSnapshotMapper<'a> {
                     )));
                 }
             }
+        }
+
+        if let Some(yugabyte) = &raw.yugabyte {
+            map_yugabyte_metadata(
+                &mut metadata,
+                yugabyte,
+                self.source_kind,
+                self.connection_alias,
+                &database_name,
+                &database_key,
+                &principal_keys,
+                &physical_relation_keys,
+            )?;
         }
 
         let view_position_by_oid = views
@@ -2899,6 +3328,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
         let mut routine_keys = BTreeMap::new();
         for routine in &raw.routines {
             let key = pg_key(
+                self.source_kind,
                 self.connection_alias,
                 &database_name,
                 &routine.schema,
@@ -2908,7 +3338,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
             );
             if routine_keys.insert(routine.oid, key).is_some() {
                 return Err(CatalogError::Mapping(format!(
-                    "duplicate PostgreSQL routine oid {}",
+                    "duplicate pg_catalog routine oid {}",
                     routine.oid
                 )));
             }
@@ -2992,6 +3422,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                 display_name
             );
             let key = pg_key(
+                self.source_kind,
                 self.connection_alias,
                 &database_name,
                 &routine_key.schema,
@@ -3090,6 +3521,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                 ),
             )?;
             let key = pg_key(
+                self.source_kind,
                 self.connection_alias,
                 &database_name,
                 &relation_key.schema,
@@ -3193,6 +3625,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                 format!("policy target relation oid {}", policy.relation_oid),
             )?;
             let key = pg_key(
+                self.source_kind,
                 self.connection_alias,
                 &database_name,
                 &parent.schema,
@@ -3242,6 +3675,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
 
         for extension in &raw.extensions {
             let key = pg_key(
+                self.source_kind,
                 self.connection_alias,
                 &database_name,
                 &database_name,
@@ -3280,6 +3714,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                 ),
             )?;
             let key = pg_key(
+                self.source_kind,
                 self.connection_alias,
                 &database_name,
                 &database_name,
@@ -3322,7 +3757,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
         deduplicate_metadata_relationships(&mut metadata.relationships)?;
         let snapshot = CanonicalSchemaSnapshot {
             schema: SchemaSnapshot {
-                source_kind: POSTGRES_SOURCE.to_owned(),
+                source_kind: self.source_kind.to_owned(),
                 connection_alias: self.connection_alias.to_owned(),
                 database,
                 schemas,
@@ -3333,7 +3768,7 @@ impl<'a> PostgresSnapshotMapper<'a> {
                 views,
                 triggers,
                 routines,
-                capabilities: postgres_complete_capabilities(),
+                capabilities: pg_catalog_complete_capabilities(strategy),
             },
             metadata,
         };
@@ -3344,15 +3779,90 @@ impl<'a> PostgresSnapshotMapper<'a> {
             .map(|schema| schema.name.clone())
             .collect::<Vec<_>>();
         scope_schemas.sort();
+        let mut capability_checks = vec![
+            CapabilityCheck {
+                name: "supported_server_version".to_owned(),
+                evidence: format!(
+                    "server_version={} and server_version_num={} map to certified {} strategy {}",
+                    raw.server.version,
+                    raw.server.version_num,
+                    strategy.product_name(),
+                    strategy.strategy_name()
+                ),
+            },
+            CapabilityCheck {
+                name: "read_only_repeatable_read_transaction".to_owned(),
+                evidence: format!(
+                    "transaction_read_only={} and transaction_isolation={}",
+                    raw.server.transaction_read_only, raw.server.transaction_isolation
+                ),
+            },
+            CapabilityCheck {
+                name: "schema_visibility".to_owned(),
+                evidence: format!(
+                    "has_schema_privilege(..., USAGE) succeeded for {} requested schema(s)",
+                    scope_schemas.len()
+                ),
+            },
+            CapabilityCheck {
+                name: "metadata_only_catalog_queries".to_owned(),
+                evidence: "adapter queried pg_catalog metadata and server information only; no application relation appears in a FROM clause"
+                    .to_owned(),
+            },
+            CapabilityCheck {
+                name: "routine_dependency_proof".to_owned(),
+                evidence: format!(
+                    "all {} selected routine(s) use catalog-tracked SQL-standard bodies; opaque bodies fail before certification",
+                    raw.routines.len()
+                ),
+            },
+            CapabilityCheck {
+                name: "principal_context".to_owned(),
+                evidence: format!(
+                    "current_user={} session_user={} and pg_roles inventory was readable",
+                    raw.server.current_user, raw.server.session_user
+                ),
+            },
+            CapabilityCheck {
+                name: "transport_security".to_owned(),
+                evidence: if raw.server.tls {
+                    format!(
+                        "TLS enabled version={} cipher={}",
+                        raw.server.tls_version.as_deref().unwrap_or("reported"),
+                        raw.server.tls_cipher.as_deref().unwrap_or("reported")
+                    )
+                } else {
+                    "plaintext transport accepted only for a loopback/local connection".to_owned()
+                },
+            },
+        ];
+        if let Some(yugabyte) = &raw.yugabyte {
+            capability_checks.push(CapabilityCheck {
+                name: "yugabytedb_distributed_metadata".to_owned(),
+                evidence: format!(
+                    "yb_table_properties certified {} physical relation(s), including tablet count, hash-key count, colocation, tablegroup, and range split metadata",
+                    yugabyte.relation_properties.len()
+                ),
+            });
+            capability_checks.push(CapabilityCheck {
+                name: "yugabytedb_placement_metadata".to_owned(),
+                evidence: format!(
+                    "pg_yb_tablegroup and pg_tablespace certified {} tablegroup(s), {} tablespace(s), database_colocated={}",
+                    yugabyte.tablegroups.len(),
+                    yugabyte.tablespaces.len(),
+                    yugabyte.database_colocated
+                ),
+            });
+        }
 
         Ok(CatalogDiscovery {
             snapshot,
             adapter: AdapterIdentity {
-                name: "database-memory-postgres-catalog".to_owned(),
+                name: strategy.adapter_name().to_owned(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
             },
             server: ServerIdentity {
-                product: "PostgreSQL".to_owned(),
+                product: strategy.product_name().to_owned(),
                 version: raw.server.version.clone(),
             },
             scope: IntrospectionScope {
@@ -3360,79 +3870,44 @@ impl<'a> PostgresSnapshotMapper<'a> {
                 schemas: scope_schemas.clone(),
             },
             discovered_counts,
-            capability_checks: vec![
-                CapabilityCheck {
-                    name: "supported_server_version".to_owned(),
-                    evidence: format!(
-                        "server_version_num={} maps to certified PostgreSQL major {} using strategy {}",
-                        raw.server.version_num,
-                        raw.catalog_version.major(),
-                        raw.catalog_version.strategy_name()
-                    ),
-                },
-                CapabilityCheck {
-                    name: "read_only_repeatable_read_transaction".to_owned(),
-                    evidence: format!(
-                        "transaction_read_only={} and transaction_isolation={}",
-                        raw.server.transaction_read_only, raw.server.transaction_isolation
-                    ),
-                },
-                CapabilityCheck {
-                    name: "schema_visibility".to_owned(),
-                    evidence: format!(
-                        "has_schema_privilege(..., USAGE) succeeded for {} requested schema(s)",
-                        scope_schemas.len()
-                    ),
-                },
-                CapabilityCheck {
-                    name: "metadata_only_catalog_queries".to_owned(),
-                    evidence: "adapter queried pg_catalog metadata and server information only; no application relation appears in a FROM clause"
-                        .to_owned(),
-                },
-                CapabilityCheck {
-                    name: "routine_dependency_proof".to_owned(),
-                    evidence: format!(
-                        "all {} selected routine(s) use catalog-tracked SQL-standard bodies; opaque bodies fail before certification",
-                        raw.routines.len()
-                    ),
-                },
-                CapabilityCheck {
-                    name: "principal_context".to_owned(),
-                    evidence: format!(
-                        "current_user={} session_user={} and pg_roles inventory was readable",
-                        raw.server.current_user, raw.server.session_user
-                    ),
-                },
-                CapabilityCheck {
-                    name: "transport_security".to_owned(),
-                    evidence: if raw.server.tls {
-                        format!(
-                            "TLS enabled version={} cipher={}",
-                            raw.server.tls_version.as_deref().unwrap_or("reported"),
-                            raw.server.tls_cipher.as_deref().unwrap_or("reported")
-                        )
-                    } else {
-                        "plaintext transport accepted only for a loopback/local connection"
-                            .to_owned()
-                    },
-                },
-            ],
+            capability_checks,
         })
     }
 }
 
 fn validate_raw_catalog(raw: &RawPostgresCatalog) -> Result<(), CatalogError> {
-    if raw.server.major() != raw.catalog_version.major() {
+    let strategy = raw.strategy;
+    if raw.server.major() != strategy.catalog_version().major() {
         return Err(CatalogError::Mapping(format!(
-            "PostgreSQL server major {} does not match selected catalog strategy {}",
+            "{} server major {} does not match selected catalog strategy {}",
+            strategy.product_name(),
             raw.server.major(),
-            raw.catalog_version.strategy_name()
+            strategy.strategy_name()
         )));
+    }
+    match (strategy, &raw.yugabyte) {
+        (PgCatalogStrategy::YugabyteDb2025_2_3_2, Some(yugabyte)) => {
+            validate_yugabyte_catalog(raw, yugabyte)?;
+        }
+        (PgCatalogStrategy::YugabyteDb2025_2_3_2, None) => {
+            return Err(CatalogError::UnsupportedMetadata(
+                "certified YugabyteDB strategy did not collect YugabyteDB catalog metadata"
+                    .to_owned(),
+            ));
+        }
+        (PgCatalogStrategy::PostgreSql(_), Some(_)) => {
+            return Err(CatalogError::Mapping(
+                "PostgreSQL strategy unexpectedly contains YugabyteDB catalog metadata".to_owned(),
+            ));
+        }
+        (PgCatalogStrategy::PostgreSql(_), None) => {}
     }
     if !raw.server.transaction_read_only || raw.server.transaction_isolation != "repeatable read" {
         return Err(CatalogError::UnsupportedMetadata(format!(
-            "PostgreSQL metadata transaction is not read-only repeatable-read (read_only={}, isolation={})",
-            raw.server.transaction_read_only, raw.server.transaction_isolation
+            "{} metadata transaction is not read-only repeatable-read (read_only={}, isolation={})",
+            strategy.product_name(),
+            raw.server.transaction_read_only,
+            raw.server.transaction_isolation
         )));
     }
     for relation in &raw.relations {
@@ -3565,6 +4040,231 @@ fn validate_raw_catalog(raw: &RawPostgresCatalog) -> Result<(), CatalogError> {
     Ok(())
 }
 
+fn validate_yugabyte_catalog(
+    raw: &RawPostgresCatalog,
+    yugabyte: &RawYugabyteCatalog,
+) -> Result<(), CatalogError> {
+    if yugabyte.database_default_tablespace_oid <= 0 {
+        return Err(CatalogError::UnsupportedMetadata(format!(
+            "YugabyteDB database default tablespace oid must be positive, got {}",
+            yugabyte.database_default_tablespace_oid
+        )));
+    }
+
+    let mut tablespace_oids = BTreeSet::new();
+    let mut tablespace_names = BTreeSet::new();
+    for tablespace in &yugabyte.tablespaces {
+        if tablespace.oid <= 0
+            || tablespace.name.trim().is_empty()
+            || !tablespace_oids.insert(tablespace.oid)
+            || !tablespace_names.insert(tablespace.name.clone())
+        {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "invalid or duplicate YugabyteDB tablespace oid={} name='{}'",
+                tablespace.oid, tablespace.name
+            )));
+        }
+        validate_property_text(
+            &format!("YugabyteDB tablespace {} comment", tablespace.name),
+            tablespace.comment.as_deref(),
+        )?;
+        validate_string_list(
+            &format!("YugabyteDB tablespace {} ACL", tablespace.name),
+            &tablespace.acl,
+        )?;
+        validate_string_list(
+            &format!(
+                "YugabyteDB tablespace {} placement options",
+                tablespace.name
+            ),
+            &tablespace.options,
+        )?;
+    }
+    if !tablespace_oids.contains(&yugabyte.database_default_tablespace_oid) {
+        return Err(CatalogError::UnsupportedMetadata(format!(
+            "YugabyteDB default tablespace oid {} is absent from pg_tablespace",
+            yugabyte.database_default_tablespace_oid
+        )));
+    }
+
+    let mut tablegroup_oids = BTreeSet::new();
+    let mut tablegroup_names = BTreeSet::new();
+    for tablegroup in &yugabyte.tablegroups {
+        if tablegroup.oid <= 0
+            || tablegroup.name.trim().is_empty()
+            || !tablegroup_oids.insert(tablegroup.oid)
+            || !tablegroup_names.insert(tablegroup.name.clone())
+        {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "invalid or duplicate YugabyteDB tablegroup oid={} name='{}'",
+                tablegroup.oid, tablegroup.name
+            )));
+        }
+        let effective_tablespace = effective_yugabyte_tablespace_oid(
+            tablegroup.tablespace_oid,
+            yugabyte.database_default_tablespace_oid,
+        );
+        if !tablespace_oids.contains(&effective_tablespace) {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "YugabyteDB tablegroup {} references missing tablespace oid {}",
+                tablegroup.name, effective_tablespace
+            )));
+        }
+        validate_string_list(
+            &format!("YugabyteDB tablegroup {} ACL", tablegroup.name),
+            &tablegroup.acl,
+        )?;
+        validate_string_list(
+            &format!("YugabyteDB tablegroup {} options", tablegroup.name),
+            &tablegroup.options,
+        )?;
+    }
+
+    let mut expected_relations = BTreeMap::new();
+    for relation in &raw.relations {
+        if matches!(relation.relkind, 'r' | 'p' | 'f' | 'm' | 'S')
+            && expected_relations
+                .insert(relation.oid, Some(relation.relkind))
+                .is_some()
+        {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate YugabyteDB relation oid {}",
+                relation.oid
+            )));
+        }
+    }
+    for index in &raw.indexes {
+        if expected_relations.insert(index.oid, None).is_some() {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate YugabyteDB index oid {}",
+                index.oid
+            )));
+        }
+    }
+
+    let mut discovered_relations = BTreeSet::new();
+    for relation in &yugabyte.relation_properties {
+        let Some(expected_kind) = expected_relations.get(&relation.relation_oid) else {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "yb_table_properties returned out-of-scope relation oid {}",
+                relation.relation_oid
+            )));
+        };
+        if !discovered_relations.insert(relation.relation_oid) {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "yb_table_properties returned duplicate relation oid {}",
+                relation.relation_oid
+            )));
+        }
+        match expected_kind {
+            Some(kind) if *kind != relation.relation_kind => {
+                return Err(CatalogError::UnsupportedMetadata(format!(
+                    "YugabyteDB relation oid {} changed kind from '{}' to '{}' during discovery",
+                    relation.relation_oid, kind, relation.relation_kind
+                )));
+            }
+            None if !matches!(relation.relation_kind, 'i' | 'I') => {
+                return Err(CatalogError::UnsupportedMetadata(format!(
+                    "YugabyteDB index oid {} reports relation kind '{}'",
+                    relation.relation_oid, relation.relation_kind
+                )));
+            }
+            _ => {}
+        }
+        if relation.tablespace_oid < 0 {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "YugabyteDB relation oid {} has negative tablespace oid {}",
+                relation.relation_oid, relation.tablespace_oid
+            )));
+        }
+        validate_property_text(
+            &format!(
+                "YugabyteDB relation oid {} range split clause",
+                relation.relation_oid
+            ),
+            relation.range_split_clause.as_deref(),
+        )?;
+
+        match (
+            relation.num_tablets,
+            relation.num_hash_key_columns,
+            relation.is_colocated,
+        ) {
+            (Some(num_tablets), Some(num_hash_columns), Some(_))
+                if num_tablets > 0 && num_hash_columns >= 0 => {}
+            (None, None, None)
+                if relation.tablegroup_oid.is_none()
+                    && relation.colocation_id.is_none()
+                    && relation.range_split_clause.is_none() =>
+            {
+                continue;
+            }
+            values => {
+                return Err(CatalogError::UnsupportedMetadata(format!(
+                    "incoherent yb_table_properties for relation oid {}: {:?}",
+                    relation.relation_oid, values
+                )));
+            }
+        }
+        if relation.range_split_clause.is_some() && relation.num_hash_key_columns != Some(0) {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "YugabyteDB relation oid {} has a range split clause with hash key columns",
+                relation.relation_oid
+            )));
+        }
+        match relation.is_colocated {
+            Some(true) if relation.tablegroup_oid.is_some() && relation.colocation_id.is_some() => {
+            }
+            Some(false)
+                if relation.tablegroup_oid.is_none() && relation.colocation_id.is_none() => {}
+            Some(is_colocated) => {
+                return Err(CatalogError::UnsupportedMetadata(format!(
+                    "YugabyteDB relation oid {} has inconsistent colocation fields (is_colocated={is_colocated})",
+                    relation.relation_oid
+                )));
+            }
+            None => unreachable!("the non-storage-backed case continued above"),
+        }
+        if let Some(tablegroup_oid) = relation.tablegroup_oid {
+            if !tablegroup_oids.contains(&tablegroup_oid) {
+                return Err(CatalogError::UnsupportedMetadata(format!(
+                    "YugabyteDB relation oid {} references missing tablegroup oid {}",
+                    relation.relation_oid, tablegroup_oid
+                )));
+            }
+        }
+        let effective_tablespace = effective_yugabyte_tablespace_oid(
+            relation.tablespace_oid,
+            yugabyte.database_default_tablespace_oid,
+        );
+        if !tablespace_oids.contains(&effective_tablespace) {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "YugabyteDB relation oid {} references missing tablespace oid {}",
+                relation.relation_oid, effective_tablespace
+            )));
+        }
+    }
+    let expected_oids = expected_relations.keys().copied().collect::<BTreeSet<_>>();
+    if expected_oids != discovered_relations {
+        let missing = expected_oids
+            .difference(&discovered_relations)
+            .copied()
+            .collect::<Vec<_>>();
+        return Err(CatalogError::UnsupportedMetadata(format!(
+            "YugabyteDB physical metadata is incomplete; missing relation oids {missing:?}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_string_list(subject: &str, values: &[String]) -> Result<(), CatalogError> {
+    for value in values {
+        validate_property_text(subject, Some(value))?;
+    }
+    Ok(())
+}
+
 fn validate_property_text(subject: &str, value: Option<&str>) -> Result<(), CatalogError> {
     if value
         .map(|value| value.len() > MAX_PROPERTY_STRING_BYTES as usize)
@@ -3578,6 +4278,7 @@ fn validate_property_text(subject: &str, value: Option<&str>) -> Result<(), Cata
 }
 
 fn pg_key(
+    source_kind: &str,
     connection_alias: &str,
     database: &str,
     schema: &str,
@@ -3586,7 +4287,7 @@ fn pg_key(
     sub_object: Option<String>,
 ) -> ObjectKey {
     ObjectKey::new(
-        POSTGRES_SOURCE,
+        source_kind,
         connection_alias,
         database,
         schema,
@@ -3606,6 +4307,16 @@ fn insert_bool(properties: &mut BTreeMap<String, MetadataValue>, key: &str, valu
 
 fn insert_i64(properties: &mut BTreeMap<String, MetadataValue>, key: &str, value: i64) {
     properties.insert(key.to_owned(), MetadataValue::Integer(value));
+}
+
+fn insert_optional_i64(
+    properties: &mut BTreeMap<String, MetadataValue>,
+    key: &str,
+    value: Option<i64>,
+) {
+    if let Some(value) = value {
+        insert_i64(properties, key, value);
+    }
 }
 
 fn insert_u64(properties: &mut BTreeMap<String, MetadataValue>, key: &str, value: u64) {
@@ -3630,6 +4341,16 @@ fn insert_optional_string(
 ) {
     if let Some(value) = value {
         insert_string(properties, key, value);
+    }
+}
+
+fn insert_optional_bool(
+    properties: &mut BTreeMap<String, MetadataValue>,
+    key: &str,
+    value: Option<bool>,
+) {
+    if let Some(value) = value {
+        insert_bool(properties, key, value);
     }
 }
 
@@ -3708,6 +4429,333 @@ fn relation_annotation(relation: &RawRelation, key: &ObjectKey) -> ObjectAnnotat
         definition: None,
         properties: relation_properties(relation),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn map_yugabyte_metadata(
+    metadata: &mut CanonicalMetadata,
+    raw: &RawYugabyteCatalog,
+    source_kind: &str,
+    connection_alias: &str,
+    database_name: &str,
+    database_key: &ObjectKey,
+    principal_keys: &BTreeMap<i64, ObjectKey>,
+    physical_relation_keys: &BTreeMap<i64, ObjectKey>,
+) -> Result<(), CatalogError> {
+    let mut tablespace_keys = BTreeMap::new();
+    let mut tablespace_names = BTreeMap::new();
+    for tablespace in &raw.tablespaces {
+        let key = pg_key(
+            source_kind,
+            connection_alias,
+            database_name,
+            database_name,
+            ObjectKind::Extension,
+            &format!("tablespace:{}", tablespace.name),
+            None,
+        );
+        if tablespace_keys
+            .insert(tablespace.oid, key.clone())
+            .is_some()
+        {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate YugabyteDB tablespace oid {}",
+                tablespace.oid
+            )));
+        }
+        tablespace_names.insert(tablespace.oid, tablespace.name.clone());
+        let mut properties = BTreeMap::new();
+        insert_i64(&mut properties, "yugabytedb_tablespace_oid", tablespace.oid);
+        properties.insert(
+            "acl".to_owned(),
+            MetadataValue::StringList(tablespace.acl.clone()),
+        );
+        properties.insert(
+            "placement_options".to_owned(),
+            MetadataValue::StringList(tablespace.options.clone()),
+        );
+        insert_optional_string(&mut properties, "comment", tablespace.comment.as_deref());
+        metadata.objects.push(MetadataObject {
+            key: key.clone(),
+            parent_key: Some(database_key.clone()),
+            name: tablespace.name.clone(),
+            extension_kind: Some("yugabytedb_tablespace".to_owned()),
+            definition: None,
+            properties,
+        });
+        add_owned_by(
+            &mut metadata.relationships,
+            &key,
+            tablespace.owner_oid,
+            principal_keys,
+            "YugabyteDB tablespace",
+        )?;
+    }
+
+    let default_tablespace = required(
+        tablespace_keys.get(&raw.database_default_tablespace_oid),
+        format!(
+            "YugabyteDB database default tablespace oid {}",
+            raw.database_default_tablespace_oid
+        ),
+    )?;
+    let default_tablespace_name = required(
+        tablespace_names.get(&raw.database_default_tablespace_oid),
+        format!(
+            "YugabyteDB database default tablespace name oid {}",
+            raw.database_default_tablespace_oid
+        ),
+    )?;
+    let mut database_properties = BTreeMap::new();
+    insert_bool(
+        &mut database_properties,
+        "yugabytedb_database_colocated",
+        raw.database_colocated,
+    );
+    insert_i64(
+        &mut database_properties,
+        "yugabytedb_default_tablespace_oid",
+        raw.database_default_tablespace_oid,
+    );
+    insert_string(
+        &mut database_properties,
+        "yugabytedb_default_tablespace",
+        default_tablespace_name,
+    );
+    merge_metadata_properties(metadata, database_key, database_properties)?;
+    metadata.relationships.push(MetadataRelationship {
+        kind: MetadataRelationshipKind::Extension("yugabytedb_default_tablespace".to_owned()),
+        from_key: database_key.clone(),
+        to_key: default_tablespace.clone(),
+        ordinal: None,
+        properties: BTreeMap::new(),
+    });
+
+    let mut tablegroup_keys = BTreeMap::new();
+    for tablegroup in &raw.tablegroups {
+        let key = pg_key(
+            source_kind,
+            connection_alias,
+            database_name,
+            database_name,
+            ObjectKind::Extension,
+            &format!("tablegroup:{}", tablegroup.name),
+            None,
+        );
+        if tablegroup_keys
+            .insert(tablegroup.oid, key.clone())
+            .is_some()
+        {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate YugabyteDB tablegroup oid {}",
+                tablegroup.oid
+            )));
+        }
+        let effective_tablespace_oid = effective_yugabyte_tablespace_oid(
+            tablegroup.tablespace_oid,
+            raw.database_default_tablespace_oid,
+        );
+        let tablespace = required(
+            tablespace_keys.get(&effective_tablespace_oid),
+            format!(
+                "tablespace oid {effective_tablespace_oid} for YugabyteDB tablegroup {}",
+                tablegroup.name
+            ),
+        )?;
+        let mut properties = BTreeMap::new();
+        insert_i64(&mut properties, "yugabytedb_tablegroup_oid", tablegroup.oid);
+        insert_i64(
+            &mut properties,
+            "yugabytedb_catalog_tablespace_oid",
+            tablegroup.tablespace_oid,
+        );
+        properties.insert(
+            "acl".to_owned(),
+            MetadataValue::StringList(tablegroup.acl.clone()),
+        );
+        properties.insert(
+            "options".to_owned(),
+            MetadataValue::StringList(tablegroup.options.clone()),
+        );
+        metadata.objects.push(MetadataObject {
+            key: key.clone(),
+            parent_key: Some(database_key.clone()),
+            name: tablegroup.name.clone(),
+            extension_kind: Some("yugabytedb_tablegroup".to_owned()),
+            definition: None,
+            properties,
+        });
+        add_owned_by(
+            &mut metadata.relationships,
+            &key,
+            tablegroup.owner_oid,
+            principal_keys,
+            "YugabyteDB tablegroup",
+        )?;
+        metadata.relationships.push(MetadataRelationship {
+            kind: MetadataRelationshipKind::Extension("yugabytedb_uses_tablespace".to_owned()),
+            from_key: key,
+            to_key: tablespace.clone(),
+            ordinal: None,
+            properties: BTreeMap::new(),
+        });
+    }
+
+    for relation in &raw.relation_properties {
+        let key = required(
+            physical_relation_keys.get(&relation.relation_oid),
+            format!("YugabyteDB physical relation oid {}", relation.relation_oid),
+        )?;
+        let storage_backed = relation.num_tablets.is_some();
+        let mut properties = BTreeMap::new();
+        insert_bool(&mut properties, "yugabytedb_storage_backed", storage_backed);
+        insert_string(
+            &mut properties,
+            "yugabytedb_relation_kind",
+            relation.relation_kind.to_string(),
+        );
+        insert_i64(
+            &mut properties,
+            "yugabytedb_catalog_tablespace_oid",
+            relation.tablespace_oid,
+        );
+        insert_optional_i64(
+            &mut properties,
+            "yugabytedb_num_tablets",
+            relation.num_tablets,
+        );
+        insert_optional_i64(
+            &mut properties,
+            "yugabytedb_num_hash_key_columns",
+            relation.num_hash_key_columns,
+        );
+        insert_optional_bool(
+            &mut properties,
+            "yugabytedb_is_colocated",
+            relation.is_colocated,
+        );
+        insert_optional_i64(
+            &mut properties,
+            "yugabytedb_tablegroup_oid",
+            relation.tablegroup_oid,
+        );
+        insert_optional_i64(
+            &mut properties,
+            "yugabytedb_colocation_id",
+            relation.colocation_id,
+        );
+        insert_optional_string(
+            &mut properties,
+            "yugabytedb_range_split_clause",
+            relation.range_split_clause.as_deref(),
+        );
+
+        if storage_backed {
+            let effective_tablespace_oid = effective_yugabyte_tablespace_oid(
+                relation.tablespace_oid,
+                raw.database_default_tablespace_oid,
+            );
+            let tablespace = required(
+                tablespace_keys.get(&effective_tablespace_oid),
+                format!(
+                    "tablespace oid {effective_tablespace_oid} for YugabyteDB relation {}",
+                    key
+                ),
+            )?;
+            let tablespace_name = required(
+                tablespace_names.get(&effective_tablespace_oid),
+                format!(
+                    "tablespace name oid {effective_tablespace_oid} for YugabyteDB relation {}",
+                    key
+                ),
+            )?;
+            insert_string(
+                &mut properties,
+                "yugabytedb_effective_tablespace",
+                tablespace_name,
+            );
+            metadata.relationships.push(MetadataRelationship {
+                kind: MetadataRelationshipKind::Extension("yugabytedb_uses_tablespace".to_owned()),
+                from_key: key.clone(),
+                to_key: tablespace.clone(),
+                ordinal: None,
+                properties: BTreeMap::new(),
+            });
+        }
+        if let Some(tablegroup_oid) = relation.tablegroup_oid {
+            let tablegroup = required(
+                tablegroup_keys.get(&tablegroup_oid),
+                format!(
+                    "tablegroup oid {tablegroup_oid} for YugabyteDB relation {}",
+                    key
+                ),
+            )?;
+            metadata.relationships.push(MetadataRelationship {
+                kind: MetadataRelationshipKind::Extension(
+                    "yugabytedb_member_of_tablegroup".to_owned(),
+                ),
+                from_key: key.clone(),
+                to_key: tablegroup.clone(),
+                ordinal: None,
+                properties: BTreeMap::new(),
+            });
+        }
+        merge_metadata_properties(metadata, key, properties)?;
+    }
+
+    Ok(())
+}
+
+fn effective_yugabyte_tablespace_oid(catalog_oid: i64, database_default_oid: i64) -> i64 {
+    if catalog_oid == 0 {
+        database_default_oid
+    } else {
+        catalog_oid
+    }
+}
+
+fn merge_metadata_properties(
+    metadata: &mut CanonicalMetadata,
+    object_key: &ObjectKey,
+    properties: BTreeMap<String, MetadataValue>,
+) -> Result<(), CatalogError> {
+    if let Some(object) = metadata
+        .objects
+        .iter_mut()
+        .find(|object| object.key == *object_key)
+    {
+        merge_property_maps(&mut object.properties, properties, object_key)?;
+        return Ok(());
+    }
+    if let Some(annotation) = metadata
+        .annotations
+        .iter_mut()
+        .find(|annotation| annotation.object_key == *object_key)
+    {
+        merge_property_maps(&mut annotation.properties, properties, object_key)?;
+        return Ok(());
+    }
+    metadata.annotations.push(ObjectAnnotation {
+        object_key: object_key.clone(),
+        definition: None,
+        properties,
+    });
+    Ok(())
+}
+
+fn merge_property_maps(
+    target: &mut BTreeMap<String, MetadataValue>,
+    properties: BTreeMap<String, MetadataValue>,
+    object_key: &ObjectKey,
+) -> Result<(), CatalogError> {
+    for (name, value) in properties {
+        if target.insert(name.clone(), value).is_some() {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate metadata property '{name}' for {object_key}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn column_properties(column: &RawColumn) -> BTreeMap<String, MetadataValue> {
@@ -4324,9 +5372,9 @@ fn deduplicate_metadata_relationships(
     Ok(())
 }
 
-fn postgres_complete_capabilities() -> AdapterCapabilities {
+fn pg_catalog_complete_capabilities(strategy: PgCatalogStrategy) -> AdapterCapabilities {
     AdapterCapabilities {
-        source_kind: POSTGRES_SOURCE.to_owned(),
+        source_kind: strategy.source_kind().to_owned(),
         metadata_only: true,
         schemas: true,
         tables: true,
@@ -4339,9 +5387,11 @@ fn postgres_complete_capabilities() -> AdapterCapabilities {
         dependencies: CapabilitySupport::Supported,
         limitations: Vec::new(),
         notes: vec![
-            "Reads pg_catalog metadata in one read-only repeatable-read transaction; application rows are never queried."
-                .to_owned(),
-            "Routine dependency completeness requires a PostgreSQL catalog-tracked SQL-standard body; opaque language bodies fail certification."
+            format!(
+                "Reads {} pg_catalog metadata in one read-only repeatable-read transaction; application rows are never queried.",
+                strategy.product_name()
+            ),
+            "Routine dependency completeness requires a pg_catalog-tracked SQL-standard body; opaque language bodies fail certification."
                 .to_owned(),
             "System-schema implementation dependencies are outside the declared application schema scope."
                 .to_owned(),
@@ -4467,7 +5517,12 @@ fn discovery_counts_from_catalog(
                 .columns
                 .iter()
                 .filter(|column| column.relation_kind == 'c')
-                .count()) as u64,
+                .count()
+            + raw
+                .yugabyte
+                .as_ref()
+                .map(|catalog| catalog.tablegroups.len() + catalog.tablespaces.len())
+                .unwrap_or_default()) as u64,
     );
 
     let emitted_objects = emitted_object_counts(snapshot);
@@ -4476,7 +5531,8 @@ fn discovery_counts_from_catalog(
         let emitted = emitted_objects.get(&category).copied().unwrap_or_default();
         if discovered != emitted {
             return Err(CatalogError::Mapping(format!(
-                "PostgreSQL raw/emitted object count mismatch for {category:?}: discovered={discovered}, emitted={emitted}"
+                "{} raw/emitted object count mismatch for {category:?}: discovered={discovered}, emitted={emitted}",
+                raw.strategy.product_name()
             )));
         }
     }
@@ -4639,7 +5695,8 @@ fn discovery_counts_from_catalog(
             .unwrap_or_default();
         if discovered != emitted {
             return Err(CatalogError::Mapping(format!(
-                "PostgreSQL raw/emitted relationship count mismatch for {category:?}: discovered={discovered}, emitted={emitted}"
+                "{} raw/emitted relationship count mismatch for {category:?}: discovered={discovered}, emitted={emitted}",
+                raw.strategy.product_name()
             )));
         }
     }
@@ -4653,7 +5710,8 @@ fn discovery_counts_from_catalog(
                     DiscoveredCount {
                         count,
                         evidence: format!(
-                            "PostgreSQL pg_catalog raw object inventory for {category:?} in the declared schema scope"
+                            "{} pg_catalog raw object inventory for {category:?} in the declared schema scope",
+                            raw.strategy.product_name()
                         ),
                     },
                 )
@@ -4667,7 +5725,8 @@ fn discovery_counts_from_catalog(
                     DiscoveredCount {
                         count,
                         evidence: format!(
-                            "PostgreSQL pg_catalog relationship ledger for {category:?} in the declared schema scope"
+                            "{} pg_catalog relationship ledger for {category:?} in the declared schema scope",
+                            raw.strategy.product_name()
                         ),
                     },
                 )
@@ -4697,27 +5756,70 @@ mod version_strategy_tests {
     }
 
     #[test]
-    fn postgres_identity_rejects_wire_compatible_products_before_version_selection() {
-        validate_postgres_product_identity(
+    fn product_strategies_reject_cross_product_and_uncertified_releases() {
+        let postgres = server_facts(
             "16.10 (Debian 16.10-1.pgdg13+1)",
             "PostgreSQL 16.10 (Debian 16.10-1.pgdg13+1) on x86_64-pc-linux-gnu",
-        )
-        .unwrap();
+            160_010,
+        );
+        assert_eq!(
+            PgCatalogStrategy::detect(PgWireProduct::PostgreSql, &postgres).unwrap(),
+            PgCatalogStrategy::PostgreSql(PostgresCatalogVersion::V16)
+        );
 
+        let yugabyte = server_facts(
+            CERTIFIED_YUGABYTEDB_VERSION,
+            "PostgreSQL 15.12-YB-2025.2.3.2-b0 on x86_64-pc-linux-gnu",
+            150_012,
+        );
         assert!(matches!(
-            validate_postgres_product_identity(
-                "15.12-YB-2025.2.3.2-b0",
-                "PostgreSQL 15.12-YB-2025.2.3.2-b0 on x86_64-pc-linux-gnu"
-            ),
+            PgCatalogStrategy::detect(PgWireProduct::PostgreSql, &yugabyte),
             Err(CatalogError::UnsupportedProduct(_))
         ));
+        assert_eq!(
+            PgCatalogStrategy::detect(PgWireProduct::YugabyteDb, &yugabyte).unwrap(),
+            PgCatalogStrategy::YugabyteDb2025_2_3_2
+        );
         assert!(matches!(
-            validate_postgres_product_identity(
-                "15.0",
-                "CockroachDB CCL v25.2.1 (x86_64-unknown-linux-gnu)"
-            ),
+            PgCatalogStrategy::detect(PgWireProduct::YugabyteDb, &postgres),
             Err(CatalogError::UnsupportedProduct(_))
         ));
+
+        let unsupported_yugabyte = server_facts(
+            "15.12-YB-2025.2.4.0-b0",
+            "PostgreSQL 15.12-YB-2025.2.4.0-b0 on x86_64-pc-linux-gnu",
+            150_012,
+        );
+        assert!(matches!(
+            PgCatalogStrategy::detect(PgWireProduct::YugabyteDb, &unsupported_yugabyte),
+            Err(CatalogError::UnsupportedRelease(_))
+        ));
+
+        let cockroach = server_facts(
+            "15.0",
+            "CockroachDB CCL v25.2.1 (x86_64-unknown-linux-gnu)",
+            150_000,
+        );
+        assert!(matches!(
+            PgCatalogStrategy::detect(PgWireProduct::PostgreSql, &cockroach),
+            Err(CatalogError::UnsupportedProduct(_))
+        ));
+    }
+
+    fn server_facts(version: &str, version_banner: &str, version_num: i32) -> ServerFacts {
+        ServerFacts {
+            database: "app".to_owned(),
+            version: version.to_owned(),
+            version_banner: version_banner.to_owned(),
+            version_num,
+            current_user: "reader".to_owned(),
+            session_user: "reader".to_owned(),
+            transaction_read_only: true,
+            transaction_isolation: "repeatable read".to_owned(),
+            tls: false,
+            tls_version: None,
+            tls_cipher: None,
+        }
     }
 
     #[test]

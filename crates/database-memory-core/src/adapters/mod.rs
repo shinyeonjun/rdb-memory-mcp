@@ -10,3 +10,4 @@ pub(crate) mod sqlite_catalog;
 pub(crate) mod sqlite_sql;
 pub mod sqlserver;
 mod sqlserver_catalog;
+pub mod yugabytedb;
