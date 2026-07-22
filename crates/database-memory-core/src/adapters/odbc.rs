@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 use std::net::IpAddr;
+#[cfg(feature = "odbc")]
+use std::time::{Duration, Instant};
 
 use connection_string::AdoNetString;
 use serde::{Deserialize, Serialize};
@@ -107,7 +109,15 @@ impl OdbcCatalogFunction {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OdbcCatalogFunctionCapability {
     pub function: OdbcCatalogFunction,
-    pub driver_declared_supported: bool,
+    pub support: OdbcCatalogFunctionSupport,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OdbcCatalogFunctionSupport {
+    NotSupported,
+    DriverDeclared,
+    RuntimeCallVerified,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -193,10 +203,52 @@ pub fn introspect_odbc_complete_scoped_with_cancellation(
         requested_schemas,
         timeout_ms,
     };
+    #[cfg(feature = "odbc")]
+    let started = Instant::now();
     let report = match probe_request(connection_string, &request, cancellation) {
         Ok(report) => report,
         Err(failure) => return AnalysisOutcome::failed(failure),
     };
+    #[cfg(feature = "odbc")]
+    {
+        let Some(remaining) =
+            Duration::from_millis(request.timeout_ms).checked_sub(started.elapsed())
+        else {
+            return AnalysisOutcome::failed(AnalysisFailure::redacted(
+                AnalysisFailureCode::Timeout,
+                AnalysisStage::CapabilityProbe,
+                ODBC_SOURCE,
+                &request.connection_alias,
+                "ODBC capability negotiation exhausted the introspection deadline",
+                "increase the bounded timeout or inspect driver and network latency",
+                true,
+                Some(connection_string),
+            ));
+        };
+        let remaining_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+        if remaining_ms == 0 {
+            return AnalysisOutcome::failed(AnalysisFailure::redacted(
+                AnalysisFailureCode::Timeout,
+                AnalysisStage::CapabilityProbe,
+                ODBC_SOURCE,
+                &request.connection_alias,
+                "ODBC capability negotiation left no time for authoritative discovery",
+                "increase the bounded timeout or inspect driver and network latency",
+                true,
+                Some(connection_string),
+            ));
+        }
+        let mut strategy_request = request.clone();
+        strategy_request.timeout_ms = remaining_ms;
+        if let Some(outcome) = runtime::analyze_with_registered_strategy(
+            connection_string,
+            &strategy_request,
+            cancellation,
+            &report,
+        ) {
+            return outcome;
+        }
+    }
     AnalysisOutcome::failed(AnalysisFailure::redacted(
         AnalysisFailureCode::UnsupportedProduct,
         AnalysisStage::CapabilityProbe,
@@ -460,10 +512,13 @@ fn configuration_failure(
 }
 
 #[cfg(any(feature = "odbc", test))]
-fn rejected_assessment(functions: &[OdbcCatalogFunctionCapability]) -> OdbcCompletenessAssessment {
+fn rejected_assessment(
+    functions: &[OdbcCatalogFunctionCapability],
+    strategy: Option<&str>,
+) -> OdbcCompletenessAssessment {
     let mut blockers = functions
         .iter()
-        .filter(|capability| !capability.driver_declared_supported)
+        .filter(|capability| capability.support == OdbcCatalogFunctionSupport::NotSupported)
         .map(|capability| {
             format!(
                 "driver does not declare support for {:?}",
@@ -471,8 +526,13 @@ fn rejected_assessment(functions: &[OdbcCatalogFunctionCapability]) -> OdbcCompl
             )
         })
         .collect::<Vec<_>>();
+    blockers.push(match strategy {
+        Some(strategy) => format!(
+            "ODBC strategy '{strategy}' cannot run because its required catalog functions are unavailable"
+        ),
+        None => "no live-certified product strategy is registered for this ODBC identity".to_owned(),
+    });
     blockers.extend([
-        "no live-certified product strategy is registered for this ODBC identity".to_owned(),
         "ODBC catalog functions do not prove unique and check constraint semantics".to_owned(),
         "ODBC catalog functions do not expose a complete trigger inventory".to_owned(),
         "ODBC catalog functions do not expose complete cross-object dependencies".to_owned(),
@@ -492,18 +552,81 @@ mod runtime {
     use std::time::{Duration, Instant};
 
     use odbc_api::handles::{
-        slice_to_utf8, Connection, Diagnostics, Environment, Record, SqlResult, SqlText,
+        slice_to_utf8, Connection, Diagnostics, Environment, Record, SqlResult, SqlText, Statement,
     };
     use odbc_api::sys::{
         AttrOdbcVersion, ConnectionAttribute, HDbc, InfoType, Pointer, SQLGetConnectAttr,
         SQLGetInfo, SQLGetInfoW, SQLSetConnectAttr, SqlReturn, IS_UINTEGER,
     };
-    use odbc_api::Error;
+    use odbc_api::{Error, Preallocated};
 
     use super::*;
 
     const INFO_BUFFER_UNITS: usize = 1_024;
     const SQL_MODE_READ_ONLY: usize = 1;
+    const CATALOG_PROBE_SENTINEL: &str = "__database_memory_odbc_capability_probe__";
+    const SQLSERVER_BRIDGE_STRATEGY: &str = "sqlserver-native-bridge-v1";
+    const SQLSERVER_REQUIRED_FUNCTIONS: [OdbcCatalogFunction; 4] = [
+        OdbcCatalogFunction::Tables,
+        OdbcCatalogFunction::Columns,
+        OdbcCatalogFunction::PrimaryKeys,
+        OdbcCatalogFunction::ForeignKeys,
+    ];
+
+    trait OdbcProductStrategy: Sync {
+        fn id(&self) -> &'static str;
+        fn matches(&self, driver: &OdbcDriverIdentity, server: &OdbcServerIdentity) -> bool;
+        fn required_functions(&self) -> &'static [OdbcCatalogFunction];
+        fn analyze(
+            &self,
+            connection_string: &str,
+            request: &IntrospectionRequest,
+            cancellation: &CancellationToken,
+        ) -> AnalysisOutcome;
+    }
+
+    struct SqlServerOdbcStrategy;
+
+    impl OdbcProductStrategy for SqlServerOdbcStrategy {
+        fn id(&self) -> &'static str {
+            SQLSERVER_BRIDGE_STRATEGY
+        }
+
+        fn matches(&self, _driver: &OdbcDriverIdentity, server: &OdbcServerIdentity) -> bool {
+            server
+                .product
+                .trim()
+                .eq_ignore_ascii_case("Microsoft SQL Server")
+        }
+
+        fn required_functions(&self) -> &'static [OdbcCatalogFunction] {
+            &SQLSERVER_REQUIRED_FUNCTIONS
+        }
+
+        fn analyze(
+            &self,
+            connection_string: &str,
+            request: &IntrospectionRequest,
+            cancellation: &CancellationToken,
+        ) -> AnalysisOutcome {
+            let connection_string =
+                match sqlserver_native_connection_string(connection_string, request) {
+                    Ok(connection_string) => connection_string,
+                    Err(failure) => return AnalysisOutcome::failed(failure),
+                };
+            crate::adapters::sqlserver_catalog::analyze_sqlserver_with_cancellation(
+                &connection_string,
+                &request.connection_alias,
+                request.requested_catalogs.clone(),
+                request.requested_schemas.clone(),
+                request.timeout_ms,
+                cancellation,
+            )
+        }
+    }
+
+    static SQLSERVER_ODBC_STRATEGY: SqlServerOdbcStrategy = SqlServerOdbcStrategy;
+    static BUILTIN_ODBC_STRATEGIES: [&dyn OdbcProductStrategy; 1] = [&SQLSERVER_ODBC_STRATEGY];
 
     extern "system" {
         #[link_name = "SQLGetFunctions"]
@@ -665,7 +788,7 @@ mod runtime {
                 &deadline,
                 AnalysisStage::CapabilityProbe,
             )?;
-            let supported =
+            let declared_supported =
                 function_supported(session.connection(), function).map_err(|error| {
                     classify_error(
                         request,
@@ -674,10 +797,29 @@ mod runtime {
                         AnalysisStage::CapabilityProbe,
                     )
                 })?;
-            catalog_functions.push(OdbcCatalogFunctionCapability {
-                function,
-                driver_declared_supported: supported,
-            });
+            let support = if !declared_supported {
+                OdbcCatalogFunctionSupport::NotSupported
+            } else if runtime_verifiable(function) {
+                verify_catalog_function_call(
+                    session.connection(),
+                    function,
+                    current_catalog.as_deref(),
+                    request.requested_schemas.first().map(String::as_str),
+                    deadline.remaining_seconds(request, AnalysisStage::CapabilityProbe)?,
+                )
+                .map_err(|error| {
+                    classify_error(
+                        request,
+                        connection_string,
+                        error,
+                        AnalysisStage::CapabilityProbe,
+                    )
+                })?;
+                OdbcCatalogFunctionSupport::RuntimeCallVerified
+            } else {
+                OdbcCatalogFunctionSupport::DriverDeclared
+            };
+            catalog_functions.push(OdbcCatalogFunctionCapability { function, support });
         }
         checkpoint(
             request,
@@ -689,7 +831,7 @@ mod runtime {
             classify_error(request, connection_string, error, AnalysisStage::Connection)
         })?;
 
-        let completeness = rejected_assessment(&catalog_functions);
+        let completeness = completeness_assessment(&driver, &server, &catalog_functions);
         Ok(OdbcCapabilityReport {
             contract_version: ODBC_PROBE_CONTRACT_VERSION,
             source_kind: ODBC_SOURCE.to_owned(),
@@ -704,6 +846,123 @@ mod runtime {
             catalog_functions,
             completeness,
         })
+    }
+
+    pub(super) fn analyze_with_registered_strategy(
+        connection_string: &str,
+        request: &IntrospectionRequest,
+        cancellation: &CancellationToken,
+        report: &OdbcCapabilityReport,
+    ) -> Option<AnalysisOutcome> {
+        let strategy = strategy_for(&report.driver, &report.server)?;
+        let OdbcCompletenessAssessment::Eligible { strategy: eligible } = &report.completeness
+        else {
+            return None;
+        };
+        (eligible == strategy.id())
+            .then(|| strategy.analyze(connection_string, request, cancellation))
+    }
+
+    pub(super) fn completeness_assessment(
+        driver: &OdbcDriverIdentity,
+        server: &OdbcServerIdentity,
+        functions: &[OdbcCatalogFunctionCapability],
+    ) -> OdbcCompletenessAssessment {
+        let Some(strategy) = strategy_for(driver, server) else {
+            return rejected_assessment(functions, None);
+        };
+        let requirements_met = strategy.required_functions().iter().all(|required| {
+            functions.iter().any(|capability| {
+                capability.function == *required
+                    && if runtime_verifiable(*required) {
+                        capability.support == OdbcCatalogFunctionSupport::RuntimeCallVerified
+                    } else {
+                        capability.support != OdbcCatalogFunctionSupport::NotSupported
+                    }
+            })
+        });
+        if requirements_met {
+            OdbcCompletenessAssessment::Eligible {
+                strategy: strategy.id().to_owned(),
+            }
+        } else {
+            rejected_assessment(functions, Some(strategy.id()))
+        }
+    }
+
+    fn strategy_for(
+        driver: &OdbcDriverIdentity,
+        server: &OdbcServerIdentity,
+    ) -> Option<&'static dyn OdbcProductStrategy> {
+        BUILTIN_ODBC_STRATEGIES
+            .iter()
+            .copied()
+            .find(|strategy| strategy.matches(driver, server))
+    }
+
+    pub(super) fn sqlserver_native_connection_string(
+        connection_string: &str,
+        request: &IntrospectionRequest,
+    ) -> Result<String, AnalysisFailure> {
+        let mut values = connection_string.parse::<AdoNetString>().map_err(|error| {
+            configuration_failure(
+                request,
+                connection_string,
+                format!("cannot translate ODBC settings for SQL Server: {error}"),
+                "use an explicit SQL Server ODBC driver connection string",
+            )
+        })?;
+
+        values.remove("driver");
+        values.remove("dsn");
+        move_connection_value(
+            &mut values,
+            &["host", "hostname", "address", "addr", "network address"],
+            "server",
+        );
+        move_connection_value(
+            &mut values,
+            &["trust server certificate"],
+            "trustservercertificate",
+        );
+        move_connection_value(
+            &mut values,
+            &["trusted_connection", "trusted connection"],
+            "integrated security",
+        );
+
+        if connection_value(&values, &["server"]).is_none() {
+            return Err(configuration_failure(
+                request,
+                connection_string,
+                "SQL Server ODBC bridge requires an explicit server endpoint",
+                "set Server explicitly in the ODBC connection string",
+            ));
+        }
+        if connection_value(&values, &["database", "initial catalog", "databasename"]).is_none() {
+            return Err(configuration_failure(
+                request,
+                connection_string,
+                "SQL Server ODBC bridge requires one explicit database",
+                "set Database or Initial Catalog explicitly",
+            ));
+        }
+        Ok(values.to_string())
+    }
+
+    fn move_connection_value(values: &mut AdoNetString, aliases: &[&str], canonical: &str) {
+        if values.contains_key(canonical) {
+            for alias in aliases {
+                values.remove(*alias);
+            }
+            return;
+        }
+        if let Some(value) = aliases.iter().find_map(|alias| values.remove(*alias)) {
+            values.insert(canonical.to_owned(), value);
+        }
+        for alias in aliases {
+            values.remove(*alias);
+        }
     }
 
     fn allocate_environment() -> Result<Environment, OdbcCallError> {
@@ -883,6 +1142,98 @@ mod runtime {
                 format!("ODBC driver returned invalid SQLGetFunctions value {value}"),
             )),
         }
+    }
+
+    fn runtime_verifiable(function: OdbcCatalogFunction) -> bool {
+        matches!(
+            function,
+            OdbcCatalogFunction::Tables
+                | OdbcCatalogFunction::Columns
+                | OdbcCatalogFunction::PrimaryKeys
+                | OdbcCatalogFunction::ForeignKeys
+        )
+    }
+
+    fn verify_catalog_function_call(
+        connection: &Connection<'_>,
+        function: OdbcCatalogFunction,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        timeout_seconds: u32,
+    ) -> Result<(), OdbcCallError> {
+        let mut statement = connection
+            .allocate_statement()
+            .into_result(connection)
+            .map_err(OdbcCallError::from)?;
+        statement
+            .set_query_timeout_sec(timeout_seconds as usize)
+            .into_result(&statement)
+            .map_err(OdbcCallError::from)?;
+        let actual_timeout = statement
+            .query_timeout_sec()
+            .into_result(&statement)
+            .map_err(OdbcCallError::from)?;
+        if actual_timeout == 0 || actual_timeout > timeout_seconds as usize {
+            return Err(OdbcCallError::new(
+                None,
+                format!(
+                    "ODBC driver reported unsafe query timeout {actual_timeout}s for a {timeout_seconds}s deadline"
+                ),
+            ));
+        }
+        let mut statement = unsafe { Preallocated::new(statement) };
+        let catalog = catalog.unwrap_or("");
+        let schema = schema.unwrap_or("");
+        match function {
+            OdbcCatalogFunction::Tables => {
+                let mut rows = statement
+                    .tables(catalog, schema, CATALOG_PROBE_SENTINEL, "")
+                    .map_err(OdbcCallError::from)?;
+                if let Some(row) = rows.next() {
+                    row.map_err(OdbcCallError::from)?;
+                }
+            }
+            OdbcCatalogFunction::Columns => {
+                let mut rows = statement
+                    .columns(
+                        catalog,
+                        schema,
+                        CATALOG_PROBE_SENTINEL,
+                        CATALOG_PROBE_SENTINEL,
+                    )
+                    .map_err(OdbcCallError::from)?;
+                if let Some(row) = rows.next() {
+                    row.map_err(OdbcCallError::from)?;
+                }
+            }
+            OdbcCatalogFunction::PrimaryKeys => {
+                let mut rows = statement
+                    .primary_keys(
+                        (!catalog.is_empty()).then_some(catalog),
+                        (!schema.is_empty()).then_some(schema),
+                        CATALOG_PROBE_SENTINEL,
+                    )
+                    .map_err(OdbcCallError::from)?;
+                if let Some(row) = rows.next() {
+                    row.map_err(OdbcCallError::from)?;
+                }
+            }
+            OdbcCatalogFunction::ForeignKeys => {
+                let mut rows = statement
+                    .foreign_keys("", "", "", catalog, schema, CATALOG_PROBE_SENTINEL)
+                    .map_err(OdbcCallError::from)?;
+                if let Some(row) = rows.next() {
+                    row.map_err(OdbcCallError::from)?;
+                }
+            }
+            _ => {
+                return Err(OdbcCallError::new(
+                    None,
+                    "ODBC catalog function has no runtime verifier",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn transaction_capability(
@@ -1250,10 +1601,11 @@ mod tests {
             .into_iter()
             .map(|function| OdbcCatalogFunctionCapability {
                 function,
-                driver_declared_supported: true,
+                support: OdbcCatalogFunctionSupport::DriverDeclared,
             })
             .collect::<Vec<_>>();
-        let OdbcCompletenessAssessment::Rejected { blockers } = rejected_assessment(&capabilities)
+        let OdbcCompletenessAssessment::Rejected { blockers } =
+            rejected_assessment(&capabilities, None)
         else {
             panic!("generic ODBC must remain rejected without a certified strategy");
         };
@@ -1264,6 +1616,88 @@ mod tests {
         assert!(blockers
             .iter()
             .any(|blocker| blocker.contains("live-certified")));
+    }
+
+    #[cfg(feature = "odbc")]
+    #[test]
+    fn sqlserver_strategy_requires_runtime_verified_catalog_calls() {
+        let driver = OdbcDriverIdentity {
+            name: "ODBC Driver 17 for SQL Server".to_owned(),
+            version: "17.10".to_owned(),
+            odbc_version: "03.80".to_owned(),
+        };
+        let server = OdbcServerIdentity {
+            product: "Microsoft SQL Server".to_owned(),
+            version: "16.00".to_owned(),
+        };
+        let declared = OdbcCatalogFunction::ALL
+            .into_iter()
+            .map(|function| OdbcCatalogFunctionCapability {
+                function,
+                support: OdbcCatalogFunctionSupport::DriverDeclared,
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            runtime::completeness_assessment(&driver, &server, &declared),
+            OdbcCompletenessAssessment::Rejected { .. }
+        ));
+
+        let verified = declared
+            .into_iter()
+            .map(|capability| OdbcCatalogFunctionCapability {
+                support: if matches!(
+                    capability.function,
+                    OdbcCatalogFunction::Tables
+                        | OdbcCatalogFunction::Columns
+                        | OdbcCatalogFunction::PrimaryKeys
+                        | OdbcCatalogFunction::ForeignKeys
+                ) {
+                    OdbcCatalogFunctionSupport::RuntimeCallVerified
+                } else {
+                    capability.support
+                },
+                ..capability
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            runtime::completeness_assessment(&driver, &server, &verified),
+            OdbcCompletenessAssessment::Eligible {
+                strategy: "sqlserver-native-bridge-v1".to_owned()
+            }
+        );
+
+        let impostor = OdbcServerIdentity {
+            product: "SQL Server compatible proxy".to_owned(),
+            version: "16.00".to_owned(),
+        };
+        assert!(matches!(
+            runtime::completeness_assessment(&driver, &impostor, &verified),
+            OdbcCompletenessAssessment::Rejected { .. }
+        ));
+    }
+
+    #[cfg(feature = "odbc")]
+    #[test]
+    fn sqlserver_bridge_normalizes_odbc_aliases_without_losing_secrets() {
+        let input = "Driver={ODBC Driver 17 for SQL Server};Address=127.0.0.1,1433;Initial Catalog=app;UID=reader;PWD={p;a};Encrypt=no;Trust Server Certificate=yes";
+        let translated = runtime::sqlserver_native_connection_string(input, &request()).unwrap();
+        let values = translated.parse::<AdoNetString>().unwrap();
+
+        assert!(!values.contains_key("driver"));
+        assert_eq!(
+            values.get("server").map(String::as_str),
+            Some("127.0.0.1,1433")
+        );
+        assert_eq!(
+            values.get("initial catalog").map(String::as_str),
+            Some("app")
+        );
+        assert_eq!(values.get("uid").map(String::as_str), Some("reader"));
+        assert_eq!(values.get("pwd").map(String::as_str), Some("p;a"));
+        assert_eq!(
+            values.get("trustservercertificate").map(String::as_str),
+            Some("yes")
+        );
     }
 
     #[test]
@@ -1307,26 +1741,40 @@ mod tests {
             .contains("sql server"));
         assert!(report.read_only_access_mode);
         assert!(report.metadata_functions_only);
-        assert!(report
-            .catalog_functions
-            .iter()
-            .find(|capability| capability.function == OdbcCatalogFunction::Tables)
-            .is_some_and(|capability| capability.driver_declared_supported));
+        for function in [
+            OdbcCatalogFunction::Tables,
+            OdbcCatalogFunction::Columns,
+            OdbcCatalogFunction::PrimaryKeys,
+            OdbcCatalogFunction::ForeignKeys,
+        ] {
+            assert!(report
+                .catalog_functions
+                .iter()
+                .find(|capability| capability.function == function)
+                .is_some_and(|capability| {
+                    capability.support == OdbcCatalogFunctionSupport::RuntimeCallVerified
+                }));
+        }
         assert!(matches!(
             report.completeness,
-            OdbcCompletenessAssessment::Rejected { .. }
+            OdbcCompletenessAssessment::Eligible { ref strategy }
+                if strategy == "sqlserver-native-bridge-v1"
         ));
         let serialized = serde_json::to_string(&report).unwrap();
         assert!(!serialized.contains(&connection_string));
         assert!(!serialized.contains("PWD"));
 
         let outcome = introspect_odbc_complete(&connection_string, "odbc-sqlserver");
-        assert_eq!(outcome.status(), AnalysisStatus::Failed);
+        assert_eq!(outcome.status(), AnalysisStatus::Complete);
+        let snapshot = outcome
+            .certified_snapshot()
+            .expect("SQL Server ODBC bridge must return the native certified snapshot");
+        assert_eq!(snapshot.snapshot.schema.source_kind, "sqlserver");
         assert_eq!(
-            outcome.failure().map(|failure| failure.code),
-            Some(AnalysisFailureCode::UnsupportedProduct)
+            snapshot.completeness.status,
+            crate::certification::CompletionStatus::Complete
         );
-        assert!(outcome.certified_snapshot().is_none());
+        assert!(outcome.failure().is_none());
     }
 
     fn request() -> IntrospectionRequest {
