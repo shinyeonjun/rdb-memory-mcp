@@ -1,0 +1,204 @@
+name: Live Adapter Certification
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_proprietary:
+        description: Run SQL Server, Oracle, and ODBC tests on the licensed self-hosted runner
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 3 1 * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-adapter-certification
+  cancel-in-progress: false
+
+jobs:
+  open-source-matrix:
+    name: ${{ matrix.service }} live certification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - service: postgres14
+            container: dbmcp-postgres14
+            family: postgres
+            env_name: DATABASE_MEMORY_TEST_POSTGRES_URL
+            url: postgresql://dbmcp:dbmcp@127.0.0.1:15434/dbmcp?sslmode=disable
+          - service: postgres15
+            container: dbmcp-postgres15
+            family: postgres
+            env_name: DATABASE_MEMORY_TEST_POSTGRES_URL
+            url: postgresql://dbmcp:dbmcp@127.0.0.1:15435/dbmcp?sslmode=disable
+          - service: postgres
+            container: dbmcp-postgres
+            family: postgres
+            env_name: DATABASE_MEMORY_TEST_POSTGRES_URL
+            url: postgresql://dbmcp:dbmcp@127.0.0.1:15432/dbmcp?sslmode=disable
+          - service: postgres17
+            container: dbmcp-postgres17
+            family: postgres
+            env_name: DATABASE_MEMORY_TEST_POSTGRES_URL
+            url: postgresql://dbmcp:dbmcp@127.0.0.1:15437/dbmcp?sslmode=disable
+          - service: postgres18
+            container: dbmcp-postgres18
+            family: postgres
+            env_name: DATABASE_MEMORY_TEST_POSTGRES_URL
+            url: postgresql://dbmcp:dbmcp@127.0.0.1:15438/dbmcp?sslmode=disable
+          - service: yugabytedb
+            container: dbmcp-yugabyte
+            family: yugabytedb
+            env_name: DATABASE_MEMORY_TEST_YUGABYTE_URL
+            url: postgresql://yugabyte@127.0.0.1:15443/yugabyte?sslmode=disable
+          - service: mysql80
+            container: dbmcp-mysql80
+            family: mysql
+            env_name: DATABASE_MEMORY_TEST_MYSQL80_URL
+            url: mysql://dbmcp:dbmcp@127.0.0.1:13308/dbmcp
+          - service: mysql
+            container: dbmcp-mysql
+            family: mysql
+            env_name: DATABASE_MEMORY_TEST_MYSQL84_URL
+            url: mysql://dbmcp:dbmcp@127.0.0.1:13306/dbmcp
+          - service: mysql97
+            container: dbmcp-mysql97
+            family: mysql
+            env_name: DATABASE_MEMORY_TEST_MYSQL97_URL
+            url: mysql://dbmcp:dbmcp@127.0.0.1:13309/dbmcp
+          - service: mariadb1011
+            container: dbmcp-mariadb1011
+            family: mysql
+            env_name: DATABASE_MEMORY_TEST_MARIADB1011_URL
+            url: mysql://dbmcp:dbmcp@127.0.0.1:13311/dbmcp
+          - service: mariadb114
+            container: dbmcp-mariadb114
+            family: mysql
+            env_name: DATABASE_MEMORY_TEST_MARIADB114_URL
+            url: mysql://dbmcp:dbmcp@127.0.0.1:13314/dbmcp
+          - service: mariadb118
+            container: dbmcp-mariadb118
+            family: mysql
+            env_name: DATABASE_MEMORY_TEST_MARIADB118_URL
+            url: mysql://dbmcp:dbmcp@127.0.0.1:13318/dbmcp
+          - service: mariadb123
+            container: dbmcp-mariadb123
+            family: mysql
+            env_name: DATABASE_MEMORY_TEST_MARIADB123_URL
+            url: mysql://dbmcp:dbmcp@127.0.0.1:13323/dbmcp
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal
+          rustup override set 1.96.1
+
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libssl-dev pkg-config
+
+      - name: Start one disposable database
+        run: docker compose -f dev/docker-compose.db-test.yml up --detach ${{ matrix.service }}
+
+      - name: Wait for database health
+        shell: bash
+        run: |
+          for attempt in $(seq 1 240); do
+            status=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' '${{ matrix.container }}' 2>/dev/null || true)
+            if [ "$status" = "healthy" ] || [ "$status" = "running" ]; then
+              exit 0
+            fi
+            if [ "$status" = "unhealthy" ] || [ "$status" = "exited" ]; then
+              docker logs '${{ matrix.container }}'
+              exit 1
+            fi
+            sleep 2
+          done
+          docker logs '${{ matrix.container }}'
+          exit 1
+
+      - name: Export selected live connection
+        shell: bash
+        run: echo '${{ matrix.env_name }}=${{ matrix.url }}' >> "$GITHUB_ENV"
+
+      - name: Run product-specific live contract
+        shell: bash
+        run: |
+          case '${{ matrix.family }}' in
+            postgres)
+              cargo test --locked -p database-memory-core adapters::postgres::tests -- --nocapture
+              ;;
+            yugabytedb)
+              cargo test --locked -p database-memory-core adapters::yugabytedb::tests -- --nocapture
+              ;;
+            mysql)
+              cargo test --locked -p database-memory-core adapters::mysql_catalog::tests -- --nocapture
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+
+      - name: Preserve database logs on failure
+        if: failure()
+        run: docker logs '${{ matrix.container }}'
+
+      - name: Stop disposable database
+        if: always()
+        run: docker compose -f dev/docker-compose.db-test.yml down --volumes --remove-orphans
+
+  proprietary-matrix:
+    name: Licensed SQL Server, Oracle, and ODBC certification
+    if: github.event_name == 'workflow_dispatch' && inputs.include_proprietary
+    runs-on: [self-hosted, Windows, X64, database-memory-proprietary]
+    timeout-minutes: 90
+    env:
+      DATABASE_MEMORY_TEST_SQLSERVER2017_URL: ${{ secrets.DATABASE_MEMORY_TEST_SQLSERVER2017_URL }}
+      DATABASE_MEMORY_TEST_SQLSERVER2019_URL: ${{ secrets.DATABASE_MEMORY_TEST_SQLSERVER2019_URL }}
+      DATABASE_MEMORY_TEST_SQLSERVER2022_URL: ${{ secrets.DATABASE_MEMORY_TEST_SQLSERVER2022_URL }}
+      DATABASE_MEMORY_TEST_SQLSERVER2025_URL: ${{ secrets.DATABASE_MEMORY_TEST_SQLSERVER2025_URL }}
+      DATABASE_MEMORY_TEST_ORACLE_URL: ${{ secrets.DATABASE_MEMORY_TEST_ORACLE_URL }}
+      DATABASE_MEMORY_TEST_ODBC_SQLSERVER_URL: ${{ secrets.DATABASE_MEMORY_TEST_ODBC_SQLSERVER_URL }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal
+          rustup override set 1.96.1
+
+      - name: Require licensed runner connection secrets
+        shell: pwsh
+        run: |
+          foreach ($name in @(
+            "DATABASE_MEMORY_TEST_SQLSERVER2017_URL",
+            "DATABASE_MEMORY_TEST_SQLSERVER2019_URL",
+            "DATABASE_MEMORY_TEST_SQLSERVER2022_URL",
+            "DATABASE_MEMORY_TEST_SQLSERVER2025_URL",
+            "DATABASE_MEMORY_TEST_ORACLE_URL",
+            "DATABASE_MEMORY_TEST_ODBC_SQLSERVER_URL"
+          )) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Missing required self-hosted runner secret: $name"
+            }
+          }
+
+      - name: Run SQL Server native contract
+        run: cargo test --locked -p database-memory-core adapters::sqlserver_catalog::tests -- --nocapture
+
+      - name: Run Oracle native contract
+        run: cargo test --locked -p database-memory-core adapters::oracle_catalog::tests -- --nocapture
+
+      - name: Run SQL Server ODBC contract
+        run: cargo test --locked -p database-memory-core --features odbc adapters::odbc::tests -- --nocapture

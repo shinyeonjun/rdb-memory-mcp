@@ -25,9 +25,14 @@ diff for Backend Visual Map's later integration layer.
   failed analysis preserves the previous complete generation.
 - Generic CLI and MCP discovery covers all 26 canonical object kinds with
   bounded database-side pagination and structured errors.
-- The default workspace has 201 passing tests; the ODBC-enabled workspace has
-  203. Live network cases remain environment-gated and fail closed when a
+- The default workspace has 207 passing tests; the ODBC-enabled workspace has
+  209. The release-profile workspace also has 207 passing tests. Live network
+  cases remain environment-gated and fail closed when a
   product/version or evidence requirement is not certified.
+- Certified graph persistence reconciles both semantic relationship counts and
+  the physical traversal projection inside the replacement transaction.
+- MCP local-file access is restricted to canonicalized startup-time allowed
+  roots; CLI path selection remains under the trusted local operator.
 
 ## Required Behavior
 
@@ -509,6 +514,8 @@ Rollback:
 
 ### Phase 10: Scale, Security, Packaging, And Release Audit
 
+Status: Complete (2026-07-22)
+
 Goal:
 
 - Prove production readiness requirement by requirement.
@@ -520,6 +527,23 @@ Deliverables:
 - Live adapter CI matrix and generated support ledger.
 - Windows/Linux packaging and checksum verification.
 - Requirement traceability report with no unproven item.
+
+Completed:
+
+- Added deterministic 10k/50k/100k/1M release-process scale gates and committed
+  Windows X64 evidence. The 1M case remains bounded and is documented as a
+  heavyweight ceiling rather than a normal interactive target.
+- Added repository threat modeling, read-only source guards, DML/DDL regression
+  guards, RustSec auditing, and a reviewed dependency exception ledger.
+- Reconciled certified semantic relationship counts against actual graph nodes
+  and traversal edges in the same transaction. This exposed and fixed missing
+  CHECK-constraint column edges.
+- Added a fail-closed MCP filesystem policy with explicit allowed roots and a
+  safer environment-variable credential path for CLI profiles.
+- Added Windows/Linux quality, release, packaging, checksum, and live adapter
+  workflows with pinned actions and Rust 1.96.1.
+- Rebuilt and extracted the Windows package, then revalidated its contract,
+  support ledger, manifest hashes, and platform checksum.
 
 Verification:
 
@@ -533,6 +557,29 @@ cargo test --workspace --release
 Rollback:
 
 - Do not publish; preserve the last certified release and caches.
+
+### Phase 11: Final Support Ledger And Release Candidate
+
+Status: In Progress
+
+Goal:
+
+- Stabilize `main`, collect hosted workflow receipts, and freeze the exact
+  release support boundary before Backend Map integration begins.
+
+Deliverables:
+
+- Green Windows/Linux hosted quality and packaging runs for the merged commit.
+- Green open-source live adapter matrix for every claimed version.
+- Proprietary SQL Server/Oracle/ODBC matrix receipt when an owner-controlled,
+  licensed self-hosted runner and secrets are available.
+- Final machine-readable support ledger review and release-candidate decision.
+
+Release rule:
+
+- No tag is published while a required workflow is failing or while a claimed
+  product/version lacks matching live evidence. DB2 remains explicitly deferred
+  under the owner's no-EULA decision and is not a release blocker or claim.
 
 ## Test Plan
 
@@ -557,7 +604,8 @@ Rollback:
 | RDB-F009..F010 | generated support ledger and live certification matrix |
 | RDB-C001..C007 | completeness proof tests and failure atomicity tests |
 | RDB-S001..S006 | security tests, redaction tests, metadata query audit |
-| RDB-R001..R006 | store recovery, bounded algorithms, scale and CI evidence |
+| RDB-R001..R005 | store recovery, projection reconciliation, bounded algorithms, and committed scale evidence |
+| RDB-R006 | live adapter workflow plus Phase 11 hosted/self-hosted release receipts |
 | RDB-I001..I005 | versioned JSON fixtures and migration tests |
 
 ## Risks And Assumptions

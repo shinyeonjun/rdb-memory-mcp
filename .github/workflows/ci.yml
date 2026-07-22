@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Quality (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal --component clippy --component rustfmt
+          rustup override set 1.96.1
+          rustc --version --verbose
+
+      - name: Install Linux native build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libssl-dev pkg-config unixodbc-dev
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint default build
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Test default build
+        run: cargo test --locked --workspace
+
+      - name: Lint ODBC build
+        run: cargo clippy --locked --workspace --all-targets --features database-memory-core/odbc -- -D warnings
+
+      - name: Test ODBC build
+        run: cargo test --locked --workspace --features database-memory-core/odbc
+
+  release-evidence:
+    name: Release profile and bounded scale evidence
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal
+          rustup override set 1.96.1
+
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libssl-dev pkg-config
+
+      - name: Test release profile
+        run: cargo test --locked --workspace --release
+
+      - name: Build release binaries
+        run: cargo build --locked --workspace --release
+
+      - name: Run 10k-object release scale gate
+        shell: pwsh
+        run: ./scripts/run-scale-audit.ps1 -Targets "10000"
+
+      - name: Package and verify Linux release
+        shell: pwsh
+        run: ./scripts/package-release.ps1 -Platform linux-amd64
+
+      - name: Upload release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-evidence-linux-amd64
+          path: |
+            dist/rdb-memory-mcp-linux-amd64.tar.gz
+            dist/checksums-linux-amd64.txt
+            target/scale-audit/report.json
+          if-no-files-found: error
+          retention-days: 14
+
+  dependency-audit:
+    name: RustSec dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal
+          rustup override set 1.96.1
+
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Audit locked dependencies
+        run: cargo audit
