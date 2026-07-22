@@ -823,6 +823,16 @@ struct RawMaterializedView {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct RawSynonym {
+    owner: String,
+    name: String,
+    target_owner: String,
+    target_name: String,
+    database_link: Option<String>,
+    origin_container_id: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RawTrigger {
     owner: String,
     name: String,
@@ -1000,6 +1010,7 @@ struct RawOracleCatalog {
     views: Vec<RawView>,
     view_columns: Vec<RawColumn>,
     materialized_views: Vec<RawMaterializedView>,
+    synonyms: Vec<RawSynonym>,
     triggers: Vec<RawTrigger>,
     routines: Vec<RawRoutine>,
     routine_arguments: Vec<RawRoutineArgument>,
@@ -1035,6 +1046,8 @@ impl RawOracleCatalog {
             .map_err(|error| error.catalog_context("view-column"))?;
         let materialized_views = read_materialized_views(connection, scope, deadline)
             .map_err(|error| error.catalog_context("materialized-view"))?;
+        let synonyms = read_synonyms(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("synonym"))?;
         let triggers = read_triggers(connection, scope, deadline)
             .map_err(|error| error.catalog_context("trigger"))?;
         let mut routines = read_routines(connection, scope, deadline)
@@ -1073,6 +1086,7 @@ impl RawOracleCatalog {
             views,
             view_columns,
             materialized_views,
+            synonyms,
             triggers,
             routines,
             routine_arguments,
@@ -1971,6 +1985,59 @@ fn read_materialized_views(
     materialized_views
         .sort_by(|left, right| (&left.owner, &left.name).cmp(&(&right.owner, &right.name)));
     Ok(materialized_views)
+}
+
+fn read_synonyms(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawSynonym>, CatalogError> {
+    let mut synonyms = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let sql = match scope.mode {
+            DictionaryScopeMode::User => {
+                "
+                SELECT :1,
+                       SYNONYM_NAME,
+                       TABLE_OWNER,
+                       TABLE_NAME,
+                       DB_LINK,
+                       ORIGIN_CON_ID
+                FROM USER_SYNONYMS
+                ORDER BY SYNONYM_NAME
+                "
+            }
+            DictionaryScopeMode::Dba => {
+                "
+                SELECT OWNER,
+                       SYNONYM_NAME,
+                       TABLE_OWNER,
+                       TABLE_NAME,
+                       DB_LINK,
+                       ORIGIN_CON_ID
+                FROM DBA_SYNONYMS
+                WHERE OWNER = :1
+                ORDER BY OWNER, SYNONYM_NAME
+                "
+            }
+        };
+        let rows = connection
+            .query_as::<(String, String, String, String, Option<String>, i64)>(sql, &[owner])?;
+        for row in rows {
+            let (owner, name, target_owner, target_name, database_link, origin_container_id) = row?;
+            synonyms.push(RawSynonym {
+                owner,
+                name,
+                target_owner,
+                target_name,
+                database_link: normalize_optional_token(database_link),
+                origin_container_id,
+            });
+        }
+    }
+    synonyms.sort_by(|left, right| (&left.owner, &left.name).cmp(&(&right.owner, &right.name)));
+    Ok(synonyms)
 }
 
 fn read_triggers(
@@ -3754,6 +3821,7 @@ fn validate_raw_catalog(
                     | "PROCEDURE"
                     | "PACKAGE"
                     | "PACKAGE BODY"
+                    | "SYNONYM"
             )
         })
         .take(8)
@@ -4081,6 +4149,52 @@ fn validate_raw_catalog(
         return Err(CatalogError::Mapping(format!(
             "Oracle materialized-view inventory mismatch: USER/DBA_OBJECTS reports {inventory_mview_count}, USER/DBA_MVIEWS reports {}",
             raw.materialized_views.len()
+        )));
+    }
+
+    let mut synonyms = BTreeSet::new();
+    for synonym in &raw.synonyms {
+        ensure_owner(scope, &synonym.owner, "synonym")?;
+        ensure_owner(scope, &synonym.target_owner, "synonym target")?;
+        if synonym.database_link.is_some() {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle synonym {}.{} uses remote database link '{}'",
+                synonym.owner,
+                synonym.name,
+                synonym.database_link.as_deref().unwrap_or_default()
+            )));
+        }
+        if synonym.origin_container_id < 0 {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle synonym {}.{} has invalid origin container id {}",
+                synonym.owner, synonym.name, synonym.origin_container_id
+            )));
+        }
+        if !synonyms.insert((synonym.owner.clone(), synonym.name.clone())) {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle synonym {}.{}",
+                synonym.owner, synonym.name
+            )));
+        }
+        if !inventory_keys.contains(&(
+            synonym.owner.clone(),
+            "SYNONYM".to_owned(),
+            synonym.name.clone(),
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle synonym {}.{} is missing from the independent object inventory",
+                synonym.owner, synonym.name
+            )));
+        }
+    }
+    let inventory_synonym_count = inventory
+        .iter()
+        .filter(|object| object.object_type == "SYNONYM")
+        .count();
+    if inventory_synonym_count != raw.synonyms.len() {
+        return Err(CatalogError::Mapping(format!(
+            "Oracle synonym inventory mismatch: USER/DBA_OBJECTS reports {inventory_synonym_count}, USER/DBA_SYNONYMS reports {}",
+            raw.synonyms.len()
         )));
     }
 
@@ -4730,11 +4844,14 @@ fn validate_raw_catalog(
         let source_is_package =
             matches!(dependency.object_type.as_str(), "PACKAGE" | "PACKAGE BODY")
                 && packages.contains_key(&(dependency.owner.clone(), dependency.name.clone()));
+        let source_is_synonym = dependency.object_type == "SYNONYM"
+            && synonyms.contains(&(dependency.owner.clone(), dependency.name.clone()));
         if !source_is_view
             && !source_is_mview
             && !source_is_trigger
             && !source_is_routine
             && !source_is_package
+            && !source_is_synonym
         {
             return Err(CatalogError::UnsupportedMetadata(format!(
                 "Oracle dependency source is not yet covered: {}.{} ({})",
@@ -4781,12 +4898,36 @@ fn validate_raw_catalog(
                 dependency.referenced_owner.clone(),
                 dependency.referenced_name.clone(),
             )),
+            "SYNONYM" => synonyms.contains(&(
+                dependency.referenced_owner.clone(),
+                dependency.referenced_name.clone(),
+            )),
             _ => false,
         };
         if !target_exists {
             return Err(CatalogError::UnsupportedMetadata(format!(
                 "Oracle dependency target is outside the covered object set: {}.{} ({})",
                 dependency.referenced_owner, dependency.referenced_name, dependency.referenced_type
+            )));
+        }
+    }
+    for synonym in &raw.synonyms {
+        let target_dependency_count = raw
+            .dependencies
+            .iter()
+            .filter(|dependency| {
+                dependency.object_type == "SYNONYM"
+                    && dependency.owner == synonym.owner
+                    && dependency.name == synonym.name
+                    && !dependency.referenced_owner_oracle_maintained
+                    && dependency.referenced_owner == synonym.target_owner
+                    && dependency.referenced_name == synonym.target_name
+            })
+            .count();
+        if target_dependency_count != 1 {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle synonym {}.{} has {target_dependency_count} matching target dependency rows; expected exactly one",
+                synonym.owner, synonym.name
             )));
         }
     }
@@ -5870,6 +6011,166 @@ impl<'a> OracleSnapshotMapper<'a> {
                     "Oracle package argument relationship ordinal",
                 )?),
                 properties: BTreeMap::new(),
+            });
+        }
+
+        let mut synonym_keys = BTreeMap::new();
+        for synonym in &raw.synonyms {
+            let schema_key = required(
+                schema_keys.get(&synonym.owner),
+                format!(
+                    "schema key for Oracle synonym {}.{}",
+                    synonym.owner, synonym.name
+                ),
+            )?;
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &synonym.owner,
+                ObjectKind::Synonym,
+                &synonym.name,
+                None,
+            );
+            synonym_keys.insert((synonym.owner.clone(), synonym.name.clone()), key.clone());
+            let inventory_object = required(
+                inventory.get(&(
+                    synonym.owner.clone(),
+                    "SYNONYM".to_owned(),
+                    synonym.name.clone(),
+                )),
+                format!(
+                    "inventory row for Oracle synonym {}.{}",
+                    synonym.owner, synonym.name
+                ),
+            )?;
+            let mut properties = inventory_properties(inventory_object);
+            insert_string(&mut properties, "target_owner", &synonym.target_owner);
+            insert_string(&mut properties, "target_name", &synonym.target_name);
+            insert_optional_string(
+                &mut properties,
+                "database_link",
+                synonym.database_link.as_deref(),
+            );
+            insert_i64(
+                &mut properties,
+                "origin_container_id",
+                synonym.origin_container_id,
+            );
+            metadata.objects.push(MetadataObject {
+                key,
+                parent_key: Some(schema_key.clone()),
+                name: synonym.name.clone(),
+                extension_kind: None,
+                definition: None,
+                properties,
+            });
+        }
+        for dependency in raw
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.object_type == "SYNONYM")
+            .filter(|dependency| !dependency.referenced_owner_oracle_maintained)
+        {
+            let source_key = required(
+                synonym_keys.get(&(dependency.owner.clone(), dependency.name.clone())),
+                format!(
+                    "source key for Oracle synonym dependency {}.{}",
+                    dependency.owner, dependency.name
+                ),
+            )?;
+            let target_key = match dependency.referenced_type.as_str() {
+                "TABLE" => match materialized_view_keys.get(&(
+                    dependency.referenced_owner.clone(),
+                    dependency.referenced_name.clone(),
+                )) {
+                    Some(key) => key,
+                    None => required(
+                        table_keys.get(&(
+                            dependency.referenced_owner.clone(),
+                            dependency.referenced_name.clone(),
+                        )),
+                        format!(
+                            "table target for Oracle synonym dependency {}.{}",
+                            dependency.referenced_owner, dependency.referenced_name
+                        ),
+                    )?,
+                },
+                "VIEW" => required(
+                    view_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )),
+                    format!(
+                        "view target for Oracle synonym dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
+                "MATERIALIZED VIEW" => required(
+                    materialized_view_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )),
+                    format!(
+                        "materialized-view target for Oracle synonym dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
+                "SEQUENCE" => required(
+                    sequence_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )),
+                    format!(
+                        "sequence target for Oracle synonym dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
+                "FUNCTION" | "PROCEDURE" => required(
+                    routine_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                        dependency.referenced_type.clone(),
+                    )),
+                    format!(
+                        "routine target for Oracle synonym dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
+                "PACKAGE" => required(
+                    package_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )),
+                    format!(
+                        "package target for Oracle synonym dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
+                "SYNONYM" => required(
+                    synonym_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )),
+                    format!(
+                        "synonym target for Oracle dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
+                other => {
+                    return Err(CatalogError::Mapping(format!(
+                        "unmapped Oracle synonym target type '{other}'"
+                    )));
+                }
+            };
+            metadata.relationships.push(MetadataRelationship {
+                kind: MetadataRelationshipKind::SynonymFor,
+                from_key: source_key.clone(),
+                to_key: target_key.clone(),
+                ordinal: None,
+                properties: BTreeMap::from([(
+                    "oracle_dependency_type".to_owned(),
+                    MetadataValue::String(dependency.dependency_type.clone()),
+                )]),
             });
         }
 
@@ -6957,7 +7258,7 @@ impl<'a> OracleSnapshotMapper<'a> {
                 CapabilityCheck {
                     name: "independent_inventory_reconciliation".to_owned(),
                     evidence: format!(
-                        "{} non-secondary USER/DBA_OBJECTS rows reconciled against table, index, sequence, view, materialized-view, trigger, routine, and package detail catalogs",
+                        "{} non-secondary USER/DBA_OBJECTS rows reconciled against table, index, sequence, view, materialized-view, synonym, trigger, routine, and package detail catalogs",
                         raw.inventory.iter().filter(|object| !object.secondary).count()
                     ),
                 },
@@ -7632,6 +7933,12 @@ fn discovery_counts_from_catalog(
         .filter(|dependency| !dependency.referenced_owner_oracle_maintained)
         .count();
     let package_dependency_count = oracle_package_dependency_groups(&raw.dependencies).len();
+    let synonym_dependency_count = raw
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.object_type == "SYNONYM")
+        .filter(|dependency| !dependency.referenced_owner_oracle_maintained)
+        .count();
 
     set_object_count(&mut objects, ObjectCategory::Database, 1);
     set_object_count(&mut objects, ObjectCategory::Schema, scope.owners.len());
@@ -7640,6 +7947,7 @@ fn discovery_counts_from_catalog(
     set_object_count(&mut objects, ObjectCategory::Index, raw.indexes.len());
     set_object_count(&mut objects, ObjectCategory::Sequence, raw.sequences.len());
     set_object_count(&mut objects, ObjectCategory::View, raw.views.len());
+    set_object_count(&mut objects, ObjectCategory::Synonym, raw.synonyms.len());
     set_object_count(&mut objects, ObjectCategory::Trigger, raw.triggers.len());
     set_object_count(
         &mut objects,
@@ -7775,6 +8083,7 @@ fn discovery_counts_from_catalog(
         RelationshipCategory::MetadataParent,
         scope.principals.len()
             + raw.sequences.len()
+            + raw.synonyms.len()
             + raw.view_columns.len()
             + raw.materialized_views.len()
             + materialized_view_column_count
@@ -7798,6 +8107,7 @@ fn discovery_counts_from_catalog(
         raw.identity_columns.len()
             + materialized_view_dependency_count
             + trigger_dependency_count
+            + synonym_dependency_count
             + raw.routine_arguments.len()
             + raw.package_arguments.len()
             + package_dependency_count
@@ -8041,7 +8351,7 @@ mod tests {
             .admin
             .execute(
                 &format!(
-                    "GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW, CREATE MATERIALIZED VIEW, CREATE TRIGGER, CREATE PROCEDURE, ADMINISTER DATABASE TRIGGER TO {}",
+                    "GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW, CREATE MATERIALIZED VIEW, CREATE TRIGGER, CREATE PROCEDURE, CREATE SYNONYM, ADMINISTER DATABASE TRIGGER TO {}",
                     cleanup.username
                 ),
                 &[],
@@ -8102,6 +8412,16 @@ mod tests {
                 &[],
             )
             .expect("create package body");
+        for statement in [
+            "CREATE SYNONYM CHILD_ALIAS FOR CHILD_ENTITY",
+            "CREATE SYNONYM ACTIVE_PARENT_ALIAS FOR ACTIVE_PARENT",
+            "CREATE SYNONYM AUDIT_SEQUENCE_ALIAS FOR AUDIT_SEQUENCE",
+            "CREATE SYNONYM NORMALIZE_LABEL_ALIAS FOR NORMALIZE_LABEL",
+            "CREATE SYNONYM ITEM_API_ALIAS FOR ITEM_API",
+            "CREATE SYNONYM CHILD_ALIAS_CHAIN FOR CHILD_ALIAS",
+        ] {
+            setup.execute(statement, &[]).expect("create local synonym");
+        }
         drop(setup);
 
         let complete = analyze_oracle(&user_url, "oracle-live", Vec::new(), Vec::new(), 30_000);
@@ -8225,6 +8545,43 @@ mod tests {
                     && relationship.to_key.object_kind == ObjectKind::Table
                     && relationship.to_key.object_name == "CHILD_ENTITY"
             }));
+        for (synonym_name, target_kind, target_name) in [
+            ("CHILD_ALIAS", ObjectKind::Table, "CHILD_ENTITY"),
+            ("ACTIVE_PARENT_ALIAS", ObjectKind::View, "ACTIVE_PARENT"),
+            (
+                "AUDIT_SEQUENCE_ALIAS",
+                ObjectKind::Sequence,
+                "AUDIT_SEQUENCE",
+            ),
+            (
+                "NORMALIZE_LABEL_ALIAS",
+                ObjectKind::Routine,
+                "NORMALIZE_LABEL",
+            ),
+            ("ITEM_API_ALIAS", ObjectKind::Package, "ITEM_API"),
+            ("CHILD_ALIAS_CHAIN", ObjectKind::Synonym, "CHILD_ALIAS"),
+        ] {
+            let synonym = certified
+                .snapshot
+                .metadata
+                .objects
+                .iter()
+                .find(|object| {
+                    object.key.object_kind == ObjectKind::Synonym && object.name == synonym_name
+                })
+                .expect("synonym is mapped");
+            assert!(certified
+                .snapshot
+                .metadata
+                .relationships
+                .iter()
+                .any(|relationship| {
+                    relationship.kind == MetadataRelationshipKind::SynonymFor
+                        && relationship.from_key == synonym.key
+                        && relationship.to_key.object_kind == target_kind
+                        && relationship.to_key.object_name == target_name
+                }));
+        }
 
         let setup = Connection::connect(&cleanup.username, password, &connect_string)
             .expect("reconnect as isolated Oracle test user");
@@ -8450,6 +8807,20 @@ mod tests {
 
         let setup = Connection::connect(&cleanup.username, password, &connect_string)
             .expect("reconnect as isolated Oracle test user");
+        setup
+            .execute("CREATE SYNONYM MISSING_ALIAS FOR MISSING_TARGET", &[])
+            .expect("create unresolved synonym fixture");
+        drop(setup);
+
+        let failed = analyze_oracle(&user_url, "oracle-live", Vec::new(), Vec::new(), 30_000);
+        assert_eq!(failed.status(), AnalysisStatus::Failed);
+        assert!(failed.certified_snapshot().is_none());
+
+        let setup = Connection::connect(&cleanup.username, password, &connect_string)
+            .expect("reconnect as isolated Oracle test user");
+        setup
+            .execute("DROP SYNONYM MISSING_ALIAS", &[])
+            .expect("drop unresolved synonym fixture");
         setup
             .execute(
                 "CREATE OR REPLACE TRIGGER DYNAMIC_TRIGGER BEFORE UPDATE ON CHILD_ENTITY FOR EACH ROW BEGIN EXECUTE IMMEDIATE 'BEGIN NULL; END;'; END;",
