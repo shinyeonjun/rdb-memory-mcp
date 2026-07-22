@@ -1248,6 +1248,7 @@ struct RawIndexColumn {
     name: String,
     position: i64,
     descending: bool,
+    expression: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1389,6 +1390,8 @@ impl RawOracleCatalog {
             .map_err(|error| error.catalog_context("index"))?;
         attach_index_columns(connection, scope, &mut indexes, deadline)
             .map_err(|error| error.catalog_context("index-column"))?;
+        attach_index_expressions(connection, scope, &mut indexes, deadline)
+            .map_err(|error| error.catalog_context("index-expression"))?;
         let partitioned_tables = read_partitioned_tables(connection, scope, deadline)
             .map_err(|error| error.catalog_context("partitioned-table"))?;
         let table_partitions = read_table_partitions(connection, scope, deadline)
@@ -4809,11 +4812,115 @@ fn attach_index_columns(
                 name: column_name,
                 position,
                 descending: descend == "DESC",
+                expression: None,
             });
         }
     }
     for index in indexes {
         index.columns.sort_by_key(|column| column.position);
+    }
+    Ok(())
+}
+
+fn attach_index_expressions(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    indexes: &mut [RawIndex],
+    deadline: Instant,
+) -> Result<(), CatalogError> {
+    let mut positions = BTreeMap::new();
+    for (index_position, index) in indexes.iter().enumerate() {
+        for (column_position, column) in index.columns.iter().enumerate() {
+            let identity = (index.owner.clone(), index.name.clone(), column.position);
+            if positions
+                .insert(identity.clone(), (index_position, column_position))
+                .is_some()
+            {
+                return Err(CatalogError::Mapping(format!(
+                    "duplicate Oracle index-expression position {} for {}.{}",
+                    identity.2, identity.0, identity.1
+                )));
+            }
+        }
+    }
+
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let sql = match scope.mode {
+            DictionaryScopeMode::User => {
+                "
+                SELECT :1,
+                       e.INDEX_NAME,
+                       :1,
+                       e.TABLE_NAME,
+                       e.COLUMN_EXPRESSION,
+                       e.COLUMN_POSITION
+                FROM USER_IND_EXPRESSIONS e
+                JOIN USER_INDEXES i
+                  ON i.INDEX_NAME = e.INDEX_NAME
+                 AND i.TABLE_NAME = e.TABLE_NAME
+                JOIN USER_TABLES t ON t.TABLE_NAME = e.TABLE_NAME
+                WHERE t.SECONDARY = 'N'
+                  AND t.DROPPED = 'NO'
+                  AND i.INDEX_TYPE <> 'LOB'
+                ORDER BY e.TABLE_NAME, e.INDEX_NAME, e.COLUMN_POSITION
+                "
+            }
+            DictionaryScopeMode::Dba => {
+                "
+                SELECT e.INDEX_OWNER,
+                       e.INDEX_NAME,
+                       e.TABLE_OWNER,
+                       e.TABLE_NAME,
+                       e.COLUMN_EXPRESSION,
+                       e.COLUMN_POSITION
+                FROM DBA_IND_EXPRESSIONS e
+                JOIN DBA_INDEXES i
+                  ON i.OWNER = e.INDEX_OWNER
+                 AND i.INDEX_NAME = e.INDEX_NAME
+                 AND i.TABLE_OWNER = e.TABLE_OWNER
+                 AND i.TABLE_NAME = e.TABLE_NAME
+                JOIN DBA_TABLES t
+                  ON t.OWNER = e.TABLE_OWNER
+                 AND t.TABLE_NAME = e.TABLE_NAME
+                WHERE e.TABLE_OWNER = :1
+                  AND t.SECONDARY = 'N'
+                  AND t.DROPPED = 'NO'
+                  AND i.INDEX_TYPE <> 'LOB'
+                ORDER BY e.INDEX_OWNER, e.TABLE_NAME, e.INDEX_NAME, e.COLUMN_POSITION
+                "
+            }
+        };
+        let rows = connection
+            .query_as::<(String, String, String, String, Option<String>, i64)>(sql, &[owner])?;
+        for row in rows {
+            let (index_owner, index_name, table_owner, table_name, expression, position) = row?;
+            let (index_position, column_position) = positions
+                .get(&(index_owner.clone(), index_name.clone(), position))
+                .copied()
+                .ok_or_else(|| {
+                    CatalogError::Mapping(format!(
+                        "Oracle index expression references missing key position {position} for {index_owner}.{index_name}"
+                    ))
+                })?;
+            let index = &mut indexes[index_position];
+            if index.table_owner != table_owner || index.table != table_name {
+                return Err(CatalogError::Mapping(format!(
+                    "Oracle index expression table mismatch for {index_owner}.{index_name}"
+                )));
+            }
+            let expression = normalize_definition(expression)?.ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle index expression is empty for {index_owner}.{index_name} position {position}"
+                ))
+            })?;
+            let column = &mut index.columns[column_position];
+            if column.expression.replace(expression).is_some() {
+                return Err(CatalogError::Mapping(format!(
+                    "duplicate Oracle index expression for {index_owner}.{index_name} position {position}"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -8008,6 +8115,20 @@ fn validate_raw_catalog(
         }
     }
 
+    let columns_by_identity = raw
+        .columns
+        .iter()
+        .map(|column| {
+            (
+                (
+                    column.owner.clone(),
+                    column.table.clone(),
+                    column.name.clone(),
+                ),
+                column,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut indexes = BTreeSet::new();
     for index in &raw.indexes {
         ensure_owner(scope, &index.owner, "index")?;
@@ -8024,7 +8145,15 @@ fn validate_raw_catalog(
                 index.owner, index.name, index.table_owner, index.table
             )));
         }
-        if index.index_type != "NORMAL" || index.secondary {
+        let function_based = matches!(
+            index.index_type.as_str(),
+            "FUNCTION-BASED NORMAL" | "FUNCTION-BASED BITMAP"
+        );
+        if !matches!(
+            index.index_type.as_str(),
+            "NORMAL" | "BITMAP" | "FUNCTION-BASED NORMAL" | "FUNCTION-BASED BITMAP"
+        ) || index.secondary
+        {
             return Err(CatalogError::UnsupportedMetadata(format!(
                 "Oracle index shape is not yet covered for {}.{} (type={}, partitioned={}, secondary={})",
                 index.owner, index.name, index.index_type, index.partitioned, index.secondary
@@ -8037,6 +8166,7 @@ fn validate_raw_catalog(
             )));
         }
         let mut positions = BTreeSet::new();
+        let mut expression_count = 0;
         for column in &index.columns {
             positive_u32(column.position, "Oracle index column ordinal")?;
             if !positions.insert(column.position) {
@@ -8045,16 +8175,84 @@ fn validate_raw_catalog(
                     column.position, index.owner, index.name
                 )));
             }
-            if !column_keys.contains(&(
+            let column_identity = (
                 index.table_owner.clone(),
                 index.table.clone(),
                 column.name.clone(),
-            )) {
+            );
+            if !column_keys.contains(&column_identity) {
                 return Err(CatalogError::Mapping(format!(
                     "Oracle index {}.{} references missing column {}.{}.{}",
                     index.owner, index.name, index.table_owner, index.table, column.name
                 )));
             }
+            let referenced_column = columns_by_identity
+                .get(&column_identity)
+                .copied()
+                .ok_or_else(|| {
+                    CatalogError::Mapping(format!(
+                        "Oracle index {}.{} has no column metadata for {}",
+                        index.owner, index.name, column.name
+                    ))
+                })?;
+            match column.expression.as_deref() {
+                Some(expression) => {
+                    expression_count += 1;
+                    if !function_based
+                        || expression.trim().is_empty()
+                        || !referenced_column.hidden
+                        || referenced_column.user_generated
+                    {
+                        return Err(CatalogError::Mapping(format!(
+                            "Oracle index expression metadata is inconsistent for {}.{} position {}",
+                            index.owner, index.name, column.position
+                        )));
+                    }
+                }
+                None if function_based
+                    && referenced_column.hidden
+                    && !referenced_column.user_generated =>
+                {
+                    return Err(CatalogError::Mapping(format!(
+                        "Oracle function-based index {}.{} is missing expression metadata at position {}",
+                        index.owner, index.name, column.position
+                    )));
+                }
+                None => {}
+            }
+        }
+        if function_based != (expression_count > 0) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle index type and expression catalog disagree for {}.{}",
+                index.owner, index.name
+            )));
+        }
+        match (function_based, index.function_status.as_deref()) {
+            (true, Some("ENABLED")) | (false, None) => {}
+            (true, status) => {
+                return Err(CatalogError::UnsupportedMetadata(format!(
+                    "Oracle function-based index {}.{} is not enabled (status={})",
+                    index.owner,
+                    index.name,
+                    status.unwrap_or("missing")
+                )));
+            }
+            (false, Some(status)) => {
+                return Err(CatalogError::Mapping(format!(
+                    "Oracle non-function index {}.{} unexpectedly reports function status '{status}'",
+                    index.owner, index.name
+                )));
+            }
+        }
+        let expression = oracle_index_expression(index);
+        if expression
+            .as_ref()
+            .is_some_and(|expression| expression.len() > MAX_DEFINITION_BYTES)
+        {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle index expression exceeds the {MAX_DEFINITION_BYTES}-byte safety limit for {}.{}",
+                index.owner, index.name
+            )));
         }
         if !indexes.insert((index.owner.clone(), index.name.clone())) {
             return Err(CatalogError::Mapping(format!(
@@ -11498,6 +11696,7 @@ impl<'a> OracleSnapshotMapper<'a> {
         let mut indexes = Vec::new();
         let mut index_keys = BTreeMap::new();
         for index in &raw.indexes {
+            let expression = oracle_index_expression(index);
             let inventory_object = required(
                 inventory.get(&(index.owner.clone(), "INDEX".to_owned(), index.name.clone())),
                 format!(
@@ -11532,10 +11731,14 @@ impl<'a> OracleSnapshotMapper<'a> {
                     parent_key: Some(materialized_view_key.clone()),
                     name: index.name.clone(),
                     extension_kind: None,
-                    definition: None,
+                    definition: expression,
                     properties,
                 });
-                for column in &index.columns {
+                for column in index
+                    .columns
+                    .iter()
+                    .filter(|column| column.expression.is_none())
+                {
                     let column_key = required(
                         materialized_view_column_keys.get(&(
                             index.table_owner.clone(),
@@ -11576,10 +11779,16 @@ impl<'a> OracleSnapshotMapper<'a> {
                 Some(index.name.clone()),
             );
             index_keys.insert((index.owner.clone(), index.name.clone()), key.clone());
+            let direct_columns = index
+                .columns
+                .iter()
+                .filter(|column| column.expression.is_none())
+                .cloned()
+                .collect::<Vec<_>>();
             let index_columns = resolve_named_columns(
                 &index.table_owner,
                 &index.table,
-                &index.columns,
+                &direct_columns,
                 &column_keys,
                 &index.name,
             )?;
@@ -11591,11 +11800,11 @@ impl<'a> OracleSnapshotMapper<'a> {
                 is_unique: index.unique,
                 is_primary: primary_indexes.contains(&(index.owner.clone(), index.name.clone())),
                 predicate: None,
-                expression: None,
+                expression: expression.clone(),
             });
             metadata.annotations.push(ObjectAnnotation {
                 object_key: key,
-                definition: None,
+                definition: expression,
                 properties,
             });
         }
@@ -12538,6 +12747,23 @@ fn oracle_index_properties(
     );
     insert_bool(&mut properties, "constraint_index", index.constraint_index);
     properties.insert(
+        "key_parts".to_owned(),
+        MetadataValue::StringList(
+            index
+                .columns
+                .iter()
+                .map(|column| {
+                    let value = column.expression.as_deref().unwrap_or(&column.name);
+                    if column.descending {
+                        format!("{value} DESC")
+                    } else {
+                        value.to_owned()
+                    }
+                })
+                .collect(),
+        ),
+    );
+    properties.insert(
         "descending_columns".to_owned(),
         MetadataValue::StringList(
             index
@@ -12549,6 +12775,23 @@ fn oracle_index_properties(
         ),
     );
     properties
+}
+
+fn oracle_index_expression(index: &RawIndex) -> Option<String> {
+    let expressions = index
+        .columns
+        .iter()
+        .filter_map(|column| {
+            column.expression.as_ref().map(|expression| {
+                if column.descending {
+                    format!("{expression} DESC")
+                } else {
+                    expression.clone()
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    (!expressions.is_empty()).then(|| expressions.join(", "))
 }
 
 fn add_oracle_partitioned_table_properties(
@@ -13896,7 +14139,13 @@ fn discovery_counts_from_catalog(
                 !materialized_view_names
                     .contains(&(index.table_owner.as_str(), index.table.as_str()))
             })
-            .map(|index| index.columns.len())
+            .map(|index| {
+                index
+                    .columns
+                    .iter()
+                    .filter(|column| column.expression.is_none())
+                    .count()
+            })
             .sum(),
     );
     set_relationship_count(
@@ -13996,7 +14245,13 @@ fn discovery_counts_from_catalog(
                     materialized_view_names
                         .contains(&(index.table_owner.as_str(), index.table.as_str()))
                 })
-                .map(|index| index.columns.len())
+                .map(|index| {
+                    index
+                        .columns
+                        .iter()
+                        .filter(|column| column.expression.is_none())
+                        .count()
+                })
                 .sum::<usize>(),
     );
 
@@ -14249,6 +14504,30 @@ mod tests {
             )
             .expect("create secondary index");
         setup
+            .execute(
+                "CREATE INDEX IX_PARENT_CODE_SEARCH ON PARENT_ENTITY (UPPER(CODE), ID)",
+                &[],
+            )
+            .expect("create function-based index");
+        setup
+            .execute(
+                "CREATE BITMAP INDEX IX_CHILD_LABEL_BITMAP ON CHILD_ENTITY (LABEL)",
+                &[],
+            )
+            .expect("create bitmap index");
+        setup
+            .execute(
+                "CREATE BITMAP INDEX IX_CHILD_LABEL_BITMAP_FN ON CHILD_ENTITY (UPPER(LABEL))",
+                &[],
+            )
+            .expect("create function-based bitmap index");
+        setup
+            .execute(
+                "CREATE INDEX IX_CHILD_LABEL_DESC ON CHILD_ENTITY (LABEL DESC)",
+                &[],
+            )
+            .expect("create descending function-based index");
+        setup
             .execute("CREATE SEQUENCE AUDIT_SEQUENCE START WITH 10", &[])
             .expect("create explicit sequence");
         setup
@@ -14396,6 +14675,13 @@ mod tests {
                 .count(),
             3
         );
+        assert!(dba_certified.snapshot.schema.indexes.iter().any(|index| {
+            index.name == "IX_PARENT_CODE_SEARCH"
+                && index
+                    .expression
+                    .as_deref()
+                    .is_some_and(|expression| expression.contains("UPPER"))
+        }));
         assert_eq!(certified.snapshot.schema.tables.len(), 5);
         assert!(certified
             .snapshot
@@ -14403,7 +14689,78 @@ mod tests {
             .constraints
             .iter()
             .any(|constraint| constraint.kind == ConstraintKind::ForeignKey));
-        assert!(certified.snapshot.schema.indexes.len() >= 3);
+        assert!(certified.snapshot.schema.indexes.len() >= 7);
+        let function_index = certified
+            .snapshot
+            .schema
+            .indexes
+            .iter()
+            .find(|index| index.name == "IX_PARENT_CODE_SEARCH")
+            .expect("function-based index is mapped");
+        assert_eq!(function_index.columns.len(), 1);
+        assert_eq!(function_index.columns[0].sub_object.as_deref(), Some("ID"));
+        assert!(function_index
+            .expression
+            .as_deref()
+            .is_some_and(|expression| expression.contains("UPPER") && expression.contains("CODE")));
+        let function_index_annotation = certified
+            .snapshot
+            .metadata
+            .annotations
+            .iter()
+            .find(|annotation| annotation.object_key == function_index.key)
+            .expect("function-based index evidence is mapped");
+        assert!(matches!(
+            function_index_annotation.properties.get("index_type"),
+            Some(MetadataValue::String(value)) if value == "FUNCTION-BASED NORMAL"
+        ));
+        assert!(matches!(
+            function_index_annotation.properties.get("function_status"),
+            Some(MetadataValue::String(value)) if value == "ENABLED"
+        ));
+        assert!(matches!(
+            function_index_annotation.properties.get("key_parts"),
+            Some(MetadataValue::StringList(parts))
+                if parts.len() == 2 && parts[0].contains("UPPER") && parts[1] == "ID"
+        ));
+        let bitmap_index = certified
+            .snapshot
+            .schema
+            .indexes
+            .iter()
+            .find(|index| index.name == "IX_CHILD_LABEL_BITMAP")
+            .expect("bitmap index is mapped");
+        assert_eq!(bitmap_index.columns.len(), 1);
+        assert_eq!(bitmap_index.columns[0].sub_object.as_deref(), Some("LABEL"));
+        assert!(bitmap_index.expression.is_none());
+        let function_bitmap_index = certified
+            .snapshot
+            .schema
+            .indexes
+            .iter()
+            .find(|index| index.name == "IX_CHILD_LABEL_BITMAP_FN")
+            .expect("function-based bitmap index is mapped");
+        assert!(function_bitmap_index.columns.is_empty());
+        assert!(function_bitmap_index
+            .expression
+            .as_deref()
+            .is_some_and(|expression| expression.contains("UPPER")));
+        let descending_index = certified
+            .snapshot
+            .schema
+            .indexes
+            .iter()
+            .find(|index| index.name == "IX_CHILD_LABEL_DESC")
+            .expect("descending index is mapped");
+        assert!(descending_index.columns.is_empty());
+        assert!(
+            descending_index
+                .expression
+                .as_deref()
+                .is_some_and(
+                    |expression| expression.contains("LABEL") && expression.ends_with("DESC")
+                )
+        );
         assert!(
             certified
                 .snapshot
