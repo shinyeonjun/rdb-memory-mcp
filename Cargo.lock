@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "database-memory-cli"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "database-memory-core",
  "database-memory-mcp",
@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "database-memory-core"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "connection-string",
  "mysql",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "database-memory-mcp"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "database-memory-core",
  "rmcp",
