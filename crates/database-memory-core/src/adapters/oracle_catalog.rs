@@ -4164,7 +4164,7 @@ fn ensure_user_type_reference(
     let Some(owner) = owner else {
         return Ok(());
     };
-    ensure_owner(scope, owner, "user-defined type reference")?;
+    ensure_reference_owner(scope, owner, subject)?;
     if user_types.contains_key(&(owner.to_owned(), name.to_owned())) {
         Ok(())
     } else {
@@ -6519,7 +6519,11 @@ fn validate_raw_catalog(
     let mut synonyms = BTreeSet::new();
     for synonym in &raw.synonyms {
         ensure_owner(scope, &synonym.owner, "synonym")?;
-        ensure_owner(scope, &synonym.target_owner, "synonym target")?;
+        ensure_reference_owner(
+            scope,
+            &synonym.target_owner,
+            &format!("synonym {}.{}", synonym.owner, synonym.name),
+        )?;
         if synonym.database_link.is_some() {
             return Err(CatalogError::UnsupportedMetadata(format!(
                 "Oracle synonym {}.{} uses remote database link '{}'",
@@ -6676,7 +6680,11 @@ fn validate_raw_catalog(
             user_type.supertype_name.as_deref(),
         ) {
             (Some(owner), Some(name)) => {
-                ensure_owner(scope, owner, "type supertype")?;
+                ensure_reference_owner(
+                    scope,
+                    owner,
+                    &format!("type {}.{}", user_type.owner, user_type.name),
+                )?;
                 if !user_types.contains_key(&(owner.to_owned(), name.to_owned()))
                     || (owner == user_type.owner && name == user_type.name)
                     || user_type.local_attribute_count.is_none()
@@ -7697,7 +7705,14 @@ fn validate_raw_catalog(
                 dependency.referenced_type
             )));
         }
-        ensure_owner(scope, &dependency.referenced_owner, "dependency target")?;
+        ensure_reference_owner(
+            scope,
+            &dependency.referenced_owner,
+            &format!(
+                "dependency {}.{} ({})",
+                dependency.owner, dependency.name, dependency.object_type
+            ),
+        )?;
         let target_exists = match dependency.referenced_type.as_str() {
             "TABLE" => tables.contains(&(
                 dependency.referenced_owner.clone(),
@@ -7954,7 +7969,11 @@ fn validate_raw_catalog(
                 constraint.owner, constraint.name
             ))
         })?;
-        ensure_owner(scope, referenced_owner, "foreign-key target")?;
+        ensure_reference_owner(
+            scope,
+            referenced_owner,
+            &format!("foreign key {}.{}", constraint.owner, constraint.name),
+        )?;
         let referenced_name = constraint.referenced_constraint.as_deref().ok_or_else(|| {
             CatalogError::Mapping(format!(
                 "Oracle foreign key {}.{} has no referenced constraint",
@@ -9270,6 +9289,20 @@ fn ensure_owner(scope: &DictionaryScope, owner: &str, subject: &str) -> Result<(
     } else {
         Err(CatalogError::Mapping(format!(
             "Oracle {subject} owner '{owner}' is outside the certified schema scope"
+        )))
+    }
+}
+
+fn ensure_reference_owner(
+    scope: &DictionaryScope,
+    owner: &str,
+    source: &str,
+) -> Result<(), CatalogError> {
+    if scope.contains_owner(owner) {
+        Ok(())
+    } else {
+        Err(CatalogError::InvalidScope(format!(
+            "Oracle schema selection is not relationship-closed: {source} references application owner '{owner}'; include that owner and retry"
         )))
     }
 }
@@ -15155,6 +15188,304 @@ mod tests {
             AnalysisFailureCode::UnsupportedMetadata
         );
         assert!(failed.certified_snapshot().is_none());
+    }
+
+    #[test]
+    fn oracle_multi_schema_contract_is_env_gated() {
+        let Some(admin_url) = env::var("DATABASE_MEMORY_TEST_ORACLE_URL").ok() else {
+            return;
+        };
+        let parsed = parse_oracle_connection_string(&admin_url).unwrap();
+        let connect_string = parsed.connect_string.to_owned();
+        let password = "DbmcpTest1!";
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            % 1_000_000_000;
+        let parent_name = format!("DBMCP_P{}_{}", std::process::id(), suffix);
+        let child_name = format!("DBMCP_C{}_{}", std::process::id(), suffix);
+
+        let parent_admin =
+            Connection::connect(parsed.username, parsed.password, parsed.connect_string)
+                .expect("connect to Oracle certification database for parent schema");
+        parent_admin
+            .execute(
+                &format!(
+                    "CREATE USER {parent_name} IDENTIFIED BY \"{password}\" DEFAULT TABLESPACE USERS QUOTA UNLIMITED ON USERS"
+                ),
+                &[],
+            )
+            .expect("create Oracle parent test user");
+        let parent_cleanup = TestUserGuard {
+            admin: parent_admin,
+            username: parent_name,
+        };
+
+        let child_admin =
+            Connection::connect(parsed.username, parsed.password, parsed.connect_string)
+                .expect("connect to Oracle certification database for child schema");
+        child_admin
+            .execute(
+                &format!(
+                    "CREATE USER {child_name} IDENTIFIED BY \"{password}\" DEFAULT TABLESPACE USERS QUOTA UNLIMITED ON USERS"
+                ),
+                &[],
+            )
+            .expect("create Oracle child test user");
+        let child_cleanup = TestUserGuard {
+            admin: child_admin,
+            username: child_name,
+        };
+
+        for cleanup in [&parent_cleanup, &child_cleanup] {
+            cleanup
+                .admin
+                .execute(
+                    &format!(
+                        "GRANT CREATE SESSION, CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE SYNONYM, CREATE TYPE TO {}",
+                        cleanup.username
+                    ),
+                    &[],
+                )
+                .expect("grant Oracle multi-schema fixture privileges");
+        }
+
+        let parent = Connection::connect(&parent_cleanup.username, password, &connect_string)
+            .expect("connect as Oracle parent test user");
+        parent
+            .execute(
+                "CREATE TABLE SHARED_PARENT (ID NUMBER, CODE VARCHAR2(32), CONSTRAINT PK_SHARED_PARENT PRIMARY KEY (ID))",
+                &[],
+            )
+            .expect("create shared parent table");
+        parent
+            .execute(
+                "CREATE TYPE SHARED_PAYLOAD_T AS OBJECT (VALUE_TEXT VARCHAR2(64))",
+                &[],
+            )
+            .expect("create shared object type");
+        parent
+            .execute(
+                "CREATE FUNCTION SHARED_LABEL(P_ID IN NUMBER) RETURN VARCHAR2 AUTHID DEFINER AS V_CODE VARCHAR2(32); BEGIN SELECT CODE INTO V_CODE FROM SHARED_PARENT WHERE ID = P_ID; RETURN V_CODE; END;",
+                &[],
+            )
+            .expect("create shared function");
+        for statement in [
+            format!(
+                "GRANT SELECT, REFERENCES ON SHARED_PARENT TO {}",
+                child_cleanup.username
+            ),
+            format!(
+                "GRANT EXECUTE ON SHARED_PAYLOAD_T TO {}",
+                child_cleanup.username
+            ),
+            format!(
+                "GRANT EXECUTE ON SHARED_LABEL TO {}",
+                child_cleanup.username
+            ),
+        ] {
+            parent
+                .execute(&statement, &[])
+                .expect("grant cross-schema object privilege");
+        }
+        drop(parent);
+
+        let child = Connection::connect(&child_cleanup.username, password, &connect_string)
+            .expect("connect as Oracle child test user");
+        child
+            .execute(
+                &format!(
+                    "CREATE TABLE CHILD_RECORD (ID NUMBER, PARENT_ID NUMBER, PAYLOAD {}.SHARED_PAYLOAD_T, CONSTRAINT PK_CHILD_RECORD PRIMARY KEY (ID), CONSTRAINT FK_CHILD_SHARED FOREIGN KEY (PARENT_ID) REFERENCES {}.SHARED_PARENT (ID))",
+                    parent_cleanup.username, parent_cleanup.username
+                ),
+                &[],
+            )
+            .expect("create cross-schema foreign key and typed column");
+        child
+            .execute(
+                &format!(
+                    "CREATE VIEW SHARED_PARENT_VIEW AS SELECT ID, CODE FROM {}.SHARED_PARENT",
+                    parent_cleanup.username
+                ),
+                &[],
+            )
+            .expect("create cross-schema view");
+        child
+            .execute(
+                &format!(
+                    "CREATE SYNONYM SHARED_PARENT_ALIAS FOR {}.SHARED_PARENT",
+                    parent_cleanup.username
+                ),
+                &[],
+            )
+            .expect("create cross-schema synonym");
+        child
+            .execute(
+                &format!(
+                    "CREATE PROCEDURE READ_SHARED(P_ID IN NUMBER, P_VALUE OUT VARCHAR2) AUTHID DEFINER AS BEGIN P_VALUE := {}.SHARED_LABEL(P_ID); END;",
+                    parent_cleanup.username
+                ),
+                &[],
+            )
+            .expect("create cross-schema routine call");
+        drop(child);
+
+        let incomplete = analyze_oracle(
+            &admin_url,
+            "oracle-multi-incomplete",
+            Vec::new(),
+            vec![child_cleanup.username.clone()],
+            30_000,
+        );
+        assert_eq!(incomplete.status(), AnalysisStatus::Failed);
+        assert!(incomplete.certified_snapshot().is_none());
+        let incomplete_failure = incomplete.failure().expect("incomplete scope must fail");
+        assert_eq!(
+            incomplete_failure.code,
+            AnalysisFailureCode::InvalidConfiguration,
+            "unexpected incomplete-scope failure: {incomplete_failure:?}"
+        );
+        assert!(incomplete_failure.message.contains("relationship-closed"));
+        assert!(incomplete_failure
+            .message
+            .contains(&parent_cleanup.username));
+
+        let complete = analyze_oracle(
+            &admin_url,
+            "oracle-multi-live",
+            Vec::new(),
+            vec![
+                parent_cleanup.username.clone(),
+                child_cleanup.username.clone(),
+            ],
+            30_000,
+        );
+        assert_eq!(
+            complete.status(),
+            AnalysisStatus::Complete,
+            "Oracle multi-schema analysis failed: {:?}",
+            complete.failure()
+        );
+        let certified = complete
+            .certified_snapshot()
+            .expect("Oracle multi-schema snapshot must be certified");
+        assert_eq!(certified.snapshot.schema.schemas.len(), 2);
+        assert_eq!(certified.snapshot.schema.tables.len(), 2);
+
+        let parent_table = certified
+            .snapshot
+            .schema
+            .tables
+            .iter()
+            .find(|table| {
+                table.key.schema == parent_cleanup.username && table.name == "SHARED_PARENT"
+            })
+            .expect("cross-schema parent table is mapped");
+        let child_table = certified
+            .snapshot
+            .schema
+            .tables
+            .iter()
+            .find(|table| {
+                table.key.schema == child_cleanup.username && table.name == "CHILD_RECORD"
+            })
+            .expect("cross-schema child table is mapped");
+        let foreign_key = certified
+            .snapshot
+            .schema
+            .constraints
+            .iter()
+            .find(|constraint| {
+                constraint.table_key == child_table.key && constraint.name == "FK_CHILD_SHARED"
+            })
+            .expect("cross-schema foreign key is mapped");
+        assert_eq!(
+            foreign_key.referenced_table_key.as_ref(),
+            Some(&parent_table.key)
+        );
+
+        let view = certified
+            .snapshot
+            .schema
+            .views
+            .iter()
+            .find(|view| {
+                view.key.schema == child_cleanup.username && view.name == "SHARED_PARENT_VIEW"
+            })
+            .expect("cross-schema view is mapped");
+        assert!(view.depends_on.contains(&parent_table.key));
+
+        let shared_function = certified
+            .snapshot
+            .schema
+            .routines
+            .iter()
+            .find(|routine| {
+                routine.key.schema == parent_cleanup.username && routine.name == "SHARED_LABEL"
+            })
+            .expect("shared function is mapped");
+        let child_procedure = certified
+            .snapshot
+            .schema
+            .routines
+            .iter()
+            .find(|routine| {
+                routine.key.schema == child_cleanup.username && routine.name == "READ_SHARED"
+            })
+            .expect("cross-schema procedure is mapped");
+        assert!(child_procedure.depends_on.contains(&shared_function.key));
+
+        let shared_type = certified
+            .snapshot
+            .metadata
+            .objects
+            .iter()
+            .find(|object| {
+                object.key.object_kind == ObjectKind::UserDefinedType
+                    && object.key.schema == parent_cleanup.username
+                    && object.name == "SHARED_PAYLOAD_T"
+            })
+            .expect("shared object type is mapped");
+        let payload_column = certified
+            .snapshot
+            .schema
+            .columns
+            .iter()
+            .find(|column| column.table_key == child_table.key && column.name == "PAYLOAD")
+            .expect("cross-schema typed column is mapped");
+        assert!(certified
+            .snapshot
+            .metadata
+            .relationships
+            .iter()
+            .any(|relationship| {
+                relationship.kind == MetadataRelationshipKind::UsesType
+                    && relationship.from_key == payload_column.key
+                    && relationship.to_key == shared_type.key
+            }));
+
+        let synonym = certified
+            .snapshot
+            .metadata
+            .objects
+            .iter()
+            .find(|object| {
+                object.key.object_kind == ObjectKind::Synonym
+                    && object.key.schema == child_cleanup.username
+                    && object.name == "SHARED_PARENT_ALIAS"
+            })
+            .expect("cross-schema synonym is mapped");
+        assert!(certified
+            .snapshot
+            .metadata
+            .relationships
+            .iter()
+            .any(|relationship| {
+                relationship.kind == MetadataRelationshipKind::SynonymFor
+                    && relationship.from_key == synonym.key
+                    && relationship.to_key == parent_table.key
+            }));
     }
 
     fn request() -> IntrospectionRequest {
