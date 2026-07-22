@@ -833,6 +833,94 @@ struct RawSynonym {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct RawUserType {
+    owner: String,
+    name: String,
+    oid: String,
+    typecode: String,
+    attribute_count: i64,
+    method_count: i64,
+    predefined: String,
+    incomplete: String,
+    final_type: String,
+    instantiable: String,
+    persistable: String,
+    supertype_owner: Option<String>,
+    supertype_name: Option<String>,
+    local_attribute_count: Option<i64>,
+    local_method_count: Option<i64>,
+    type_id: Option<String>,
+    specification: Option<String>,
+    body: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawTypeAttribute {
+    owner: String,
+    type_name: String,
+    name: String,
+    type_modifier: Option<String>,
+    data_type_owner: Option<String>,
+    data_type_name: String,
+    length: Option<i64>,
+    precision: Option<i64>,
+    scale: Option<i64>,
+    character_set: Option<String>,
+    position: i64,
+    inherited: String,
+    char_used: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawCollectionType {
+    owner: String,
+    type_name: String,
+    collection_type: String,
+    upper_bound: Option<i64>,
+    element_type_modifier: Option<String>,
+    element_type_owner: Option<String>,
+    element_type_name: String,
+    length: Option<i64>,
+    precision: Option<i64>,
+    scale: Option<i64>,
+    character_set: Option<String>,
+    element_storage: Option<String>,
+    nulls_stored: Option<String>,
+    char_used: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawTypeMethod {
+    owner: String,
+    type_name: String,
+    name: String,
+    method_number: i64,
+    method_type: String,
+    parameter_count: i64,
+    result_count: i64,
+    final_method: String,
+    instantiable: String,
+    overriding: String,
+    inherited: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawTypeMethodParameter {
+    owner: String,
+    type_name: String,
+    method_name: String,
+    method_number: i64,
+    name: String,
+    position: i64,
+    mode: String,
+    type_modifier: Option<String>,
+    data_type_owner: Option<String>,
+    data_type_name: String,
+    character_set: Option<String>,
+    return_value: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RawTrigger {
     owner: String,
     name: String,
@@ -992,10 +1080,10 @@ struct RawDependency {
     referenced_owner_oracle_maintained: bool,
 }
 
-type PackageDependencyIdentity = (String, String, String, String, String);
+type CollapsedDependencyIdentity = (String, String, String, String, String);
 
 #[derive(Default)]
-struct PackageDependencyEvidence {
+struct CollapsedDependencyEvidence {
     source_object_types: BTreeSet<String>,
     dependency_types: BTreeSet<String>,
 }
@@ -1011,6 +1099,11 @@ struct RawOracleCatalog {
     view_columns: Vec<RawColumn>,
     materialized_views: Vec<RawMaterializedView>,
     synonyms: Vec<RawSynonym>,
+    user_types: Vec<RawUserType>,
+    type_attributes: Vec<RawTypeAttribute>,
+    collection_types: Vec<RawCollectionType>,
+    type_methods: Vec<RawTypeMethod>,
+    type_method_parameters: Vec<RawTypeMethodParameter>,
     triggers: Vec<RawTrigger>,
     routines: Vec<RawRoutine>,
     routine_arguments: Vec<RawRoutineArgument>,
@@ -1048,6 +1141,18 @@ impl RawOracleCatalog {
             .map_err(|error| error.catalog_context("materialized-view"))?;
         let synonyms = read_synonyms(connection, scope, deadline)
             .map_err(|error| error.catalog_context("synonym"))?;
+        let mut user_types = read_user_types(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("type"))?;
+        attach_type_sources(connection, scope, &mut user_types, deadline)
+            .map_err(|error| error.catalog_context("type-source"))?;
+        let type_attributes = read_type_attributes(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("type-attribute"))?;
+        let collection_types = read_collection_types(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("collection-type"))?;
+        let type_methods = read_type_methods(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("type-method"))?;
+        let type_method_parameters = read_type_method_parameters(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("type-method-parameter"))?;
         let triggers = read_triggers(connection, scope, deadline)
             .map_err(|error| error.catalog_context("trigger"))?;
         let mut routines = read_routines(connection, scope, deadline)
@@ -1087,6 +1192,11 @@ impl RawOracleCatalog {
             view_columns,
             materialized_views,
             synonyms,
+            user_types,
+            type_attributes,
+            collection_types,
+            type_methods,
+            type_method_parameters,
             triggers,
             routines,
             routine_arguments,
@@ -2040,6 +2150,752 @@ fn read_synonyms(
     Ok(synonyms)
 }
 
+fn read_user_types(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawUserType>, CatalogError> {
+    type TypeTuple = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+    );
+    let mut types = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let sql = match scope.mode {
+            DictionaryScopeMode::User => {
+                "
+                SELECT :1,
+                       TYPE_NAME,
+                       RAWTOHEX(TYPE_OID),
+                       TYPECODE,
+                       ATTRIBUTES,
+                       METHODS,
+                       PREDEFINED,
+                       INCOMPLETE,
+                       FINAL,
+                       INSTANTIABLE,
+                       PERSISTABLE,
+                       SUPERTYPE_OWNER,
+                       SUPERTYPE_NAME,
+                       LOCAL_ATTRIBUTES,
+                       LOCAL_METHODS,
+                       RAWTOHEX(TYPEID)
+                FROM USER_TYPES
+                ORDER BY TYPE_NAME
+                "
+            }
+            DictionaryScopeMode::Dba => {
+                "
+                SELECT OWNER,
+                       TYPE_NAME,
+                       RAWTOHEX(TYPE_OID),
+                       TYPECODE,
+                       ATTRIBUTES,
+                       METHODS,
+                       PREDEFINED,
+                       INCOMPLETE,
+                       FINAL,
+                       INSTANTIABLE,
+                       PERSISTABLE,
+                       SUPERTYPE_OWNER,
+                       SUPERTYPE_NAME,
+                       LOCAL_ATTRIBUTES,
+                       LOCAL_METHODS,
+                       RAWTOHEX(TYPEID)
+                FROM DBA_TYPES
+                WHERE OWNER = :1
+                ORDER BY OWNER, TYPE_NAME
+                "
+            }
+        };
+        let rows = connection.query_as::<TypeTuple>(sql, &[owner])?;
+        for row in rows {
+            let (
+                owner,
+                name,
+                oid,
+                typecode,
+                attribute_count,
+                method_count,
+                predefined,
+                incomplete,
+                final_type,
+                instantiable,
+                persistable,
+                supertype_owner,
+                supertype_name,
+                local_attribute_count,
+                local_method_count,
+                type_id,
+            ) = row?;
+            types.push(RawUserType {
+                owner: owner.clone(),
+                name: name.clone(),
+                oid,
+                typecode: required_catalog_token(
+                    typecode,
+                    &format!("typecode for {owner}.{name}"),
+                )?,
+                attribute_count: attribute_count.ok_or_else(|| {
+                    CatalogError::Mapping(format!(
+                        "Oracle type {owner}.{name} has no attribute count"
+                    ))
+                })?,
+                method_count: method_count.ok_or_else(|| {
+                    CatalogError::Mapping(format!("Oracle type {owner}.{name} has no method count"))
+                })?,
+                predefined: required_catalog_token(
+                    predefined,
+                    &format!("predefined flag for {owner}.{name}"),
+                )?,
+                incomplete: required_catalog_token(
+                    incomplete,
+                    &format!("incomplete flag for {owner}.{name}"),
+                )?,
+                final_type: required_catalog_token(
+                    final_type,
+                    &format!("final flag for {owner}.{name}"),
+                )?,
+                instantiable: required_catalog_token(
+                    instantiable,
+                    &format!("instantiable flag for {owner}.{name}"),
+                )?,
+                persistable: required_catalog_token(
+                    persistable,
+                    &format!("persistable flag for {owner}.{name}"),
+                )?,
+                supertype_owner: normalize_optional_token(supertype_owner),
+                supertype_name: normalize_optional_token(supertype_name),
+                local_attribute_count,
+                local_method_count,
+                type_id: normalize_optional_token(type_id),
+                specification: None,
+                body: None,
+            });
+        }
+    }
+    types.sort_by(|left, right| (&left.owner, &left.name).cmp(&(&right.owner, &right.name)));
+    Ok(types)
+}
+
+fn attach_type_sources(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    types: &mut [RawUserType],
+    deadline: Instant,
+) -> Result<(), CatalogError> {
+    let positions = types
+        .iter()
+        .enumerate()
+        .map(|(position, user_type)| ((user_type.owner.clone(), user_type.name.clone()), position))
+        .collect::<BTreeMap<_, _>>();
+    let mut sources = BTreeMap::<(usize, String), String>::new();
+    let mut last_lines = BTreeMap::<(usize, String), i64>::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let sql = match scope.mode {
+            DictionaryScopeMode::User => {
+                "
+                SELECT :1, NAME, TYPE, LINE, TEXT
+                FROM USER_SOURCE
+                WHERE TYPE IN ('TYPE', 'TYPE BODY')
+                ORDER BY NAME, TYPE, LINE
+                "
+            }
+            DictionaryScopeMode::Dba => {
+                "
+                SELECT OWNER, NAME, TYPE, LINE, TEXT
+                FROM DBA_SOURCE
+                WHERE OWNER = :1
+                  AND TYPE IN ('TYPE', 'TYPE BODY')
+                ORDER BY OWNER, NAME, TYPE, LINE
+                "
+            }
+        };
+        let rows =
+            connection.query_as::<(String, String, String, i64, Option<String>)>(sql, &[owner])?;
+        for row in rows {
+            let (source_owner, name, object_type, line, text) = row?;
+            let position = positions
+                .get(&(source_owner.clone(), name.clone()))
+                .copied()
+                .ok_or_else(|| {
+                    CatalogError::Mapping(format!(
+                        "Oracle type source {source_owner}.{name} ({object_type}) has no type header"
+                    ))
+                })?;
+            let source_key = (position, object_type.clone());
+            let expected_line = last_lines.get(&source_key).copied().unwrap_or(0) + 1;
+            if line != expected_line {
+                return Err(CatalogError::Mapping(format!(
+                    "Oracle type source {source_owner}.{name} ({object_type}) expected line {expected_line}, found {line}"
+                )));
+            }
+            last_lines.insert(source_key.clone(), line);
+            let source = sources.entry(source_key).or_default();
+            source.push_str(text.as_deref().unwrap_or_default());
+            if source.len() > MAX_DEFINITION_BYTES {
+                return Err(CatalogError::UnsupportedMetadata(format!(
+                    "Oracle type definition exceeds the {MAX_DEFINITION_BYTES}-byte safety limit for {source_owner}.{name} ({object_type})"
+                )));
+            }
+        }
+    }
+    for (position, user_type) in types.iter_mut().enumerate() {
+        user_type.specification =
+            normalize_definition(sources.remove(&(position, "TYPE".to_owned())))?;
+        user_type.body = normalize_definition(sources.remove(&(position, "TYPE BODY".to_owned())))?;
+        if user_type.specification.is_none() {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle type {}.{} has no complete specification",
+                user_type.owner, user_type.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn read_type_attributes(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawTypeAttribute>, CatalogError> {
+    type AttributeTuple = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        i64,
+        Option<String>,
+        Option<String>,
+    );
+    let mut attributes = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let sql = match scope.mode {
+            DictionaryScopeMode::User => {
+                "
+                SELECT :1,
+                       TYPE_NAME,
+                       ATTR_NAME,
+                       ATTR_TYPE_MOD,
+                       ATTR_TYPE_OWNER,
+                       ATTR_TYPE_NAME,
+                       LENGTH,
+                       PRECISION,
+                       SCALE,
+                       CHARACTER_SET_NAME,
+                       ATTR_NO,
+                       INHERITED,
+                       CHAR_USED
+                FROM USER_TYPE_ATTRS
+                ORDER BY TYPE_NAME, ATTR_NO
+                "
+            }
+            DictionaryScopeMode::Dba => {
+                "
+                SELECT OWNER,
+                       TYPE_NAME,
+                       ATTR_NAME,
+                       ATTR_TYPE_MOD,
+                       ATTR_TYPE_OWNER,
+                       ATTR_TYPE_NAME,
+                       LENGTH,
+                       PRECISION,
+                       SCALE,
+                       CHARACTER_SET_NAME,
+                       ATTR_NO,
+                       INHERITED,
+                       CHAR_USED
+                FROM DBA_TYPE_ATTRS
+                WHERE OWNER = :1
+                ORDER BY OWNER, TYPE_NAME, ATTR_NO
+                "
+            }
+        };
+        let rows = connection.query_as::<AttributeTuple>(sql, &[owner])?;
+        for row in rows {
+            let (
+                owner,
+                type_name,
+                name,
+                type_modifier,
+                data_type_owner,
+                data_type_name,
+                length,
+                precision,
+                scale,
+                character_set,
+                position,
+                inherited,
+                char_used,
+            ) = row?;
+            attributes.push(RawTypeAttribute {
+                owner: owner.clone(),
+                type_name: type_name.clone(),
+                name: name.clone(),
+                type_modifier: normalize_optional_token(type_modifier),
+                data_type_owner: normalize_optional_token(data_type_owner),
+                data_type_name: required_catalog_token(
+                    data_type_name,
+                    &format!("attribute type for {owner}.{type_name}.{name}"),
+                )?,
+                length,
+                precision,
+                scale,
+                character_set: normalize_optional_token(character_set),
+                position,
+                inherited: required_catalog_token(
+                    inherited,
+                    &format!("inherited flag for {owner}.{type_name}.{name}"),
+                )?,
+                char_used: normalize_optional_token(char_used),
+            });
+        }
+    }
+    attributes.sort_by(|left, right| {
+        (&left.owner, &left.type_name, left.position).cmp(&(
+            &right.owner,
+            &right.type_name,
+            right.position,
+        ))
+    });
+    Ok(attributes)
+}
+
+fn read_collection_types(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawCollectionType>, CatalogError> {
+    type CollectionTuple = (
+        String,
+        String,
+        String,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let mut collections = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let sql = match scope.mode {
+            DictionaryScopeMode::User => {
+                "
+                SELECT :1,
+                       TYPE_NAME,
+                       COLL_TYPE,
+                       UPPER_BOUND,
+                       ELEM_TYPE_MOD,
+                       ELEM_TYPE_OWNER,
+                       ELEM_TYPE_NAME,
+                       LENGTH,
+                       PRECISION,
+                       SCALE,
+                       CHARACTER_SET_NAME,
+                       ELEM_STORAGE,
+                       NULLS_STORED,
+                       CHAR_USED
+                FROM USER_COLL_TYPES
+                ORDER BY TYPE_NAME
+                "
+            }
+            DictionaryScopeMode::Dba => {
+                "
+                SELECT OWNER,
+                       TYPE_NAME,
+                       COLL_TYPE,
+                       UPPER_BOUND,
+                       ELEM_TYPE_MOD,
+                       ELEM_TYPE_OWNER,
+                       ELEM_TYPE_NAME,
+                       LENGTH,
+                       PRECISION,
+                       SCALE,
+                       CHARACTER_SET_NAME,
+                       ELEM_STORAGE,
+                       NULLS_STORED,
+                       CHAR_USED
+                FROM DBA_COLL_TYPES
+                WHERE OWNER = :1
+                ORDER BY OWNER, TYPE_NAME
+                "
+            }
+        };
+        let rows = connection.query_as::<CollectionTuple>(sql, &[owner])?;
+        for row in rows {
+            let (
+                owner,
+                type_name,
+                collection_type,
+                upper_bound,
+                element_type_modifier,
+                element_type_owner,
+                element_type_name,
+                length,
+                precision,
+                scale,
+                character_set,
+                element_storage,
+                nulls_stored,
+                char_used,
+            ) = row?;
+            collections.push(RawCollectionType {
+                owner: owner.clone(),
+                type_name: type_name.clone(),
+                collection_type: collection_type.trim().to_owned(),
+                upper_bound,
+                element_type_modifier: normalize_optional_token(element_type_modifier),
+                element_type_owner: normalize_optional_token(element_type_owner),
+                element_type_name: required_catalog_token(
+                    element_type_name,
+                    &format!("collection element type for {owner}.{type_name}"),
+                )?,
+                length,
+                precision,
+                scale,
+                character_set: normalize_optional_token(character_set),
+                element_storage: normalize_optional_token(element_storage),
+                nulls_stored: normalize_optional_token(nulls_stored),
+                char_used: normalize_optional_token(char_used),
+            });
+        }
+    }
+    collections.sort_by(|left, right| {
+        (&left.owner, &left.type_name).cmp(&(&right.owner, &right.type_name))
+    });
+    Ok(collections)
+}
+
+fn read_type_methods(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawTypeMethod>, CatalogError> {
+    type MethodTuple = (
+        String,
+        String,
+        String,
+        i64,
+        Option<String>,
+        i64,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let mut methods = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let sql = match scope.mode {
+            DictionaryScopeMode::User => {
+                "
+                SELECT :1,
+                       TYPE_NAME,
+                       METHOD_NAME,
+                       METHOD_NO,
+                       METHOD_TYPE,
+                       PARAMETERS,
+                       RESULTS,
+                       FINAL,
+                       INSTANTIABLE,
+                       OVERRIDING,
+                       INHERITED
+                FROM USER_TYPE_METHODS
+                ORDER BY TYPE_NAME, METHOD_NO
+                "
+            }
+            DictionaryScopeMode::Dba => {
+                "
+                SELECT OWNER,
+                       TYPE_NAME,
+                       METHOD_NAME,
+                       METHOD_NO,
+                       METHOD_TYPE,
+                       PARAMETERS,
+                       RESULTS,
+                       FINAL,
+                       INSTANTIABLE,
+                       OVERRIDING,
+                       INHERITED
+                FROM DBA_TYPE_METHODS
+                WHERE OWNER = :1
+                ORDER BY OWNER, TYPE_NAME, METHOD_NO
+                "
+            }
+        };
+        let rows = connection.query_as::<MethodTuple>(sql, &[owner])?;
+        for row in rows {
+            let (
+                owner,
+                type_name,
+                name,
+                method_number,
+                method_type,
+                parameter_count,
+                result_count,
+                final_method,
+                instantiable,
+                overriding,
+                inherited,
+            ) = row?;
+            methods.push(RawTypeMethod {
+                owner: owner.clone(),
+                type_name: type_name.clone(),
+                name: name.clone(),
+                method_number,
+                method_type: required_catalog_token(
+                    method_type,
+                    &format!("method type for {owner}.{type_name}.{name}"),
+                )?,
+                parameter_count,
+                result_count,
+                final_method: required_catalog_token(
+                    final_method,
+                    &format!("final flag for {owner}.{type_name}.{name}"),
+                )?,
+                instantiable: required_catalog_token(
+                    instantiable,
+                    &format!("instantiable flag for {owner}.{type_name}.{name}"),
+                )?,
+                overriding: required_catalog_token(
+                    overriding,
+                    &format!("overriding flag for {owner}.{type_name}.{name}"),
+                )?,
+                inherited: required_catalog_token(
+                    inherited,
+                    &format!("inherited flag for {owner}.{type_name}.{name}"),
+                )?,
+            });
+        }
+    }
+    methods.sort_by(|left, right| {
+        (&left.owner, &left.type_name, left.method_number).cmp(&(
+            &right.owner,
+            &right.type_name,
+            right.method_number,
+        ))
+    });
+    Ok(methods)
+}
+
+fn read_type_method_parameters(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawTypeMethodParameter>, CatalogError> {
+    type ParameterTuple = (
+        String,
+        String,
+        String,
+        i64,
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    type ResultTuple = (
+        String,
+        String,
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let mut parameters = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let parameter_sql = match scope.mode {
+            DictionaryScopeMode::User => {
+                "
+                SELECT :1,
+                       TYPE_NAME,
+                       METHOD_NAME,
+                       METHOD_NO,
+                       PARAM_NAME,
+                       PARAM_NO,
+                       PARAM_MODE,
+                       PARAM_TYPE_MOD,
+                       PARAM_TYPE_OWNER,
+                       PARAM_TYPE_NAME,
+                       CHARACTER_SET_NAME
+                FROM USER_METHOD_PARAMS
+                ORDER BY TYPE_NAME, METHOD_NO, PARAM_NO
+                "
+            }
+            DictionaryScopeMode::Dba => {
+                "
+                SELECT OWNER,
+                       TYPE_NAME,
+                       METHOD_NAME,
+                       METHOD_NO,
+                       PARAM_NAME,
+                       PARAM_NO,
+                       PARAM_MODE,
+                       PARAM_TYPE_MOD,
+                       PARAM_TYPE_OWNER,
+                       PARAM_TYPE_NAME,
+                       CHARACTER_SET_NAME
+                FROM DBA_METHOD_PARAMS
+                WHERE OWNER = :1
+                ORDER BY OWNER, TYPE_NAME, METHOD_NO, PARAM_NO
+                "
+            }
+        };
+        let rows = connection.query_as::<ParameterTuple>(parameter_sql, &[owner])?;
+        for row in rows {
+            let (
+                owner,
+                type_name,
+                method_name,
+                method_number,
+                name,
+                position,
+                mode,
+                type_modifier,
+                data_type_owner,
+                data_type_name,
+                character_set,
+            ) = row?;
+            parameters.push(RawTypeMethodParameter {
+                owner: owner.clone(),
+                type_name: type_name.clone(),
+                method_name: method_name.clone(),
+                method_number,
+                name,
+                position,
+                mode: required_catalog_token(
+                    mode,
+                    &format!("method parameter mode for {owner}.{type_name}.{method_name}"),
+                )?,
+                type_modifier: normalize_optional_token(type_modifier),
+                data_type_owner: normalize_optional_token(data_type_owner),
+                data_type_name: required_catalog_token(
+                    data_type_name,
+                    &format!("method parameter type for {owner}.{type_name}.{method_name}"),
+                )?,
+                character_set: normalize_optional_token(character_set),
+                return_value: false,
+            });
+        }
+
+        prepare_call(connection, deadline)?;
+        let result_sql = match scope.mode {
+            DictionaryScopeMode::User => {
+                "
+                SELECT :1,
+                       TYPE_NAME,
+                       METHOD_NAME,
+                       METHOD_NO,
+                       RESULT_TYPE_MOD,
+                       RESULT_TYPE_OWNER,
+                       RESULT_TYPE_NAME,
+                       CHARACTER_SET_NAME
+                FROM USER_METHOD_RESULTS
+                ORDER BY TYPE_NAME, METHOD_NO
+                "
+            }
+            DictionaryScopeMode::Dba => {
+                "
+                SELECT OWNER,
+                       TYPE_NAME,
+                       METHOD_NAME,
+                       METHOD_NO,
+                       RESULT_TYPE_MOD,
+                       RESULT_TYPE_OWNER,
+                       RESULT_TYPE_NAME,
+                       CHARACTER_SET_NAME
+                FROM DBA_METHOD_RESULTS
+                WHERE OWNER = :1
+                ORDER BY OWNER, TYPE_NAME, METHOD_NO
+                "
+            }
+        };
+        let rows = connection.query_as::<ResultTuple>(result_sql, &[owner])?;
+        for row in rows {
+            let (
+                owner,
+                type_name,
+                method_name,
+                method_number,
+                type_modifier,
+                data_type_owner,
+                data_type_name,
+                character_set,
+            ) = row?;
+            parameters.push(RawTypeMethodParameter {
+                owner: owner.clone(),
+                type_name: type_name.clone(),
+                method_name: method_name.clone(),
+                method_number,
+                name: "RETURN".to_owned(),
+                position: 0,
+                mode: "OUT".to_owned(),
+                type_modifier: normalize_optional_token(type_modifier),
+                data_type_owner: normalize_optional_token(data_type_owner),
+                data_type_name: required_catalog_token(
+                    data_type_name,
+                    &format!("method result type for {owner}.{type_name}.{method_name}"),
+                )?,
+                character_set: normalize_optional_token(character_set),
+                return_value: true,
+            });
+        }
+    }
+    parameters.sort_by(|left, right| {
+        (
+            &left.owner,
+            &left.type_name,
+            left.method_number,
+            left.position,
+            &left.name,
+        )
+            .cmp(&(
+                &right.owner,
+                &right.type_name,
+                right.method_number,
+                right.position,
+                &right.name,
+            ))
+    });
+    Ok(parameters)
+}
+
 fn read_triggers(
     connection: &Connection,
     scope: &DictionaryScope,
@@ -2707,6 +3563,27 @@ fn read_arguments(
     );
     let mut arguments = Vec::new();
     let package_predicate = if packaged { "IS NOT NULL" } else { "IS NULL" };
+    let user_package_inventory_predicate = if packaged {
+        "AND EXISTS (
+                    SELECT 1
+                    FROM USER_OBJECTS package_object
+                    WHERE package_object.OBJECT_ID = USER_ARGUMENTS.OBJECT_ID
+                      AND package_object.OBJECT_TYPE = 'PACKAGE'
+                 )"
+    } else {
+        ""
+    };
+    let dba_package_inventory_predicate = if packaged {
+        "AND EXISTS (
+                    SELECT 1
+                    FROM DBA_OBJECTS package_object
+                    WHERE package_object.OWNER = DBA_ARGUMENTS.OWNER
+                      AND package_object.OBJECT_ID = DBA_ARGUMENTS.OBJECT_ID
+                      AND package_object.OBJECT_TYPE = 'PACKAGE'
+                 )"
+    } else {
+        ""
+    };
     for owner in &scope.owners {
         prepare_call(connection, deadline)?;
         let sql = match scope.mode {
@@ -2738,6 +3615,7 @@ fn read_arguments(
                        OVERLOAD
                 FROM USER_ARGUMENTS
                 WHERE PACKAGE_NAME {package_predicate}
+                  {user_package_inventory_predicate}
                 ORDER BY OBJECT_NAME, SUBPROGRAM_ID, SEQUENCE
                 "
                 )
@@ -2771,6 +3649,7 @@ fn read_arguments(
                 FROM DBA_ARGUMENTS
                 WHERE OWNER = :1
                   AND PACKAGE_NAME {package_predicate}
+                  {dba_package_inventory_predicate}
                 ORDER BY OWNER, OBJECT_NAME, SUBPROGRAM_ID, SEQUENCE
                 "
                 )
@@ -3011,6 +3890,46 @@ fn normalize_optional_token(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+fn required_catalog_token(value: Option<String>, subject: &str) -> Result<String, CatalogError> {
+    normalize_optional_token(value)
+        .ok_or_else(|| CatalogError::Mapping(format!("Oracle catalog is missing {subject}")))
+}
+
+fn ensure_yes_no(value: &str, subject: &str) -> Result<(), CatalogError> {
+    if matches!(value, "YES" | "NO") {
+        Ok(())
+    } else {
+        Err(CatalogError::Mapping(format!(
+            "{subject} has unrecognized value '{value}'"
+        )))
+    }
+}
+
+fn ensure_user_type_reference(
+    scope: &DictionaryScope,
+    user_types: &BTreeMap<(String, String), &RawUserType>,
+    owner: Option<&str>,
+    name: &str,
+    subject: &str,
+) -> Result<(), CatalogError> {
+    if name.trim().is_empty() {
+        return Err(CatalogError::Mapping(format!(
+            "{subject} has no data type name"
+        )));
+    }
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    ensure_owner(scope, owner, "user-defined type reference")?;
+    if user_types.contains_key(&(owner.to_owned(), name.to_owned())) {
+        Ok(())
+    } else {
+        Err(CatalogError::Mapping(format!(
+            "{subject} references missing type {owner}.{name}"
+        )))
+    }
 }
 
 fn reject_dynamic_plsql(kind: &str, name: &str, definition: &str) -> Result<(), CatalogError> {
@@ -3768,13 +4687,44 @@ fn read_dependencies(
 
 fn oracle_package_dependency_groups(
     dependencies: &[RawDependency],
-) -> BTreeMap<PackageDependencyIdentity, PackageDependencyEvidence> {
-    let mut groups = BTreeMap::<PackageDependencyIdentity, PackageDependencyEvidence>::new();
+) -> BTreeMap<CollapsedDependencyIdentity, CollapsedDependencyEvidence> {
+    let mut groups = BTreeMap::<CollapsedDependencyIdentity, CollapsedDependencyEvidence>::new();
     for dependency in dependencies.iter().filter(|dependency| {
         matches!(dependency.object_type.as_str(), "PACKAGE" | "PACKAGE BODY")
             && !dependency.referenced_owner_oracle_maintained
             && !(dependency.object_type == "PACKAGE BODY"
                 && dependency.referenced_type == "PACKAGE"
+                && dependency.owner == dependency.referenced_owner
+                && dependency.name == dependency.referenced_name)
+    }) {
+        let evidence = groups
+            .entry((
+                dependency.owner.clone(),
+                dependency.name.clone(),
+                dependency.referenced_owner.clone(),
+                dependency.referenced_name.clone(),
+                dependency.referenced_type.clone(),
+            ))
+            .or_default();
+        evidence
+            .source_object_types
+            .insert(dependency.object_type.clone());
+        evidence
+            .dependency_types
+            .insert(dependency.dependency_type.clone());
+    }
+    groups
+}
+
+fn oracle_type_dependency_groups(
+    dependencies: &[RawDependency],
+) -> BTreeMap<CollapsedDependencyIdentity, CollapsedDependencyEvidence> {
+    let mut groups = BTreeMap::<CollapsedDependencyIdentity, CollapsedDependencyEvidence>::new();
+    for dependency in dependencies.iter().filter(|dependency| {
+        matches!(dependency.object_type.as_str(), "TYPE" | "TYPE BODY")
+            && !dependency.referenced_owner_oracle_maintained
+            && !(dependency.object_type == "TYPE BODY"
+                && dependency.referenced_type == "TYPE"
                 && dependency.owner == dependency.referenced_owner
                 && dependency.name == dependency.referenced_name)
     }) {
@@ -3822,6 +4772,8 @@ fn validate_raw_catalog(
                     | "PACKAGE"
                     | "PACKAGE BODY"
                     | "SYNONYM"
+                    | "TYPE"
+                    | "TYPE BODY"
             )
         })
         .take(8)
@@ -4198,6 +5150,416 @@ fn validate_raw_catalog(
         )));
     }
 
+    let mut user_types = BTreeMap::new();
+    let mut type_oids = BTreeSet::new();
+    for user_type in &raw.user_types {
+        ensure_owner(scope, &user_type.owner, "type")?;
+        if !matches!(user_type.typecode.as_str(), "OBJECT" | "COLLECTION") {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle type {}.{} has unsupported typecode '{}'",
+                user_type.owner, user_type.name, user_type.typecode
+            )));
+        }
+        for (name, value) in [
+            ("predefined", user_type.predefined.as_str()),
+            ("incomplete", user_type.incomplete.as_str()),
+            ("final", user_type.final_type.as_str()),
+            ("instantiable", user_type.instantiable.as_str()),
+            ("persistable", user_type.persistable.as_str()),
+        ] {
+            ensure_yes_no(
+                value,
+                &format!("Oracle type {}.{} {name}", user_type.owner, user_type.name),
+            )?;
+        }
+        if user_type.predefined != "NO" || user_type.incomplete != "NO" {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle type {}.{} is predefined or incomplete",
+                user_type.owner, user_type.name
+            )));
+        }
+        if user_type.attribute_count < 0
+            || user_type.method_count < 0
+            || user_type
+                .local_attribute_count
+                .is_some_and(|count| count < 0)
+            || user_type.local_method_count.is_some_and(|count| count < 0)
+        {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle type {}.{} has negative member counts",
+                user_type.owner, user_type.name
+            )));
+        }
+        if user_type.oid.is_empty() || !type_oids.insert(user_type.oid.clone()) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle type {}.{} has a missing or duplicate OID",
+                user_type.owner, user_type.name
+            )));
+        }
+        if user_type.specification.is_none() {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle type {}.{} has no complete specification",
+                user_type.owner, user_type.name
+            )));
+        }
+        if let Some(body) = user_type.body.as_deref() {
+            reject_dynamic_plsql(
+                "type body",
+                &format!("{}.{}", user_type.owner, user_type.name),
+                body,
+            )?;
+        }
+        let identity = (user_type.owner.clone(), user_type.name.clone());
+        if user_types.insert(identity, user_type).is_some() {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle type {}.{}",
+                user_type.owner, user_type.name
+            )));
+        }
+        if !inventory_keys.contains(&(
+            user_type.owner.clone(),
+            "TYPE".to_owned(),
+            user_type.name.clone(),
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle type {}.{} is missing from the independent object inventory",
+                user_type.owner, user_type.name
+            )));
+        }
+        let has_body_inventory = inventory_keys.contains(&(
+            user_type.owner.clone(),
+            "TYPE BODY".to_owned(),
+            user_type.name.clone(),
+        ));
+        if has_body_inventory != user_type.body.is_some() {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle type body inventory mismatch for {}.{}",
+                user_type.owner, user_type.name
+            )));
+        }
+    }
+    let inventory_type_count = inventory
+        .iter()
+        .filter(|object| object.object_type == "TYPE")
+        .count();
+    let inventory_type_body_count = inventory
+        .iter()
+        .filter(|object| object.object_type == "TYPE BODY")
+        .count();
+    if inventory_type_count != raw.user_types.len()
+        || inventory_type_body_count
+            != raw
+                .user_types
+                .iter()
+                .filter(|user_type| user_type.body.is_some())
+                .count()
+    {
+        return Err(CatalogError::Mapping(format!(
+            "Oracle type inventory mismatch: TYPE={inventory_type_count}, TYPE BODY={inventory_type_body_count}"
+        )));
+    }
+    for user_type in &raw.user_types {
+        match (
+            user_type.supertype_owner.as_deref(),
+            user_type.supertype_name.as_deref(),
+        ) {
+            (Some(owner), Some(name)) => {
+                ensure_owner(scope, owner, "type supertype")?;
+                if !user_types.contains_key(&(owner.to_owned(), name.to_owned()))
+                    || (owner == user_type.owner && name == user_type.name)
+                    || user_type.local_attribute_count.is_none()
+                    || user_type.local_method_count.is_none()
+                {
+                    return Err(CatalogError::Mapping(format!(
+                        "Oracle type {}.{} has inconsistent supertype metadata",
+                        user_type.owner, user_type.name
+                    )));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(CatalogError::Mapping(format!(
+                    "Oracle type {}.{} has a partial supertype identity",
+                    user_type.owner, user_type.name
+                )));
+            }
+        }
+    }
+
+    let mut attribute_identities = BTreeSet::new();
+    let mut attributes_by_type = BTreeMap::<(String, String), Vec<&RawTypeAttribute>>::new();
+    for attribute in &raw.type_attributes {
+        ensure_owner(scope, &attribute.owner, "type attribute")?;
+        if !user_types.contains_key(&(attribute.owner.clone(), attribute.type_name.clone())) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle type attribute {}.{}.{} has no parent type",
+                attribute.owner, attribute.type_name, attribute.name
+            )));
+        }
+        positive_u32(attribute.position, "Oracle type attribute position")?;
+        ensure_yes_no(
+            &attribute.inherited,
+            &format!(
+                "Oracle type attribute {}.{}.{} inherited",
+                attribute.owner, attribute.type_name, attribute.name
+            ),
+        )?;
+        ensure_user_type_reference(
+            scope,
+            &user_types,
+            attribute.data_type_owner.as_deref(),
+            &attribute.data_type_name,
+            &format!(
+                "Oracle type attribute {}.{}.{}",
+                attribute.owner, attribute.type_name, attribute.name
+            ),
+        )?;
+        if !attribute_identities.insert((
+            attribute.owner.clone(),
+            attribute.type_name.clone(),
+            attribute.position,
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle type attribute position {} for {}.{}",
+                attribute.position, attribute.owner, attribute.type_name
+            )));
+        }
+        attributes_by_type
+            .entry((attribute.owner.clone(), attribute.type_name.clone()))
+            .or_default()
+            .push(attribute);
+    }
+    for user_type in &raw.user_types {
+        let attributes = attributes_by_type
+            .get(&(user_type.owner.clone(), user_type.name.clone()))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if attributes.len() != user_type.attribute_count as usize
+            || attributes
+                .iter()
+                .enumerate()
+                .any(|(offset, attribute)| attribute.position != (offset + 1) as i64)
+        {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle type attribute catalog mismatch for {}.{}",
+                user_type.owner, user_type.name
+            )));
+        }
+    }
+
+    let mut collection_names = BTreeSet::new();
+    for collection in &raw.collection_types {
+        ensure_owner(scope, &collection.owner, "collection type")?;
+        let parent = user_types
+            .get(&(collection.owner.clone(), collection.type_name.clone()))
+            .copied()
+            .ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle collection {}.{} has no parent type",
+                    collection.owner, collection.type_name
+                ))
+            })?;
+        if parent.typecode != "COLLECTION"
+            || !matches!(
+                collection.collection_type.as_str(),
+                "TABLE" | "VARYING ARRAY"
+            )
+            || (collection.collection_type == "VARYING ARRAY" && collection.upper_bound.is_none())
+            || (collection.collection_type == "TABLE" && collection.upper_bound.is_some())
+        {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle collection metadata is inconsistent for {}.{}",
+                collection.owner, collection.type_name
+            )));
+        }
+        ensure_user_type_reference(
+            scope,
+            &user_types,
+            collection.element_type_owner.as_deref(),
+            &collection.element_type_name,
+            &format!(
+                "Oracle collection {}.{}",
+                collection.owner, collection.type_name
+            ),
+        )?;
+        if !collection_names.insert((collection.owner.clone(), collection.type_name.clone())) {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle collection type {}.{}",
+                collection.owner, collection.type_name
+            )));
+        }
+    }
+    let expected_collection_names = raw
+        .user_types
+        .iter()
+        .filter(|user_type| user_type.typecode == "COLLECTION")
+        .map(|user_type| (user_type.owner.clone(), user_type.name.clone()))
+        .collect::<BTreeSet<_>>();
+    if collection_names != expected_collection_names {
+        return Err(CatalogError::Mapping(
+            "Oracle USER/DBA_COLL_TYPES does not exactly match collection TYPE rows".to_owned(),
+        ));
+    }
+
+    let mut method_identities = BTreeSet::new();
+    let mut methods_by_type = BTreeMap::<(String, String), Vec<&RawTypeMethod>>::new();
+    for method in &raw.type_methods {
+        ensure_owner(scope, &method.owner, "type method")?;
+        let parent = user_types
+            .get(&(method.owner.clone(), method.type_name.clone()))
+            .copied()
+            .ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle type method {}.{}.{} has no parent type",
+                    method.owner, method.type_name, method.name
+                ))
+            })?;
+        if parent.typecode != "OBJECT" || method.parameter_count < 0 || method.result_count < 0 {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle type method metadata is malformed for {}.{}.{}",
+                method.owner, method.type_name, method.name
+            )));
+        }
+        positive_u32(method.method_number, "Oracle type method number")?;
+        for (name, value) in [
+            ("final", method.final_method.as_str()),
+            ("instantiable", method.instantiable.as_str()),
+            ("overriding", method.overriding.as_str()),
+            ("inherited", method.inherited.as_str()),
+        ] {
+            ensure_yes_no(
+                value,
+                &format!(
+                    "Oracle type method {}.{}.{} {name}",
+                    method.owner, method.type_name, method.name
+                ),
+            )?;
+        }
+        if !method_identities.insert((
+            method.owner.clone(),
+            method.type_name.clone(),
+            method.method_number,
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle type method number {} for {}.{}",
+                method.method_number, method.owner, method.type_name
+            )));
+        }
+        methods_by_type
+            .entry((method.owner.clone(), method.type_name.clone()))
+            .or_default()
+            .push(method);
+    }
+    for user_type in &raw.user_types {
+        let method_count = methods_by_type
+            .get(&(user_type.owner.clone(), user_type.name.clone()))
+            .map_or(0, Vec::len);
+        if method_count != user_type.method_count as usize {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle type method catalog mismatch for {}.{}",
+                user_type.owner, user_type.name
+            )));
+        }
+    }
+
+    let mut method_parameter_identities = BTreeSet::new();
+    let mut parameters_by_method =
+        BTreeMap::<(String, String, i64), Vec<&RawTypeMethodParameter>>::new();
+    for parameter in &raw.type_method_parameters {
+        ensure_owner(scope, &parameter.owner, "type method parameter")?;
+        let method_key = (
+            parameter.owner.clone(),
+            parameter.type_name.clone(),
+            parameter.method_number,
+        );
+        let method = raw
+            .type_methods
+            .iter()
+            .find(|method| {
+                method.owner == parameter.owner
+                    && method.type_name == parameter.type_name
+                    && method.method_number == parameter.method_number
+            })
+            .ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle type method parameter {}.{}.{} has no method",
+                    parameter.owner, parameter.type_name, parameter.name
+                ))
+            })?;
+        if parameter.method_name != method.name
+            || parameter.position < 0
+            || !matches!(parameter.mode.as_str(), "IN" | "OUT" | "IN/OUT")
+        {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle type method parameter metadata is malformed for {}.{}.{}",
+                parameter.owner, parameter.type_name, parameter.name
+            )));
+        }
+        ensure_user_type_reference(
+            scope,
+            &user_types,
+            parameter.data_type_owner.as_deref(),
+            &parameter.data_type_name,
+            &format!(
+                "Oracle type method parameter {}.{}.{}",
+                parameter.owner, parameter.type_name, parameter.name
+            ),
+        )?;
+        if !method_parameter_identities.insert((
+            method_key.clone(),
+            parameter.return_value,
+            parameter.position,
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle type method parameter position {} for {}.{}",
+                parameter.position, parameter.owner, parameter.type_name
+            )));
+        }
+        parameters_by_method
+            .entry(method_key)
+            .or_default()
+            .push(parameter);
+    }
+    for method in &raw.type_methods {
+        let parameters = parameters_by_method
+            .get(&(
+                method.owner.clone(),
+                method.type_name.clone(),
+                method.method_number,
+            ))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let parameter_count = parameters
+            .iter()
+            .filter(|parameter| !parameter.return_value)
+            .count();
+        let result_count = parameters
+            .iter()
+            .filter(|parameter| parameter.return_value)
+            .count();
+        if parameter_count != method.parameter_count as usize
+            || result_count != method.result_count as usize
+        {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle type method parameter catalog mismatch for {}.{}.{}",
+                method.owner, method.type_name, method.name
+            )));
+        }
+    }
+
+    for column in raw.columns.iter().chain(&raw.view_columns) {
+        ensure_user_type_reference(
+            scope,
+            &user_types,
+            column.data_type_owner.as_deref(),
+            &column.data_type,
+            &format!(
+                "Oracle column {}.{}.{}",
+                column.owner, column.table, column.name
+            ),
+        )?;
+    }
+
     let mut triggers = BTreeSet::new();
     for trigger in &raw.triggers {
         ensure_owner(scope, &trigger.owner, "trigger")?;
@@ -4452,15 +5814,33 @@ fn validate_raw_catalog(
                 argument.owner, argument.routine
             )));
         }
-        if argument.data_level != 0
-            || argument.type_owner.is_some()
-            || argument.type_name.is_some()
-            || argument.type_subname.is_some()
-        {
+        if argument.data_level != 0 || argument.type_subname.is_some() {
             return Err(CatalogError::UnsupportedMetadata(format!(
-                "Oracle composite or user-defined routine argument is not yet covered for {}.{} position {}",
+                "Oracle nested or package-defined routine argument is not covered for {}.{} position {}",
                 argument.owner, argument.routine, argument.position
             )));
+        }
+        match (
+            argument.type_owner.as_deref(),
+            argument.type_name.as_deref(),
+        ) {
+            (Some(owner), Some(name)) => ensure_user_type_reference(
+                scope,
+                &user_types,
+                Some(owner),
+                name,
+                &format!(
+                    "Oracle routine argument {}.{} position {}",
+                    argument.owner, argument.routine, argument.position
+                ),
+            )?,
+            (None, None) => {}
+            _ => {
+                return Err(CatalogError::Mapping(format!(
+                    "Oracle routine argument {}.{} position {} has a partial type identity",
+                    argument.owner, argument.routine, argument.position
+                )));
+            }
         }
         if argument.data_type.is_none() {
             return Err(CatalogError::Mapping(format!(
@@ -4722,15 +6102,33 @@ fn validate_raw_catalog(
                 argument.owner, package_name, argument.routine
             )));
         }
-        if argument.data_level != 0
-            || argument.type_owner.is_some()
-            || argument.type_name.is_some()
-            || argument.type_subname.is_some()
-        {
+        if argument.data_level != 0 || argument.type_subname.is_some() {
             return Err(CatalogError::UnsupportedMetadata(format!(
-                "Oracle composite or user-defined package argument is not yet covered for {}.{}.{} position {}",
+                "Oracle nested or package-defined package argument is not covered for {}.{}.{} position {}",
                 argument.owner, package_name, argument.routine, argument.position
             )));
+        }
+        match (
+            argument.type_owner.as_deref(),
+            argument.type_name.as_deref(),
+        ) {
+            (Some(owner), Some(name)) => ensure_user_type_reference(
+                scope,
+                &user_types,
+                Some(owner),
+                name,
+                &format!(
+                    "Oracle package argument {}.{}.{} position {}",
+                    argument.owner, package_name, argument.routine, argument.position
+                ),
+            )?,
+            (None, None) => {}
+            _ => {
+                return Err(CatalogError::Mapping(format!(
+                    "Oracle package argument {}.{}.{} position {} has a partial type identity",
+                    argument.owner, package_name, argument.routine, argument.position
+                )));
+            }
         }
         if argument.data_type.is_none()
             || !matches!(argument.mode.as_str(), "IN" | "OUT" | "IN/OUT")
@@ -4846,12 +6244,18 @@ fn validate_raw_catalog(
                 && packages.contains_key(&(dependency.owner.clone(), dependency.name.clone()));
         let source_is_synonym = dependency.object_type == "SYNONYM"
             && synonyms.contains(&(dependency.owner.clone(), dependency.name.clone()));
+        let source_is_type = matches!(dependency.object_type.as_str(), "TYPE" | "TYPE BODY")
+            && user_types.contains_key(&(dependency.owner.clone(), dependency.name.clone()));
+        let source_is_table = dependency.object_type == "TABLE"
+            && tables.contains(&(dependency.owner.clone(), dependency.name.clone()));
         if !source_is_view
             && !source_is_mview
             && !source_is_trigger
             && !source_is_routine
             && !source_is_package
             && !source_is_synonym
+            && !source_is_type
+            && !source_is_table
         {
             return Err(CatalogError::UnsupportedMetadata(format!(
                 "Oracle dependency source is not yet covered: {}.{} ({})",
@@ -4870,6 +6274,16 @@ fn validate_raw_catalog(
         }
         if dependency.referenced_owner_oracle_maintained {
             continue;
+        }
+        if source_is_table && dependency.referenced_type != "TYPE" {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle table dependency {}.{} -> {}.{} ({}) is not covered by typed-column mapping",
+                dependency.owner,
+                dependency.name,
+                dependency.referenced_owner,
+                dependency.referenced_name,
+                dependency.referenced_type
+            )));
         }
         ensure_owner(scope, &dependency.referenced_owner, "dependency target")?;
         let target_exists = match dependency.referenced_type.as_str() {
@@ -4902,6 +6316,10 @@ fn validate_raw_catalog(
                 dependency.referenced_owner.clone(),
                 dependency.referenced_name.clone(),
             )),
+            "TYPE" => user_types.contains_key(&(
+                dependency.referenced_owner.clone(),
+                dependency.referenced_name.clone(),
+            )),
             _ => false,
         };
         if !target_exists {
@@ -4928,6 +6346,38 @@ fn validate_raw_catalog(
             return Err(CatalogError::Mapping(format!(
                 "Oracle synonym {}.{} has {target_dependency_count} matching target dependency rows; expected exactly one",
                 synonym.owner, synonym.name
+            )));
+        }
+    }
+    let typed_column_dependencies = raw
+        .columns
+        .iter()
+        .filter_map(|column| {
+            Some((
+                column.owner.as_str(),
+                column.table.as_str(),
+                column.data_type_owner.as_deref()?,
+                column.data_type.as_str(),
+            ))
+        })
+        .collect::<BTreeSet<_>>();
+    for (owner, table, type_owner, type_name) in typed_column_dependencies {
+        let dependency_count = raw
+            .dependencies
+            .iter()
+            .filter(|dependency| {
+                dependency.owner == owner
+                    && dependency.name == table
+                    && dependency.object_type == "TABLE"
+                    && dependency.referenced_owner == type_owner
+                    && dependency.referenced_name == type_name
+                    && dependency.referenced_type == "TYPE"
+                    && !dependency.referenced_owner_oracle_maintained
+            })
+            .count();
+        if dependency_count != 1 {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle typed table {owner}.{table} has {dependency_count} dependency rows for {type_owner}.{type_name}; expected exactly one"
             )));
         }
     }
@@ -5297,7 +6747,7 @@ impl<'a> OracleSnapshotMapper<'a> {
                 principal.default_collation.as_deref(),
             );
             metadata.objects.push(MetadataObject {
-                key,
+                key: key.clone(),
                 parent_key: Some(database_key.clone()),
                 name: principal.name.clone(),
                 extension_kind: None,
@@ -5321,6 +6771,267 @@ impl<'a> OracleSnapshotMapper<'a> {
                 )
             })
             .collect::<BTreeMap<_, _>>();
+
+        let collection_by_type = raw
+            .collection_types
+            .iter()
+            .map(|collection| {
+                (
+                    (collection.owner.clone(), collection.type_name.clone()),
+                    collection,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut type_keys = BTreeMap::new();
+        for user_type in &raw.user_types {
+            let schema_key = required(
+                schema_keys.get(&user_type.owner),
+                format!(
+                    "schema key for Oracle type {}.{}",
+                    user_type.owner, user_type.name
+                ),
+            )?;
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &user_type.owner,
+                ObjectKind::UserDefinedType,
+                &user_type.name,
+                None,
+            );
+            type_keys.insert(
+                (user_type.owner.clone(), user_type.name.clone()),
+                key.clone(),
+            );
+            let inventory_object = required(
+                inventory.get(&(
+                    user_type.owner.clone(),
+                    "TYPE".to_owned(),
+                    user_type.name.clone(),
+                )),
+                format!(
+                    "inventory row for Oracle type {}.{}",
+                    user_type.owner, user_type.name
+                ),
+            )?;
+            let body_inventory = inventory
+                .get(&(
+                    user_type.owner.clone(),
+                    "TYPE BODY".to_owned(),
+                    user_type.name.clone(),
+                ))
+                .copied();
+            metadata.objects.push(MetadataObject {
+                key: key.clone(),
+                parent_key: Some(schema_key.clone()),
+                name: user_type.name.clone(),
+                extension_kind: None,
+                definition: Some(oracle_type_definition(user_type)?),
+                properties: oracle_type_properties(
+                    user_type,
+                    inventory_object,
+                    body_inventory,
+                    collection_by_type
+                        .get(&(user_type.owner.clone(), user_type.name.clone()))
+                        .copied(),
+                ),
+            });
+        }
+        for user_type in &raw.user_types {
+            let Some(supertype_owner) = user_type.supertype_owner.as_deref() else {
+                continue;
+            };
+            let supertype_name = user_type.supertype_name.as_deref().ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle type {}.{} has no supertype name",
+                    user_type.owner, user_type.name
+                ))
+            })?;
+            metadata.relationships.push(MetadataRelationship {
+                kind: MetadataRelationshipKind::InheritsFrom,
+                from_key: required(
+                    type_keys.get(&(user_type.owner.clone(), user_type.name.clone())),
+                    format!("subtype key for {}.{}", user_type.owner, user_type.name),
+                )?
+                .clone(),
+                to_key: required(
+                    type_keys.get(&(supertype_owner.to_owned(), supertype_name.to_owned())),
+                    format!("supertype key for {supertype_owner}.{supertype_name}"),
+                )?
+                .clone(),
+                ordinal: None,
+                properties: BTreeMap::new(),
+            });
+        }
+        for attribute in &raw.type_attributes {
+            let parent_key = required(
+                type_keys.get(&(attribute.owner.clone(), attribute.type_name.clone())),
+                format!(
+                    "parent type key for Oracle attribute {}.{}.{}",
+                    attribute.owner, attribute.type_name, attribute.name
+                ),
+            )?;
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &attribute.owner,
+                ObjectKind::Extension,
+                &attribute.type_name,
+                Some(format!(
+                    "attribute:{}:{}",
+                    attribute.position, attribute.name
+                )),
+            );
+            metadata.objects.push(MetadataObject {
+                key: key.clone(),
+                parent_key: Some(parent_key.clone()),
+                name: attribute.name.clone(),
+                extension_kind: Some("oracle_type_attribute".to_owned()),
+                definition: None,
+                properties: oracle_type_attribute_properties(attribute),
+            });
+            if let Some(owner) = attribute.data_type_owner.as_deref() {
+                metadata.relationships.push(MetadataRelationship {
+                    kind: MetadataRelationshipKind::UsesType,
+                    from_key: key,
+                    to_key: required(
+                        type_keys.get(&(owner.to_owned(), attribute.data_type_name.clone())),
+                        format!(
+                            "type key for Oracle attribute {}.{}.{}",
+                            attribute.owner, attribute.type_name, attribute.name
+                        ),
+                    )?
+                    .clone(),
+                    ordinal: None,
+                    properties: BTreeMap::new(),
+                });
+            }
+        }
+        for collection in &raw.collection_types {
+            let Some(element_owner) = collection.element_type_owner.as_deref() else {
+                continue;
+            };
+            metadata.relationships.push(MetadataRelationship {
+                kind: MetadataRelationshipKind::UsesType,
+                from_key: required(
+                    type_keys.get(&(collection.owner.clone(), collection.type_name.clone())),
+                    format!(
+                        "collection type key for {}.{}",
+                        collection.owner, collection.type_name
+                    ),
+                )?
+                .clone(),
+                to_key: required(
+                    type_keys.get(&(
+                        element_owner.to_owned(),
+                        collection.element_type_name.clone(),
+                    )),
+                    format!(
+                        "element type key for {}.{}",
+                        element_owner, collection.element_type_name
+                    ),
+                )?
+                .clone(),
+                ordinal: None,
+                properties: BTreeMap::new(),
+            });
+        }
+
+        let mut type_method_keys = BTreeMap::new();
+        for method in &raw.type_methods {
+            let parent_key = required(
+                type_keys.get(&(method.owner.clone(), method.type_name.clone())),
+                format!(
+                    "parent type key for Oracle method {}.{}.{}",
+                    method.owner, method.type_name, method.name
+                ),
+            )?;
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &method.owner,
+                ObjectKind::Routine,
+                &method.type_name,
+                Some(format!("method:{}:{}", method.method_number, method.name)),
+            );
+            type_method_keys.insert(
+                (
+                    method.owner.clone(),
+                    method.type_name.clone(),
+                    method.method_number,
+                ),
+                key.clone(),
+            );
+            metadata.objects.push(MetadataObject {
+                key,
+                parent_key: Some(parent_key.clone()),
+                name: method.name.clone(),
+                extension_kind: None,
+                definition: None,
+                properties: oracle_type_method_properties(method),
+            });
+        }
+        for parameter in &raw.type_method_parameters {
+            let method_key = required(
+                type_method_keys.get(&(
+                    parameter.owner.clone(),
+                    parameter.type_name.clone(),
+                    parameter.method_number,
+                )),
+                format!(
+                    "method key for Oracle parameter {}.{}.{}",
+                    parameter.owner, parameter.type_name, parameter.name
+                ),
+            )?;
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &parameter.owner,
+                ObjectKind::RoutineParameter,
+                &parameter.type_name,
+                Some(format!(
+                    "method:{}:{}#parameter:{}:{}",
+                    parameter.method_number,
+                    parameter.method_name,
+                    parameter.position,
+                    parameter.name
+                )),
+            );
+            metadata.objects.push(MetadataObject {
+                key: key.clone(),
+                parent_key: Some(method_key.clone()),
+                name: parameter.name.clone(),
+                extension_kind: None,
+                definition: None,
+                properties: oracle_type_method_parameter_properties(parameter),
+            });
+            metadata.relationships.push(MetadataRelationship {
+                kind: MetadataRelationshipKind::HasParameter,
+                from_key: method_key.clone(),
+                to_key: key.clone(),
+                ordinal: Some(positive_u32(
+                    parameter.position + 1,
+                    "Oracle type method parameter relationship ordinal",
+                )?),
+                properties: BTreeMap::new(),
+            });
+            if let Some(owner) = parameter.data_type_owner.as_deref() {
+                metadata.relationships.push(MetadataRelationship {
+                    kind: MetadataRelationshipKind::UsesType,
+                    from_key: key,
+                    to_key: required(
+                        type_keys.get(&(owner.to_owned(), parameter.data_type_name.clone())),
+                        format!(
+                            "type key for Oracle method parameter {}.{}.{}",
+                            parameter.owner, parameter.type_name, parameter.name
+                        ),
+                    )?
+                    .clone(),
+                    ordinal: None,
+                    properties: BTreeMap::new(),
+                });
+            }
+        }
 
         let mut sequence_keys = BTreeMap::new();
         for sequence in &raw.sequences {
@@ -5666,13 +7377,29 @@ impl<'a> OracleSnapshotMapper<'a> {
                 column.default_value.as_deref(),
             );
             metadata.objects.push(MetadataObject {
-                key,
+                key: key.clone(),
                 parent_key: Some(view_key.clone()),
                 name: column.name.clone(),
                 extension_kind: None,
                 definition: None,
                 properties,
             });
+            if let Some(owner) = column.data_type_owner.as_deref() {
+                metadata.relationships.push(MetadataRelationship {
+                    kind: MetadataRelationshipKind::UsesType,
+                    from_key: key,
+                    to_key: required(
+                        type_keys.get(&(owner.to_owned(), column.data_type.clone())),
+                        format!(
+                            "type key for Oracle view column {}.{}.{}",
+                            column.owner, column.table, column.name
+                        ),
+                    )?
+                    .clone(),
+                    ordinal: None,
+                    properties: BTreeMap::new(),
+                });
+            }
         }
 
         let mut materialized_view_column_keys = BTreeMap::new();
@@ -5723,13 +7450,29 @@ impl<'a> OracleSnapshotMapper<'a> {
                 column.default_value.as_deref(),
             );
             metadata.objects.push(MetadataObject {
-                key,
+                key: key.clone(),
                 parent_key: Some(view_key.clone()),
                 name: column.name.clone(),
                 extension_kind: None,
                 definition: None,
                 properties,
             });
+            if let Some(owner) = column.data_type_owner.as_deref() {
+                metadata.relationships.push(MetadataRelationship {
+                    kind: MetadataRelationshipKind::UsesType,
+                    from_key: key,
+                    to_key: required(
+                        type_keys.get(&(owner.to_owned(), column.data_type.clone())),
+                        format!(
+                            "type key for Oracle materialized-view column {}.{}.{}",
+                            column.owner, column.table, column.name
+                        ),
+                    )?
+                    .clone(),
+                    ordinal: None,
+                    properties: BTreeMap::new(),
+                });
+            }
         }
 
         let mut routines = Vec::new();
@@ -5840,13 +7583,32 @@ impl<'a> OracleSnapshotMapper<'a> {
             metadata.relationships.push(MetadataRelationship {
                 kind: MetadataRelationshipKind::HasParameter,
                 from_key: routine_key.clone(),
-                to_key: key,
+                to_key: key.clone(),
                 ordinal: Some(positive_u32(
                     argument.sequence,
                     "Oracle routine argument relationship ordinal",
                 )?),
                 properties: BTreeMap::new(),
             });
+            if let (Some(owner), Some(name)) = (
+                argument.type_owner.as_deref(),
+                argument.type_name.as_deref(),
+            ) {
+                metadata.relationships.push(MetadataRelationship {
+                    kind: MetadataRelationshipKind::UsesType,
+                    from_key: key,
+                    to_key: required(
+                        type_keys.get(&(owner.to_owned(), name.to_owned())),
+                        format!(
+                            "type key for Oracle routine argument {}.{}",
+                            argument.owner, argument.routine
+                        ),
+                    )?
+                    .clone(),
+                    ordinal: None,
+                    properties: BTreeMap::new(),
+                });
+            }
         }
 
         let mut package_keys = BTreeMap::new();
@@ -6005,13 +7767,32 @@ impl<'a> OracleSnapshotMapper<'a> {
             metadata.relationships.push(MetadataRelationship {
                 kind: MetadataRelationshipKind::HasParameter,
                 from_key: routine_key.clone(),
-                to_key: key,
+                to_key: key.clone(),
                 ordinal: Some(positive_u32(
                     argument.sequence,
                     "Oracle package argument relationship ordinal",
                 )?),
                 properties: BTreeMap::new(),
             });
+            if let (Some(owner), Some(name)) = (
+                argument.type_owner.as_deref(),
+                argument.type_name.as_deref(),
+            ) {
+                metadata.relationships.push(MetadataRelationship {
+                    kind: MetadataRelationshipKind::UsesType,
+                    from_key: key,
+                    to_key: required(
+                        type_keys.get(&(owner.to_owned(), name.to_owned())),
+                        format!(
+                            "type key for Oracle package argument {}.{}.{}",
+                            argument.owner, package_name, argument.routine
+                        ),
+                    )?
+                    .clone(),
+                    ordinal: None,
+                    properties: BTreeMap::new(),
+                });
+            }
         }
 
         let mut synonym_keys = BTreeMap::new();
@@ -6156,6 +7937,16 @@ impl<'a> OracleSnapshotMapper<'a> {
                         dependency.referenced_owner, dependency.referenced_name
                     ),
                 )?,
+                "TYPE" => required(
+                    type_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )),
+                    format!(
+                        "type target for Oracle synonym dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
                 other => {
                     return Err(CatalogError::Mapping(format!(
                         "unmapped Oracle synonym target type '{other}'"
@@ -6253,13 +8044,36 @@ impl<'a> OracleSnapshotMapper<'a> {
                         dependency.referenced_owner, dependency.referenced_name
                     ),
                 )?,
+                "TYPE" => required(
+                    type_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )),
+                    format!(
+                        "type target for Oracle view dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
                 other => {
                     return Err(CatalogError::Mapping(format!(
                         "unmapped Oracle view dependency target type '{other}'"
                     )));
                 }
             };
-            views[*source_position].depends_on.push(target_key.clone());
+            if dependency.referenced_type == "TYPE" {
+                metadata.relationships.push(MetadataRelationship {
+                    kind: MetadataRelationshipKind::DependsOn,
+                    from_key: views[*source_position].key.clone(),
+                    to_key: target_key.clone(),
+                    ordinal: None,
+                    properties: BTreeMap::from([(
+                        "oracle_dependency_type".to_owned(),
+                        MetadataValue::String(dependency.dependency_type.clone()),
+                    )]),
+                });
+            } else {
+                views[*source_position].depends_on.push(target_key.clone());
+            }
         }
 
         for dependency in raw
@@ -6362,6 +8176,19 @@ impl<'a> OracleSnapshotMapper<'a> {
                         )),
                         format!(
                             "package target for Oracle materialized-view dependency {}.{}",
+                            dependency.referenced_owner, dependency.referenced_name
+                        ),
+                    )?,
+                    MetadataRelationshipKind::DependsOn,
+                ),
+                "TYPE" => (
+                    required(
+                        type_keys.get(&(
+                            dependency.referenced_owner.clone(),
+                            dependency.referenced_name.clone(),
+                        )),
+                        format!(
+                            "type target for Oracle materialized-view dependency {}.{}",
                             dependency.referenced_owner, dependency.referenced_name
                         ),
                     )?,
@@ -6476,15 +8303,38 @@ impl<'a> OracleSnapshotMapper<'a> {
                         dependency.referenced_owner, dependency.referenced_name
                     ),
                 )?,
+                "TYPE" => required(
+                    type_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )),
+                    format!(
+                        "type target for Oracle routine dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
                 other => {
                     return Err(CatalogError::Mapping(format!(
                         "unmapped Oracle routine dependency target type '{other}'"
                     )));
                 }
             };
-            routines[*source_position]
-                .depends_on
-                .push(target_key.clone());
+            if dependency.referenced_type == "TYPE" {
+                metadata.relationships.push(MetadataRelationship {
+                    kind: MetadataRelationshipKind::DependsOn,
+                    from_key: routines[*source_position].key.clone(),
+                    to_key: target_key.clone(),
+                    ordinal: None,
+                    properties: BTreeMap::from([(
+                        "oracle_dependency_type".to_owned(),
+                        MetadataValue::String(dependency.dependency_type.clone()),
+                    )]),
+                });
+            } else {
+                routines[*source_position]
+                    .depends_on
+                    .push(target_key.clone());
+            }
         }
 
         for (identity, evidence) in oracle_package_dependency_groups(&raw.dependencies) {
@@ -6540,9 +8390,106 @@ impl<'a> OracleSnapshotMapper<'a> {
                         "package target for Oracle package dependency {referenced_owner}.{referenced_name}"
                     ),
                 )?,
+                "TYPE" => required(
+                    type_keys.get(&(referenced_owner.clone(), referenced_name.clone())),
+                    format!(
+                        "type target for Oracle package dependency {referenced_owner}.{referenced_name}"
+                    ),
+                )?,
                 other => {
                     return Err(CatalogError::Mapping(format!(
                         "unmapped Oracle package dependency target type '{other}'"
+                    )));
+                }
+            };
+            metadata.relationships.push(MetadataRelationship {
+                kind: MetadataRelationshipKind::DependsOn,
+                from_key: source_key.clone(),
+                to_key: target_key.clone(),
+                ordinal: None,
+                properties: BTreeMap::from([
+                    (
+                        "oracle_source_object_types".to_owned(),
+                        MetadataValue::StringList(
+                            evidence.source_object_types.into_iter().collect(),
+                        ),
+                    ),
+                    (
+                        "oracle_dependency_types".to_owned(),
+                        MetadataValue::StringList(evidence.dependency_types.into_iter().collect()),
+                    ),
+                ]),
+            });
+        }
+
+        for (identity, evidence) in oracle_type_dependency_groups(&raw.dependencies) {
+            let (owner, type_name, referenced_owner, referenced_name, referenced_type) = identity;
+            let source_key = required(
+                type_keys.get(&(owner.clone(), type_name.clone())),
+                format!("source key for Oracle type dependency {owner}.{type_name}"),
+            )?;
+            let target_key = match referenced_type.as_str() {
+                "TABLE" => match materialized_view_keys
+                    .get(&(referenced_owner.clone(), referenced_name.clone()))
+                {
+                    Some(key) => key,
+                    None => required(
+                        table_keys.get(&(referenced_owner.clone(), referenced_name.clone())),
+                        format!(
+                            "table target for Oracle type dependency {referenced_owner}.{referenced_name}"
+                        ),
+                    )?,
+                },
+                "VIEW" => required(
+                    view_keys.get(&(referenced_owner.clone(), referenced_name.clone())),
+                    format!(
+                        "view target for Oracle type dependency {referenced_owner}.{referenced_name}"
+                    ),
+                )?,
+                "MATERIALIZED VIEW" => required(
+                    materialized_view_keys
+                        .get(&(referenced_owner.clone(), referenced_name.clone())),
+                    format!(
+                        "materialized-view target for Oracle type dependency {referenced_owner}.{referenced_name}"
+                    ),
+                )?,
+                "SEQUENCE" => required(
+                    sequence_keys.get(&(referenced_owner.clone(), referenced_name.clone())),
+                    format!(
+                        "sequence target for Oracle type dependency {referenced_owner}.{referenced_name}"
+                    ),
+                )?,
+                "FUNCTION" | "PROCEDURE" => required(
+                    routine_keys.get(&(
+                        referenced_owner.clone(),
+                        referenced_name.clone(),
+                        referenced_type.clone(),
+                    )),
+                    format!(
+                        "routine target for Oracle type dependency {referenced_owner}.{referenced_name}"
+                    ),
+                )?,
+                "PACKAGE" => required(
+                    package_keys.get(&(referenced_owner.clone(), referenced_name.clone())),
+                    format!(
+                        "package target for Oracle type dependency {referenced_owner}.{referenced_name}"
+                    ),
+                )?,
+                "SYNONYM" => required(
+                    synonym_keys.get(&(referenced_owner.clone(), referenced_name.clone())),
+                    format!(
+                        "synonym target for Oracle type dependency {referenced_owner}.{referenced_name}"
+                    ),
+                )?,
+                "TYPE" => required(
+                    type_keys.get(&(referenced_owner.clone(), referenced_name.clone())),
+                    format!(
+                        "type target for Oracle dependency {referenced_owner}.{referenced_name}"
+                    ),
+                )?,
+                other => {
+                    return Err(CatalogError::Mapping(format!(
+                        "unmapped Oracle type dependency target type '{other}'"
                     )));
                 }
             };
@@ -6668,10 +8615,26 @@ impl<'a> OracleSnapshotMapper<'a> {
                 });
             }
             metadata.annotations.push(ObjectAnnotation {
-                object_key: key,
+                object_key: key.clone(),
                 definition: None,
                 properties,
             });
+            if let Some(owner) = column.data_type_owner.as_deref() {
+                metadata.relationships.push(MetadataRelationship {
+                    kind: MetadataRelationshipKind::UsesType,
+                    from_key: key,
+                    to_key: required(
+                        type_keys.get(&(owner.to_owned(), column.data_type.clone())),
+                        format!(
+                            "type key for Oracle column {}.{}.{}",
+                            column.owner, column.table, column.name
+                        ),
+                    )?
+                    .clone(),
+                    ordinal: None,
+                    properties: BTreeMap::new(),
+                });
+            }
         }
 
         let constraint_by_identity = raw
@@ -7173,6 +9136,19 @@ impl<'a> OracleSnapshotMapper<'a> {
                     )?,
                     MetadataRelationshipKind::DependsOn,
                 ),
+                "TYPE" => (
+                    required(
+                        type_keys.get(&(
+                            dependency.referenced_owner.clone(),
+                            dependency.referenced_name.clone(),
+                        )),
+                        format!(
+                            "type target for Oracle trigger dependency {}.{}",
+                            dependency.referenced_owner, dependency.referenced_name
+                        ),
+                    )?,
+                    MetadataRelationshipKind::DependsOn,
+                ),
                 other => {
                     return Err(CatalogError::Mapping(format!(
                         "unmapped Oracle trigger dependency target type '{other}'"
@@ -7258,7 +9234,7 @@ impl<'a> OracleSnapshotMapper<'a> {
                 CapabilityCheck {
                     name: "independent_inventory_reconciliation".to_owned(),
                     evidence: format!(
-                        "{} non-secondary USER/DBA_OBJECTS rows reconciled against table, index, sequence, view, materialized-view, synonym, trigger, routine, and package detail catalogs",
+                        "{} non-secondary USER/DBA_OBJECTS rows reconciled against table, index, sequence, view, materialized-view, synonym, type, trigger, routine, and package detail catalogs",
                         raw.inventory.iter().filter(|object| !object.secondary).count()
                     ),
                 },
@@ -7616,6 +9592,194 @@ fn oracle_package_definition(package: &RawPackage) -> Result<String, CatalogErro
     Ok(definition)
 }
 
+fn oracle_type_definition(user_type: &RawUserType) -> Result<String, CatalogError> {
+    let specification = user_type.specification.as_deref().ok_or_else(|| {
+        CatalogError::Mapping(format!(
+            "Oracle type {}.{} has no specification",
+            user_type.owner, user_type.name
+        ))
+    })?;
+    let definition = user_type
+        .body
+        .as_deref()
+        .map(|body| format!("{specification}\n\n{body}"))
+        .unwrap_or_else(|| specification.to_owned());
+    if definition.len() > MAX_DEFINITION_BYTES {
+        return Err(CatalogError::UnsupportedMetadata(format!(
+            "combined Oracle type definition exceeds the {MAX_DEFINITION_BYTES}-byte safety limit for {}.{}",
+            user_type.owner, user_type.name
+        )));
+    }
+    Ok(definition)
+}
+
+fn oracle_type_properties(
+    user_type: &RawUserType,
+    inventory_object: &RawInventoryObject,
+    body_inventory: Option<&RawInventoryObject>,
+    collection: Option<&RawCollectionType>,
+) -> BTreeMap<String, MetadataValue> {
+    let mut properties = inventory_properties(inventory_object);
+    insert_string(&mut properties, "type_oid", &user_type.oid);
+    insert_string(&mut properties, "typecode", &user_type.typecode);
+    insert_i64(
+        &mut properties,
+        "attribute_count",
+        user_type.attribute_count,
+    );
+    insert_i64(&mut properties, "method_count", user_type.method_count);
+    insert_string(&mut properties, "predefined", &user_type.predefined);
+    insert_string(&mut properties, "incomplete", &user_type.incomplete);
+    insert_string(&mut properties, "final", &user_type.final_type);
+    insert_string(&mut properties, "instantiable", &user_type.instantiable);
+    insert_string(&mut properties, "persistable", &user_type.persistable);
+    insert_optional_string(
+        &mut properties,
+        "supertype_owner",
+        user_type.supertype_owner.as_deref(),
+    );
+    insert_optional_string(
+        &mut properties,
+        "supertype_name",
+        user_type.supertype_name.as_deref(),
+    );
+    insert_optional_i64(
+        &mut properties,
+        "local_attribute_count",
+        user_type.local_attribute_count,
+    );
+    insert_optional_i64(
+        &mut properties,
+        "local_method_count",
+        user_type.local_method_count,
+    );
+    insert_optional_string(&mut properties, "type_id", user_type.type_id.as_deref());
+    insert_bool(&mut properties, "has_body", user_type.body.is_some());
+    if let Some(body_inventory) = body_inventory {
+        insert_i64(&mut properties, "body_object_id", body_inventory.object_id);
+        insert_string(&mut properties, "body_status", &body_inventory.status);
+    }
+    if let Some(collection) = collection {
+        insert_string(
+            &mut properties,
+            "collection_type",
+            &collection.collection_type,
+        );
+        insert_optional_i64(&mut properties, "upper_bound", collection.upper_bound);
+        insert_optional_string(
+            &mut properties,
+            "element_type_modifier",
+            collection.element_type_modifier.as_deref(),
+        );
+        insert_optional_string(
+            &mut properties,
+            "element_type_owner",
+            collection.element_type_owner.as_deref(),
+        );
+        insert_string(
+            &mut properties,
+            "element_type_name",
+            &collection.element_type_name,
+        );
+        insert_optional_i64(&mut properties, "element_length", collection.length);
+        insert_optional_i64(&mut properties, "element_precision", collection.precision);
+        insert_optional_i64(&mut properties, "element_scale", collection.scale);
+        insert_optional_string(
+            &mut properties,
+            "element_character_set",
+            collection.character_set.as_deref(),
+        );
+        insert_optional_string(
+            &mut properties,
+            "element_storage",
+            collection.element_storage.as_deref(),
+        );
+        insert_optional_string(
+            &mut properties,
+            "nulls_stored",
+            collection.nulls_stored.as_deref(),
+        );
+        insert_optional_string(
+            &mut properties,
+            "element_char_used",
+            collection.char_used.as_deref(),
+        );
+    }
+    properties
+}
+
+fn oracle_type_attribute_properties(
+    attribute: &RawTypeAttribute,
+) -> BTreeMap<String, MetadataValue> {
+    let mut properties = BTreeMap::new();
+    insert_i64(&mut properties, "position", attribute.position);
+    insert_string(&mut properties, "data_type", &attribute.data_type_name);
+    insert_optional_string(
+        &mut properties,
+        "type_modifier",
+        attribute.type_modifier.as_deref(),
+    );
+    insert_optional_string(
+        &mut properties,
+        "data_type_owner",
+        attribute.data_type_owner.as_deref(),
+    );
+    insert_optional_i64(&mut properties, "length", attribute.length);
+    insert_optional_i64(&mut properties, "precision", attribute.precision);
+    insert_optional_i64(&mut properties, "scale", attribute.scale);
+    insert_optional_string(
+        &mut properties,
+        "character_set",
+        attribute.character_set.as_deref(),
+    );
+    insert_bool(&mut properties, "inherited", attribute.inherited == "YES");
+    insert_optional_string(&mut properties, "char_used", attribute.char_used.as_deref());
+    properties
+}
+
+fn oracle_type_method_properties(method: &RawTypeMethod) -> BTreeMap<String, MetadataValue> {
+    let mut properties = BTreeMap::new();
+    insert_i64(&mut properties, "method_number", method.method_number);
+    insert_string(&mut properties, "method_type", &method.method_type);
+    insert_i64(&mut properties, "parameter_count", method.parameter_count);
+    insert_i64(&mut properties, "result_count", method.result_count);
+    insert_bool(&mut properties, "final", method.final_method == "YES");
+    insert_bool(
+        &mut properties,
+        "instantiable",
+        method.instantiable == "YES",
+    );
+    insert_bool(&mut properties, "overriding", method.overriding == "YES");
+    insert_bool(&mut properties, "inherited", method.inherited == "YES");
+    properties
+}
+
+fn oracle_type_method_parameter_properties(
+    parameter: &RawTypeMethodParameter,
+) -> BTreeMap<String, MetadataValue> {
+    let mut properties = BTreeMap::new();
+    insert_i64(&mut properties, "position", parameter.position);
+    insert_string(&mut properties, "mode", &parameter.mode);
+    insert_string(&mut properties, "data_type", &parameter.data_type_name);
+    insert_optional_string(
+        &mut properties,
+        "type_modifier",
+        parameter.type_modifier.as_deref(),
+    );
+    insert_optional_string(
+        &mut properties,
+        "data_type_owner",
+        parameter.data_type_owner.as_deref(),
+    );
+    insert_optional_string(
+        &mut properties,
+        "character_set",
+        parameter.character_set.as_deref(),
+    );
+    insert_bool(&mut properties, "return_value", parameter.return_value);
+    properties
+}
+
 fn oracle_package_properties(
     package: &RawPackage,
     inventory_object: &RawInventoryObject,
@@ -7931,13 +10095,66 @@ fn discovery_counts_from_catalog(
         .iter()
         .filter(|dependency| matches!(dependency.object_type.as_str(), "FUNCTION" | "PROCEDURE"))
         .filter(|dependency| !dependency.referenced_owner_oracle_maintained)
+        .filter(|dependency| dependency.referenced_type != "TYPE")
+        .count();
+    let metadata_only_type_dependency_count = raw
+        .dependencies
+        .iter()
+        .filter(|dependency| {
+            matches!(
+                dependency.object_type.as_str(),
+                "VIEW" | "FUNCTION" | "PROCEDURE"
+            ) && dependency.referenced_type == "TYPE"
+        })
+        .filter(|dependency| !dependency.referenced_owner_oracle_maintained)
         .count();
     let package_dependency_count = oracle_package_dependency_groups(&raw.dependencies).len();
+    let type_dependency_count = oracle_type_dependency_groups(&raw.dependencies).len();
     let synonym_dependency_count = raw
         .dependencies
         .iter()
         .filter(|dependency| dependency.object_type == "SYNONYM")
         .filter(|dependency| !dependency.referenced_owner_oracle_maintained)
+        .count();
+    let type_reference_count = raw
+        .type_attributes
+        .iter()
+        .filter(|attribute| attribute.data_type_owner.is_some())
+        .count()
+        + raw
+            .collection_types
+            .iter()
+            .filter(|collection| collection.element_type_owner.is_some())
+            .count()
+        + raw
+            .type_method_parameters
+            .iter()
+            .filter(|parameter| parameter.data_type_owner.is_some())
+            .count()
+        + raw
+            .columns
+            .iter()
+            .filter(|column| column.data_type_owner.is_some())
+            .count()
+        + raw
+            .view_columns
+            .iter()
+            .filter(|column| column.data_type_owner.is_some())
+            .count()
+        + raw
+            .routine_arguments
+            .iter()
+            .filter(|argument| argument.type_owner.is_some())
+            .count()
+        + raw
+            .package_arguments
+            .iter()
+            .filter(|argument| argument.type_owner.is_some())
+            .count();
+    let type_inheritance_count = raw
+        .user_types
+        .iter()
+        .filter(|user_type| user_type.supertype_owner.is_some())
         .count();
 
     set_object_count(&mut objects, ObjectCategory::Database, 1);
@@ -7948,16 +10165,28 @@ fn discovery_counts_from_catalog(
     set_object_count(&mut objects, ObjectCategory::Sequence, raw.sequences.len());
     set_object_count(&mut objects, ObjectCategory::View, raw.views.len());
     set_object_count(&mut objects, ObjectCategory::Synonym, raw.synonyms.len());
+    set_object_count(
+        &mut objects,
+        ObjectCategory::UserDefinedType,
+        raw.user_types.len(),
+    );
+    set_object_count(
+        &mut objects,
+        ObjectCategory::Extension,
+        raw.type_attributes.len(),
+    );
     set_object_count(&mut objects, ObjectCategory::Trigger, raw.triggers.len());
     set_object_count(
         &mut objects,
         ObjectCategory::Routine,
-        raw.routines.len() + raw.package_routines.len(),
+        raw.routines.len() + raw.package_routines.len() + raw.type_methods.len(),
     );
     set_object_count(
         &mut objects,
         ObjectCategory::RoutineParameter,
-        raw.routine_arguments.len() + raw.package_arguments.len(),
+        raw.routine_arguments.len()
+            + raw.package_arguments.len()
+            + raw.type_method_parameters.len(),
     );
     set_object_count(&mut objects, ObjectCategory::Package, raw.packages.len());
     set_object_count(
@@ -8061,6 +10290,7 @@ fn discovery_counts_from_catalog(
             .iter()
             .filter(|dependency| dependency.object_type == "VIEW")
             .filter(|dependency| !dependency.referenced_owner_oracle_maintained)
+            .filter(|dependency| dependency.referenced_type != "TYPE")
             .count(),
     );
     set_relationship_count(
@@ -8084,6 +10314,10 @@ fn discovery_counts_from_catalog(
         scope.principals.len()
             + raw.sequences.len()
             + raw.synonyms.len()
+            + raw.user_types.len()
+            + raw.type_attributes.len()
+            + raw.type_methods.len()
+            + raw.type_method_parameters.len()
             + raw.view_columns.len()
             + raw.materialized_views.len()
             + materialized_view_column_count
@@ -8108,8 +10342,13 @@ fn discovery_counts_from_catalog(
             + materialized_view_dependency_count
             + trigger_dependency_count
             + synonym_dependency_count
+            + type_dependency_count
+            + type_reference_count
+            + type_inheritance_count
+            + metadata_only_type_dependency_count
             + raw.routine_arguments.len()
             + raw.package_arguments.len()
+            + raw.type_method_parameters.len()
             + package_dependency_count
             + raw
                 .constraints
@@ -8351,7 +10590,7 @@ mod tests {
             .admin
             .execute(
                 &format!(
-                    "GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW, CREATE MATERIALIZED VIEW, CREATE TRIGGER, CREATE PROCEDURE, CREATE SYNONYM, ADMINISTER DATABASE TRIGGER TO {}",
+                    "GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW, CREATE MATERIALIZED VIEW, CREATE TRIGGER, CREATE PROCEDURE, CREATE SYNONYM, CREATE TYPE, ADMINISTER DATABASE TRIGGER TO {}",
                     cleanup.username
                 ),
                 &[],
@@ -8384,6 +10623,42 @@ mod tests {
             .expect("create explicit sequence");
         setup
             .execute(
+                "CREATE TYPE ADDRESS_T AS OBJECT (STREET VARCHAR2(100), ZIP_CODE VARCHAR2(12))",
+                &[],
+            )
+            .expect("create object type");
+        setup
+            .execute("CREATE TYPE ADDRESS_LIST_T AS TABLE OF ADDRESS_T", &[])
+            .expect("create nested-table type");
+        setup
+            .execute("CREATE TYPE TAG_LIST_T AS VARRAY(5) OF VARCHAR2(30)", &[])
+            .expect("create varray type");
+        setup
+            .execute(
+                "CREATE TYPE PERSON_T AS OBJECT (NAME VARCHAR2(100), ADDRESS ADDRESS_T, MEMBER FUNCTION DISPLAY_NAME(P_PREFIX VARCHAR2) RETURN VARCHAR2) NOT FINAL",
+                &[],
+            )
+            .expect("create object type with method");
+        setup
+            .execute(
+                "CREATE TYPE BODY PERSON_T AS MEMBER FUNCTION DISPLAY_NAME(P_PREFIX VARCHAR2) RETURN VARCHAR2 IS BEGIN RETURN P_PREFIX || NAME; END; END;",
+                &[],
+            )
+            .expect("create object type body");
+        setup
+            .execute(
+                "CREATE TYPE EMPLOYEE_T UNDER PERSON_T (EMPLOYEE_NO NUMBER)",
+                &[],
+            )
+            .expect("create object subtype");
+        setup
+            .execute(
+                "CREATE TABLE TYPE_USAGE (ID NUMBER, ADDRESS ADDRESS_T, TAGS TAG_LIST_T)",
+                &[],
+            )
+            .expect("create typed-column table");
+        setup
+            .execute(
                 "CREATE VIEW ACTIVE_PARENT AS SELECT ID, CODE FROM PARENT_ENTITY WHERE ID > 0",
                 &[],
             )
@@ -8394,6 +10669,12 @@ mod tests {
                 &[],
             )
             .expect("create standalone function");
+        setup
+            .execute(
+                "CREATE OR REPLACE FUNCTION ECHO_ADDRESS(P_ADDRESS IN ADDRESS_T) RETURN ADDRESS_T AUTHID DEFINER AS BEGIN RETURN P_ADDRESS; END;",
+                &[],
+            )
+            .expect("create standalone function using an object type");
         setup
             .execute(
                 "CREATE OR REPLACE PROCEDURE UPDATE_CHILD_LABEL(P_ID IN NUMBER, P_LABEL IN VARCHAR2 DEFAULT 'new', P_ROWS OUT NUMBER) AUTHID DEFINER AS BEGIN UPDATE CHILD_ENTITY SET LABEL = P_LABEL WHERE ID = P_ID; P_ROWS := SQL%ROWCOUNT; END;",
@@ -8434,7 +10715,7 @@ mod tests {
         let certified = complete
             .certified_snapshot()
             .expect("simple Oracle schema must be certified");
-        assert_eq!(certified.snapshot.schema.tables.len(), 2);
+        assert_eq!(certified.snapshot.schema.tables.len(), 3);
         assert!(certified
             .snapshot
             .schema
@@ -8479,7 +10760,7 @@ mod tests {
                 .count(),
             2
         );
-        assert_eq!(certified.snapshot.schema.routines.len(), 2);
+        assert_eq!(certified.snapshot.schema.routines.len(), 3);
         let procedure = certified
             .snapshot
             .schema
@@ -8499,7 +10780,156 @@ mod tests {
                 .iter()
                 .filter(|object| object.key.object_kind == ObjectKind::RoutineParameter)
                 .count(),
-            9
+            17
+        );
+        let user_types = certified
+            .snapshot
+            .metadata
+            .objects
+            .iter()
+            .filter(|object| object.key.object_kind == ObjectKind::UserDefinedType)
+            .collect::<Vec<_>>();
+        assert_eq!(user_types.len(), 5);
+        let person_type = user_types
+            .iter()
+            .find(|object| object.name == "PERSON_T")
+            .expect("object type is mapped");
+        assert!(person_type
+            .definition
+            .as_deref()
+            .is_some_and(|definition| definition.contains("TYPE BODY PERSON_T")));
+        assert!(matches!(
+            person_type.properties.get("has_body"),
+            Some(MetadataValue::Boolean(true))
+        ));
+        let employee_type = user_types
+            .iter()
+            .find(|object| object.name == "EMPLOYEE_T")
+            .expect("object subtype is mapped");
+        assert!(certified
+            .snapshot
+            .metadata
+            .relationships
+            .iter()
+            .any(|relationship| {
+                relationship.kind == MetadataRelationshipKind::InheritsFrom
+                    && relationship.from_key == employee_type.key
+                    && relationship.to_key == person_type.key
+            }));
+        let address_type = user_types
+            .iter()
+            .find(|object| object.name == "ADDRESS_T")
+            .expect("referenced object type is mapped");
+        let address_list_type = user_types
+            .iter()
+            .find(|object| object.name == "ADDRESS_LIST_T")
+            .expect("nested-table type is mapped");
+        assert!(certified
+            .snapshot
+            .metadata
+            .relationships
+            .iter()
+            .any(|relationship| {
+                relationship.kind == MetadataRelationshipKind::UsesType
+                    && relationship.from_key == address_list_type.key
+                    && relationship.to_key == address_type.key
+            }));
+        let person_address_attribute = certified
+            .snapshot
+            .metadata
+            .objects
+            .iter()
+            .find(|object| {
+                object.key.object_kind == ObjectKind::Extension
+                    && object.extension_kind.as_deref() == Some("oracle_type_attribute")
+                    && object.parent_key.as_ref() == Some(&person_type.key)
+                    && object.name == "ADDRESS"
+            })
+            .expect("object type attribute is mapped");
+        assert!(certified
+            .snapshot
+            .metadata
+            .relationships
+            .iter()
+            .any(|relationship| {
+                relationship.kind == MetadataRelationshipKind::UsesType
+                    && relationship.from_key == person_address_attribute.key
+                    && relationship.to_key == address_type.key
+            }));
+        let person_method = certified
+            .snapshot
+            .metadata
+            .objects
+            .iter()
+            .find(|object| {
+                object.key.object_kind == ObjectKind::Routine
+                    && object.parent_key.as_ref() == Some(&person_type.key)
+                    && object.name == "DISPLAY_NAME"
+            })
+            .expect("object type method is mapped");
+        assert_eq!(
+            certified
+                .snapshot
+                .metadata
+                .objects
+                .iter()
+                .filter(|object| {
+                    object.key.object_kind == ObjectKind::RoutineParameter
+                        && object.parent_key.as_ref() == Some(&person_method.key)
+                })
+                .count(),
+            3
+        );
+        let type_usage = certified
+            .snapshot
+            .schema
+            .tables
+            .iter()
+            .find(|table| table.name == "TYPE_USAGE")
+            .expect("typed-column table is mapped");
+        for (column_name, target_name) in [("ADDRESS", "ADDRESS_T"), ("TAGS", "TAG_LIST_T")] {
+            let column = certified
+                .snapshot
+                .schema
+                .columns
+                .iter()
+                .find(|column| column.table_key == type_usage.key && column.name == column_name)
+                .expect("typed column is mapped");
+            assert!(certified
+                .snapshot
+                .metadata
+                .relationships
+                .iter()
+                .any(|relationship| {
+                    relationship.kind == MetadataRelationshipKind::UsesType
+                        && relationship.from_key == column.key
+                        && relationship.to_key.object_kind == ObjectKind::UserDefinedType
+                        && relationship.to_key.object_name == target_name
+                }));
+        }
+        let echo_address = certified
+            .snapshot
+            .schema
+            .routines
+            .iter()
+            .find(|routine| routine.name == "ECHO_ADDRESS")
+            .expect("routine using an object type is mapped");
+        assert_eq!(
+            certified
+                .snapshot
+                .metadata
+                .relationships
+                .iter()
+                .filter(|relationship| {
+                    relationship.kind == MetadataRelationshipKind::UsesType
+                        && relationship.to_key == address_type.key
+                        && certified.snapshot.metadata.objects.iter().any(|object| {
+                            object.key == relationship.from_key
+                                && object.parent_key.as_ref() == Some(&echo_address.key)
+                        })
+                })
+                .count(),
+            2
         );
         let package = certified
             .snapshot
@@ -8603,7 +11033,7 @@ mod tests {
         let certified = complete
             .certified_snapshot()
             .expect("Oracle materialized-view schema must be certified");
-        assert_eq!(certified.snapshot.schema.tables.len(), 2);
+        assert_eq!(certified.snapshot.schema.tables.len(), 3);
         assert!(certified
             .snapshot
             .schema
@@ -8821,6 +11251,33 @@ mod tests {
         setup
             .execute("DROP SYNONYM MISSING_ALIAS", &[])
             .expect("drop unresolved synonym fixture");
+        setup
+            .execute(
+                "CREATE TYPE DYNAMIC_TYPE_T AS OBJECT (PAYLOAD VARCHAR2(20), MEMBER PROCEDURE RUN_STATEMENT)",
+                &[],
+            )
+            .expect("create dynamic type fixture specification");
+        setup
+            .execute(
+                "CREATE TYPE BODY DYNAMIC_TYPE_T AS MEMBER PROCEDURE RUN_STATEMENT IS BEGIN EXECUTE IMMEDIATE 'BEGIN NULL; END;'; END; END;",
+                &[],
+            )
+            .expect("create dynamic type fixture body");
+        drop(setup);
+
+        let failed = analyze_oracle(&user_url, "oracle-live", Vec::new(), Vec::new(), 30_000);
+        assert_eq!(failed.status(), AnalysisStatus::Failed);
+        assert_eq!(
+            failed.failure().expect("failed outcome").code,
+            AnalysisFailureCode::UnsupportedMetadata
+        );
+        assert!(failed.certified_snapshot().is_none());
+
+        let setup = Connection::connect(&cleanup.username, password, &connect_string)
+            .expect("reconnect as isolated Oracle test user");
+        setup
+            .execute("DROP TYPE DYNAMIC_TYPE_T FORCE", &[])
+            .expect("drop dynamic type fixture");
         setup
             .execute(
                 "CREATE OR REPLACE TRIGGER DYNAMIC_TRIGGER BEFORE UPDATE ON CHILD_ENTITY FOR EACH ROW BEGIN EXECUTE IMMEDIATE 'BEGIN NULL; END;'; END;",

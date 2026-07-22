@@ -275,7 +275,7 @@ fn require_metadata_parent_kind(
         | ObjectKind::Synonym
         | ObjectKind::Package => &[ObjectKind::Schema],
         ObjectKind::PrimaryKey | ObjectKind::UniqueConstraint => &[ObjectKind::MaterializedView],
-        ObjectKind::Routine => &[ObjectKind::Package],
+        ObjectKind::Routine => &[ObjectKind::Package, ObjectKind::UserDefinedType],
         ObjectKind::CheckConstraint => &[ObjectKind::Domain, ObjectKind::MaterializedView],
         ObjectKind::Index => &[ObjectKind::MaterializedView],
         ObjectKind::Event => &[ObjectKind::Database, ObjectKind::Schema],
@@ -336,6 +336,8 @@ fn validate_relationship_endpoint_kinds(
                     | ObjectKind::Routine
                     | ObjectKind::RoutineParameter
                     | ObjectKind::Sequence
+                    | ObjectKind::UserDefinedType
+                    | ObjectKind::Extension
             ) && matches!(
                 to.object_kind,
                 ObjectKind::UserDefinedType | ObjectKind::Domain
@@ -716,6 +718,21 @@ mod tests {
         let sequence_key = key(ObjectKind::Sequence, "account_numbers", None);
         let policy_key = key(ObjectKind::Policy, "tenant_policy", None);
         let trigger_key = key(ObjectKind::Trigger, "audit_ddl", None);
+        let type_attribute_key = key(
+            ObjectKind::Extension,
+            "account_number",
+            Some("attribute:1:value"),
+        );
+        let type_method_key = key(
+            ObjectKind::Routine,
+            "account_number",
+            Some("method:1:normalize"),
+        );
+        let type_parameter_key = key(
+            ObjectKind::RoutineParameter,
+            "account_number",
+            Some("method:1:normalize#parameter:0:self"),
+        );
         snapshot.schema.tables.push(crate::TableObject {
             key: table_key,
             schema_key: schema_key.clone(),
@@ -757,14 +774,61 @@ mod tests {
                 ),
                 properties: BTreeMap::new(),
             },
+            MetadataObject {
+                key: type_attribute_key.clone(),
+                parent_key: Some(type_key.clone()),
+                name: "value".to_owned(),
+                extension_kind: Some("oracle_type_attribute".to_owned()),
+                definition: None,
+                properties: BTreeMap::new(),
+            },
+            MetadataObject {
+                key: type_method_key.clone(),
+                parent_key: Some(type_key.clone()),
+                name: "normalize".to_owned(),
+                extension_kind: None,
+                definition: None,
+                properties: BTreeMap::new(),
+            },
+            MetadataObject {
+                key: type_parameter_key.clone(),
+                parent_key: Some(type_method_key.clone()),
+                name: "self".to_owned(),
+                extension_kind: None,
+                definition: None,
+                properties: BTreeMap::new(),
+            },
         ]);
-        snapshot.metadata.relationships.push(MetadataRelationship {
-            kind: MetadataRelationshipKind::UsesType,
-            from_key: sequence_key,
-            to_key: type_key,
-            ordinal: None,
-            properties: BTreeMap::new(),
-        });
+        snapshot.metadata.relationships.extend([
+            MetadataRelationship {
+                kind: MetadataRelationshipKind::UsesType,
+                from_key: sequence_key,
+                to_key: type_key.clone(),
+                ordinal: None,
+                properties: BTreeMap::new(),
+            },
+            MetadataRelationship {
+                kind: MetadataRelationshipKind::UsesType,
+                from_key: type_attribute_key,
+                to_key: type_key.clone(),
+                ordinal: None,
+                properties: BTreeMap::new(),
+            },
+            MetadataRelationship {
+                kind: MetadataRelationshipKind::HasParameter,
+                from_key: type_method_key,
+                to_key: type_parameter_key.clone(),
+                ordinal: Some(1),
+                properties: BTreeMap::new(),
+            },
+            MetadataRelationship {
+                kind: MetadataRelationshipKind::UsesType,
+                from_key: type_parameter_key,
+                to_key: type_key,
+                ordinal: None,
+                properties: BTreeMap::new(),
+            },
+        ]);
 
         assert!(validate_canonical_schema_snapshot(&snapshot).is_ok());
     }
