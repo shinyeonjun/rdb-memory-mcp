@@ -6,19 +6,31 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  windows:
-    runs-on: windows-latest
-    timeout-minutes: 45
+  verify-and-package:
+    name: Verify and package (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-amd64
+          - os: ubuntu-24.04
+            platform: linux-amd64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - name: Check out source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install pinned Rust toolchain
         shell: pwsh
-        run: rustup toolchain install 1.96.1 --profile minimal --component clippy --component rustfmt --target x86_64-pc-windows-msvc
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal --component clippy --component rustfmt
+          rustup override set 1.96.1
+          rustc --version --verbose
 
       - name: Verify release tag matches crate version
         shell: pwsh
@@ -35,15 +47,60 @@ jobs:
       - name: Lint
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
-      - name: Test
+      - name: Test debug profile
         run: cargo test --locked --workspace
 
+      - name: Test release profile
+        run: cargo test --locked --workspace --release
+
       - name: Build release binaries
-        run: cargo build --locked --release
+        run: cargo build --locked --release --workspace
 
       - name: Package and verify metadata-only release
         shell: pwsh
-        run: .\scripts\package-release.ps1
+        run: ./scripts/package-release.ps1 -Platform ${{ matrix.platform }}
+
+      - name: Upload verified package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rdb-memory-mcp-${{ matrix.platform }}
+          path: |
+            dist/rdb-memory-mcp-${{ matrix.platform }}.*
+            dist/checksums-${{ matrix.platform }}.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: verify-and-package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Download verified packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify downloaded checksums
+        shell: pwsh
+        run: |
+          $checksumFiles = @(Get-ChildItem -LiteralPath dist -Filter "checksums-*.txt" -File)
+          if ($checksumFiles.Count -ne 2) { throw "Expected two platform checksum files." }
+          foreach ($checksumFile in $checksumFiles) {
+            foreach ($line in Get-Content -LiteralPath $checksumFile.FullName) {
+              $parts = $line -split "\s+", 2
+              $asset = Join-Path dist $parts[1]
+              if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "Missing asset: $asset" }
+              $actual = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($actual -ne $parts[0]) { throw "Checksum mismatch: $asset" }
+            }
+          }
 
       - name: Publish release assets
         shell: pwsh
@@ -51,9 +108,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = $env:GITHUB_REF_NAME
+          $assets = @(Get-ChildItem -LiteralPath dist -File | Select-Object -ExpandProperty FullName)
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag dist/rdb-memory-mcp-windows-amd64.zip dist/checksums.txt --clobber
+            gh release upload $tag $assets --clobber
           } else {
-            gh release create $tag dist/rdb-memory-mcp-windows-amd64.zip dist/checksums.txt --verify-tag --generate-notes --title $tag
+            gh release create $tag $assets --verify-tag --generate-notes --title $tag
           }

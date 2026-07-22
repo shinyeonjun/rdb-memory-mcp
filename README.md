@@ -53,13 +53,12 @@ For the full product boundary and design history, see [docs/plans/database-memor
 
 Tagged releases build a Windows zip:
 
-~~~text
-rdb-memory-mcp-windows-amd64.zip
-  database-memory.exe
-  database-memory-mcp.exe
-  README.md
-  LICENSE
-~~~
+Release tags publish both `rdb-memory-mcp-windows-amd64.zip` and
+`rdb-memory-mcp-linux-amd64.tar.gz`, each with a platform-specific SHA-256 file.
+Every archive contains the CLI, MCP server, `README.md`, `LICENSE`, installation
+guide, generated `support-ledger.json`, and a per-file `manifest.json`. The
+release workflow extracts each archive and reruns the CLI contract before it can
+be published.
 
 The CLI exposes the same versioned metadata-only contract as MCP. The generic v2 surface is `contract`, `index`, `list-snapshots`, `describe-snapshot`, `list-objects`, `find-objects`, and `describe-object`. The table-specific commands remain compatibility aliases.
 
