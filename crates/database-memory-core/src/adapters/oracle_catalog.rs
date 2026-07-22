@@ -20,8 +20,8 @@ use crate::introspection::{
 };
 use crate::{
     AdapterCapabilities, CapabilitySupport, ColumnObject, ConstraintKind, ConstraintObject,
-    DatabaseObject, IndexObject, ObjectKey, ObjectKind, SchemaObject, SchemaSnapshot, TableKind,
-    TableObject, TriggerObject, ViewObject,
+    DatabaseObject, IndexObject, ObjectKey, ObjectKind, RoutineKind, RoutineObject, SchemaObject,
+    SchemaSnapshot, TableKind, TableObject, TriggerObject, ViewObject,
 };
 
 const ORACLE_SOURCE: &str = "oracle";
@@ -843,6 +843,51 @@ struct RawTrigger {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct RawRoutine {
+    owner: String,
+    name: String,
+    object_id: i64,
+    subprogram_id: i64,
+    overload: Option<String>,
+    object_type: String,
+    aggregate: bool,
+    pipelined: bool,
+    parallel: bool,
+    interface: bool,
+    deterministic: bool,
+    authid: String,
+    polymorphic: Option<String>,
+    definition: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawRoutineArgument {
+    owner: String,
+    routine: String,
+    package_name: Option<String>,
+    name: Option<String>,
+    position: i64,
+    sequence: i64,
+    data_level: i64,
+    data_type: Option<String>,
+    defaulted: bool,
+    default_length: Option<i64>,
+    default_value: Option<String>,
+    mode: String,
+    data_length: Option<i64>,
+    data_precision: Option<i64>,
+    data_scale: Option<i64>,
+    type_owner: Option<String>,
+    type_name: Option<String>,
+    type_subname: Option<String>,
+    pls_type: Option<String>,
+    char_length: Option<i64>,
+    char_used: Option<String>,
+    subprogram_id: i64,
+    overload: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RawConstraintColumn {
     name: String,
     position: Option<i64>,
@@ -920,6 +965,8 @@ struct RawOracleCatalog {
     view_columns: Vec<RawColumn>,
     materialized_views: Vec<RawMaterializedView>,
     triggers: Vec<RawTrigger>,
+    routines: Vec<RawRoutine>,
+    routine_arguments: Vec<RawRoutineArgument>,
     constraints: Vec<RawConstraint>,
     indexes: Vec<RawIndex>,
     dependencies: Vec<RawDependency>,
@@ -951,6 +998,12 @@ impl RawOracleCatalog {
             .map_err(|error| error.catalog_context("materialized-view"))?;
         let triggers = read_triggers(connection, scope, deadline)
             .map_err(|error| error.catalog_context("trigger"))?;
+        let mut routines = read_routines(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("routine"))?;
+        attach_routine_sources(connection, scope, &mut routines, deadline)
+            .map_err(|error| error.catalog_context("routine-source"))?;
+        let routine_arguments = read_routine_arguments(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("routine-argument"))?;
         let mut constraints = read_constraints(connection, scope, &recycle, deadline)
             .map_err(|error| error.catalog_context("constraint"))?;
         attach_constraint_columns(connection, scope, &mut constraints, deadline)
@@ -974,6 +1027,8 @@ impl RawOracleCatalog {
             view_columns,
             materialized_views,
             triggers,
+            routines,
+            routine_arguments,
             constraints,
             indexes,
             dependencies,
@@ -1990,6 +2045,385 @@ fn read_triggers(
     Ok(triggers)
 }
 
+fn read_routines(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawRoutine>, CatalogError> {
+    type RoutineTuple = (
+        String,
+        String,
+        i64,
+        i64,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+    );
+    let mut routines = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let sql = match scope.mode {
+            DictionaryScopeMode::User => {
+                "
+                SELECT :1,
+                       OBJECT_NAME,
+                       OBJECT_ID,
+                       SUBPROGRAM_ID,
+                       OVERLOAD,
+                       OBJECT_TYPE,
+                       AGGREGATE,
+                       PIPELINED,
+                       PARALLEL,
+                       INTERFACE,
+                       DETERMINISTIC,
+                       AUTHID,
+                       POLYMORPHIC,
+                       PROCEDURE_NAME
+                FROM USER_PROCEDURES
+                WHERE PROCEDURE_NAME IS NULL
+                  AND OBJECT_TYPE IN ('FUNCTION', 'PROCEDURE')
+                ORDER BY OBJECT_NAME, SUBPROGRAM_ID
+                "
+            }
+            DictionaryScopeMode::Dba => {
+                "
+                SELECT OWNER,
+                       OBJECT_NAME,
+                       OBJECT_ID,
+                       SUBPROGRAM_ID,
+                       OVERLOAD,
+                       OBJECT_TYPE,
+                       AGGREGATE,
+                       PIPELINED,
+                       PARALLEL,
+                       INTERFACE,
+                       DETERMINISTIC,
+                       AUTHID,
+                       POLYMORPHIC,
+                       PROCEDURE_NAME
+                FROM DBA_PROCEDURES
+                WHERE OWNER = :1
+                  AND PROCEDURE_NAME IS NULL
+                  AND OBJECT_TYPE IN ('FUNCTION', 'PROCEDURE')
+                ORDER BY OWNER, OBJECT_NAME, SUBPROGRAM_ID
+                "
+            }
+        };
+        let rows = connection.query_as::<RoutineTuple>(sql, &[owner])?;
+        for row in rows {
+            let (
+                owner,
+                name,
+                object_id,
+                subprogram_id,
+                overload,
+                object_type,
+                aggregate,
+                pipelined,
+                parallel,
+                interface,
+                deterministic,
+                authid,
+                polymorphic,
+                procedure_name,
+            ) = row?;
+            if procedure_name.is_some() {
+                return Err(CatalogError::Mapping(format!(
+                    "Oracle standalone routine {}.{} unexpectedly has PROCEDURE_NAME metadata",
+                    owner, name
+                )));
+            }
+            routines.push(RawRoutine {
+                owner,
+                name,
+                object_id,
+                subprogram_id,
+                overload: normalize_optional_token(overload),
+                object_type: object_type.trim().to_owned(),
+                aggregate: aggregate.trim() == "YES",
+                pipelined: pipelined.trim() == "YES",
+                parallel: parallel.trim() == "YES",
+                interface: interface.trim() == "YES",
+                deterministic: deterministic.trim() == "YES",
+                authid: authid.trim().to_owned(),
+                polymorphic: match polymorphic.trim() {
+                    "" | "NULL" => None,
+                    value => Some(value.to_owned()),
+                },
+                definition: None,
+            });
+        }
+    }
+    routines.sort_by(|left, right| {
+        (&left.owner, &left.name, left.subprogram_id).cmp(&(
+            &right.owner,
+            &right.name,
+            right.subprogram_id,
+        ))
+    });
+    Ok(routines)
+}
+
+fn attach_routine_sources(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    routines: &mut [RawRoutine],
+    deadline: Instant,
+) -> Result<(), CatalogError> {
+    let positions = routines
+        .iter()
+        .enumerate()
+        .map(|(position, routine)| {
+            (
+                (
+                    routine.owner.clone(),
+                    routine.name.clone(),
+                    routine.object_type.clone(),
+                ),
+                position,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut sources = BTreeMap::<usize, String>::new();
+    let mut last_lines = BTreeMap::<usize, i64>::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let sql = match scope.mode {
+            DictionaryScopeMode::User => {
+                "
+                SELECT :1, NAME, TYPE, LINE, TEXT
+                FROM USER_SOURCE
+                WHERE TYPE IN ('FUNCTION', 'PROCEDURE')
+                ORDER BY NAME, TYPE, LINE
+                "
+            }
+            DictionaryScopeMode::Dba => {
+                "
+                SELECT OWNER, NAME, TYPE, LINE, TEXT
+                FROM DBA_SOURCE
+                WHERE OWNER = :1
+                  AND TYPE IN ('FUNCTION', 'PROCEDURE')
+                ORDER BY OWNER, NAME, TYPE, LINE
+                "
+            }
+        };
+        let rows =
+            connection.query_as::<(String, String, String, i64, Option<String>)>(sql, &[owner])?;
+        for row in rows {
+            let (source_owner, name, object_type, line, text) = row?;
+            let position = positions
+                .get(&(source_owner.clone(), name.clone(), object_type.clone()))
+                .copied()
+                .ok_or_else(|| {
+                    CatalogError::Mapping(format!(
+                        "Oracle source {}.{} ({object_type}) has no routine header",
+                        source_owner, name
+                    ))
+                })?;
+            let expected_line = last_lines.get(&position).copied().unwrap_or(0) + 1;
+            if line != expected_line {
+                return Err(CatalogError::Mapping(format!(
+                    "Oracle routine source {}.{} expected line {expected_line}, found {line}",
+                    source_owner, name
+                )));
+            }
+            last_lines.insert(position, line);
+            let source = sources.entry(position).or_default();
+            source.push_str(text.as_deref().unwrap_or_default());
+            if source.len() > MAX_DEFINITION_BYTES {
+                return Err(CatalogError::UnsupportedMetadata(format!(
+                    "Oracle routine definition exceeds the {MAX_DEFINITION_BYTES}-byte safety limit for {}.{}",
+                    source_owner, name
+                )));
+            }
+        }
+    }
+    for (position, routine) in routines.iter_mut().enumerate() {
+        routine.definition = normalize_definition(sources.remove(&position))?;
+        if routine.definition.is_none() {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle routine {}.{} has no complete source",
+                routine.owner, routine.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn read_routine_arguments(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawRoutineArgument>, CatalogError> {
+    type ArgumentTuple = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+        String,
+        Option<i64>,
+        Option<String>,
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        i64,
+        Option<String>,
+    );
+    let mut arguments = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let sql = match scope.mode {
+            DictionaryScopeMode::User => {
+                "
+                SELECT :1,
+                       OBJECT_NAME,
+                       PACKAGE_NAME,
+                       ARGUMENT_NAME,
+                       POSITION,
+                       SEQUENCE,
+                       DATA_LEVEL,
+                       DATA_TYPE,
+                       DEFAULTED,
+                       DEFAULT_LENGTH,
+                       DEFAULT_VALUE,
+                       IN_OUT,
+                       DATA_LENGTH,
+                       DATA_PRECISION,
+                       DATA_SCALE,
+                       TYPE_OWNER,
+                       TYPE_NAME,
+                       TYPE_SUBNAME,
+                       PLS_TYPE,
+                       CHAR_LENGTH,
+                       CHAR_USED,
+                       SUBPROGRAM_ID,
+                       OVERLOAD
+                FROM USER_ARGUMENTS
+                WHERE PACKAGE_NAME IS NULL
+                ORDER BY OBJECT_NAME, SUBPROGRAM_ID, SEQUENCE
+                "
+            }
+            DictionaryScopeMode::Dba => {
+                "
+                SELECT OWNER,
+                       OBJECT_NAME,
+                       PACKAGE_NAME,
+                       ARGUMENT_NAME,
+                       POSITION,
+                       SEQUENCE,
+                       DATA_LEVEL,
+                       DATA_TYPE,
+                       DEFAULTED,
+                       DEFAULT_LENGTH,
+                       DEFAULT_VALUE,
+                       IN_OUT,
+                       DATA_LENGTH,
+                       DATA_PRECISION,
+                       DATA_SCALE,
+                       TYPE_OWNER,
+                       TYPE_NAME,
+                       TYPE_SUBNAME,
+                       PLS_TYPE,
+                       CHAR_LENGTH,
+                       CHAR_USED,
+                       SUBPROGRAM_ID,
+                       OVERLOAD
+                FROM DBA_ARGUMENTS
+                WHERE OWNER = :1
+                  AND PACKAGE_NAME IS NULL
+                ORDER BY OWNER, OBJECT_NAME, SUBPROGRAM_ID, SEQUENCE
+                "
+            }
+        };
+        let rows = connection.query_as::<ArgumentTuple>(sql, &[owner])?;
+        for row in rows {
+            let (
+                owner,
+                routine,
+                package_name,
+                name,
+                position,
+                sequence,
+                data_level,
+                data_type,
+                defaulted,
+                default_length,
+                default_value,
+                mode,
+                data_length,
+                data_precision,
+                data_scale,
+                type_owner,
+                type_name,
+                type_subname,
+                pls_type,
+                char_length,
+                char_used,
+                subprogram_id,
+                overload,
+            ) = row?;
+            arguments.push(RawRoutineArgument {
+                owner,
+                routine,
+                package_name: normalize_optional_token(package_name),
+                name: normalize_optional_token(name),
+                position,
+                sequence,
+                data_level,
+                data_type: normalize_optional_token(data_type),
+                defaulted: defaulted.trim() == "Y",
+                default_length,
+                default_value: normalize_definition(default_value)?,
+                mode: mode.trim().to_owned(),
+                data_length,
+                data_precision,
+                data_scale,
+                type_owner: normalize_optional_token(type_owner),
+                type_name: normalize_optional_token(type_name),
+                type_subname: normalize_optional_token(type_subname),
+                pls_type: normalize_optional_token(pls_type),
+                char_length,
+                char_used: normalize_optional_token(char_used),
+                subprogram_id,
+                overload: normalize_optional_token(overload),
+            });
+        }
+    }
+    arguments.sort_by(|left, right| {
+        (
+            &left.owner,
+            &left.routine,
+            left.subprogram_id,
+            left.sequence,
+        )
+            .cmp(&(
+                &right.owner,
+                &right.routine,
+                right.subprogram_id,
+                right.sequence,
+            ))
+    });
+    Ok(arguments)
+}
+
 fn read_view_columns(
     connection: &Connection,
     scope: &DictionaryScope,
@@ -2923,7 +3357,14 @@ fn validate_raw_catalog(
         .filter(|object| {
             !matches!(
                 object.object_type.as_str(),
-                "TABLE" | "INDEX" | "SEQUENCE" | "VIEW" | "MATERIALIZED VIEW" | "TRIGGER"
+                "TABLE"
+                    | "INDEX"
+                    | "SEQUENCE"
+                    | "VIEW"
+                    | "MATERIALIZED VIEW"
+                    | "TRIGGER"
+                    | "FUNCTION"
+                    | "PROCEDURE"
             )
         })
         .take(8)
@@ -3346,6 +3787,225 @@ fn validate_raw_catalog(
         )));
     }
 
+    let mut routines = BTreeMap::new();
+    let mut routines_by_name = BTreeMap::new();
+    for routine in &raw.routines {
+        ensure_owner(scope, &routine.owner, "routine")?;
+        if !matches!(routine.object_type.as_str(), "FUNCTION" | "PROCEDURE") {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle routine type '{}' is not covered for {}.{}",
+                routine.object_type, routine.owner, routine.name
+            )));
+        }
+        let identity = (
+            routine.owner.clone(),
+            routine.name.clone(),
+            routine.object_type.clone(),
+        );
+        if routines.insert(identity, routine).is_some()
+            || routines_by_name
+                .insert((routine.owner.clone(), routine.name.clone()), routine)
+                .is_some()
+        {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle standalone routine {}.{}",
+                routine.owner, routine.name
+            )));
+        }
+        let inventory_object = inventory
+            .iter()
+            .find(|object| {
+                object.owner == routine.owner
+                    && object.object_type == routine.object_type
+                    && object.name == routine.name
+            })
+            .copied()
+            .ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle routine {}.{} is missing from the independent object inventory",
+                    routine.owner, routine.name
+                ))
+            })?;
+        if inventory_object.object_id != routine.object_id {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle routine object id mismatch for {}.{}: inventory={}, procedure catalog={}",
+                routine.owner, routine.name, inventory_object.object_id, routine.object_id
+            )));
+        }
+        if routine.subprogram_id != 1 || routine.overload.is_some() {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle standalone routine {}.{} has unexpected overload identity subprogram_id={} overload='{}'",
+                routine.owner,
+                routine.name,
+                routine.subprogram_id,
+                routine.overload.as_deref().unwrap_or("none")
+            )));
+        }
+        if routine.aggregate
+            || routine.pipelined
+            || routine.interface
+            || routine.polymorphic.is_some()
+        {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle routine shape is not yet covered for {}.{} (aggregate={}, pipelined={}, interface={}, polymorphic={})",
+                routine.owner,
+                routine.name,
+                routine.aggregate,
+                routine.pipelined,
+                routine.interface,
+                routine.polymorphic.as_deref().unwrap_or("none")
+            )));
+        }
+        if !matches!(routine.authid.as_str(), "DEFINER" | "CURRENT_USER") {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle routine {}.{} has unrecognized AUTHID '{}'",
+                routine.owner, routine.name, routine.authid
+            )));
+        }
+        let definition = routine.definition.as_deref().ok_or_else(|| {
+            CatalogError::Mapping(format!(
+                "Oracle routine {}.{} has no complete definition",
+                routine.owner, routine.name
+            ))
+        })?;
+        reject_dynamic_plsql(
+            "routine",
+            &format!("{}.{}", routine.owner, routine.name),
+            definition,
+        )?;
+    }
+    let inventory_routine_count = inventory
+        .iter()
+        .filter(|object| matches!(object.object_type.as_str(), "FUNCTION" | "PROCEDURE"))
+        .count();
+    if inventory_routine_count != raw.routines.len() {
+        return Err(CatalogError::Mapping(format!(
+            "Oracle routine inventory mismatch: USER/DBA_OBJECTS reports {inventory_routine_count}, USER/DBA_PROCEDURES reports {} standalone routine(s)",
+            raw.routines.len()
+        )));
+    }
+
+    let mut argument_identities = BTreeSet::new();
+    let mut arguments_by_routine = BTreeMap::<(String, String), Vec<&RawRoutineArgument>>::new();
+    for argument in &raw.routine_arguments {
+        ensure_owner(scope, &argument.owner, "routine argument")?;
+        if argument.package_name.is_some() {
+            return Err(CatalogError::Mapping(format!(
+                "standalone Oracle argument {}.{} unexpectedly belongs to package '{}'",
+                argument.owner,
+                argument.routine,
+                argument.package_name.as_deref().unwrap_or_default()
+            )));
+        }
+        let routine = routines_by_name
+            .get(&(argument.owner.clone(), argument.routine.clone()))
+            .copied()
+            .ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle argument references missing standalone routine {}.{}",
+                    argument.owner, argument.routine
+                ))
+            })?;
+        if argument.subprogram_id != routine.subprogram_id || argument.overload != routine.overload
+        {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle argument overload identity does not match routine {}.{}",
+                argument.owner, argument.routine
+            )));
+        }
+        if argument.data_level != 0
+            || argument.type_owner.is_some()
+            || argument.type_name.is_some()
+            || argument.type_subname.is_some()
+        {
+            return Err(CatalogError::UnsupportedMetadata(format!(
+                "Oracle composite or user-defined routine argument is not yet covered for {}.{} position {}",
+                argument.owner, argument.routine, argument.position
+            )));
+        }
+        if argument.data_type.is_none() {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle routine argument {}.{} position {} has no data type",
+                argument.owner, argument.routine, argument.position
+            )));
+        }
+        if !matches!(argument.mode.as_str(), "IN" | "OUT" | "IN/OUT") {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle routine argument {}.{} position {} has unrecognized mode '{}'",
+                argument.owner, argument.routine, argument.position, argument.mode
+            )));
+        }
+        positive_u32(argument.sequence, "Oracle routine argument sequence")?;
+        if argument.position < 0 {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle routine argument {}.{} has negative position {}",
+                argument.owner, argument.routine, argument.position
+            )));
+        }
+        if !argument_identities.insert((
+            argument.owner.clone(),
+            argument.routine.clone(),
+            argument.subprogram_id,
+            argument.sequence,
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle routine argument sequence {} for {}.{}",
+                argument.sequence, argument.owner, argument.routine
+            )));
+        }
+        arguments_by_routine
+            .entry((argument.owner.clone(), argument.routine.clone()))
+            .or_default()
+            .push(argument);
+    }
+    for routine in &raw.routines {
+        let arguments = arguments_by_routine
+            .get(&(routine.owner.clone(), routine.name.clone()))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let return_count = arguments
+            .iter()
+            .filter(|argument| argument.position == 0)
+            .count();
+        let expected_return_count = usize::from(routine.object_type == "FUNCTION");
+        if return_count != expected_return_count {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle {} {}.{} has {return_count} return rows; expected {expected_return_count}",
+                routine.object_type, routine.owner, routine.name
+            )));
+        }
+        for (offset, argument) in arguments.iter().enumerate() {
+            let expected_sequence = i64::try_from(offset + 1).map_err(|_| {
+                CatalogError::Mapping("too many Oracle routine arguments".to_owned())
+            })?;
+            if argument.sequence != expected_sequence {
+                return Err(CatalogError::Mapping(format!(
+                    "Oracle routine argument sequence gap for {}.{}: expected {expected_sequence}, found {}",
+                    routine.owner, routine.name, argument.sequence
+                )));
+            }
+            let expected_position = if routine.object_type == "FUNCTION" {
+                i64::try_from(offset).map_err(|_| {
+                    CatalogError::Mapping("too many Oracle routine arguments".to_owned())
+                })?
+            } else {
+                expected_sequence
+            };
+            if argument.position != expected_position {
+                return Err(CatalogError::Mapping(format!(
+                    "Oracle routine argument position mismatch for {}.{}: expected {expected_position}, found {}",
+                    routine.owner, routine.name, argument.position
+                )));
+            }
+            if argument.position == 0 && (argument.name.is_some() || argument.mode != "OUT") {
+                return Err(CatalogError::Mapping(format!(
+                    "Oracle function return metadata is malformed for {}.{}",
+                    routine.owner, routine.name
+                )));
+            }
+        }
+    }
+
     let mut view_column_keys = BTreeSet::new();
     let mut view_column_ordinals = BTreeSet::new();
     for column in &raw.view_columns {
@@ -3395,7 +4055,13 @@ fn validate_raw_catalog(
             && materialized_views.contains(&(dependency.owner.clone(), dependency.name.clone()));
         let source_is_trigger = dependency.object_type == "TRIGGER"
             && triggers.contains(&(dependency.owner.clone(), dependency.name.clone()));
-        if !source_is_view && !source_is_mview && !source_is_trigger {
+        let source_is_routine = matches!(dependency.object_type.as_str(), "FUNCTION" | "PROCEDURE")
+            && routines.contains_key(&(
+                dependency.owner.clone(),
+                dependency.name.clone(),
+                dependency.object_type.clone(),
+            ));
+        if !source_is_view && !source_is_mview && !source_is_trigger && !source_is_routine {
             return Err(CatalogError::UnsupportedMetadata(format!(
                 "Oracle dependency source is not yet covered: {}.{} ({})",
                 dependency.owner, dependency.name, dependency.object_type
@@ -3431,6 +4097,11 @@ fn validate_raw_catalog(
             "SEQUENCE" => sequences.contains(&(
                 dependency.referenced_owner.clone(),
                 dependency.referenced_name.clone(),
+            )),
+            "FUNCTION" | "PROCEDURE" => routines.contains_key(&(
+                dependency.referenced_owner.clone(),
+                dependency.referenced_name.clone(),
+                dependency.referenced_type.clone(),
             )),
             _ => false,
         };
@@ -4215,6 +4886,123 @@ impl<'a> OracleSnapshotMapper<'a> {
             });
         }
 
+        let mut routines = Vec::new();
+        let mut routine_keys = BTreeMap::new();
+        let mut routine_positions = BTreeMap::new();
+        for routine in &raw.routines {
+            let schema_key = required(
+                schema_keys.get(&routine.owner),
+                format!(
+                    "schema key for Oracle routine {}.{}",
+                    routine.owner, routine.name
+                ),
+            )?;
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &routine.owner,
+                ObjectKind::Routine,
+                &routine.name,
+                None,
+            );
+            let identity = (
+                routine.owner.clone(),
+                routine.name.clone(),
+                routine.object_type.clone(),
+            );
+            routine_keys.insert(identity.clone(), key.clone());
+            routine_positions.insert(identity, routines.len());
+            routines.push(RoutineObject {
+                key: key.clone(),
+                schema_key: schema_key.clone(),
+                name: routine.name.clone(),
+                kind: match routine.object_type.as_str() {
+                    "FUNCTION" => RoutineKind::Function,
+                    "PROCEDURE" => RoutineKind::Procedure,
+                    other => {
+                        return Err(CatalogError::Mapping(format!(
+                            "unmapped Oracle routine type '{other}'"
+                        )));
+                    }
+                },
+                definition: routine.definition.clone(),
+                depends_on: Vec::new(),
+            });
+            let inventory_object = required(
+                inventory.get(&(
+                    routine.owner.clone(),
+                    routine.object_type.clone(),
+                    routine.name.clone(),
+                )),
+                format!(
+                    "inventory row for Oracle routine {}.{}",
+                    routine.owner, routine.name
+                ),
+            )?;
+            metadata.annotations.push(ObjectAnnotation {
+                object_key: key,
+                definition: None,
+                properties: oracle_routine_properties(routine, inventory_object),
+            });
+        }
+        for argument in &raw.routine_arguments {
+            let routine = raw
+                .routines
+                .iter()
+                .find(|routine| routine.owner == argument.owner && routine.name == argument.routine)
+                .ok_or_else(|| {
+                    CatalogError::Mapping(format!(
+                        "parent routine for Oracle argument {}.{}",
+                        argument.owner, argument.routine
+                    ))
+                })?;
+            let routine_key = required(
+                routine_keys.get(&(
+                    routine.owner.clone(),
+                    routine.name.clone(),
+                    routine.object_type.clone(),
+                )),
+                format!(
+                    "parent key for Oracle argument {}.{}",
+                    argument.owner, argument.routine
+                ),
+            )?;
+            let display_name = if argument.position == 0 {
+                "RETURN".to_owned()
+            } else {
+                argument
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("ARGUMENT_{}", argument.position))
+            };
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &argument.owner,
+                ObjectKind::RoutineParameter,
+                &argument.routine,
+                Some(format!("{}:{display_name}", argument.sequence)),
+            );
+            metadata.objects.push(MetadataObject {
+                key: key.clone(),
+                parent_key: Some(routine_key.clone()),
+                name: display_name,
+                extension_kind: None,
+                definition: argument.default_value.clone(),
+                properties: oracle_routine_argument_properties(argument),
+            });
+            metadata.relationships.push(MetadataRelationship {
+                kind: MetadataRelationshipKind::HasParameter,
+                from_key: routine_key.clone(),
+                to_key: key,
+                ordinal: Some(positive_u32(
+                    argument.sequence,
+                    "Oracle routine argument relationship ordinal",
+                )?),
+                properties: BTreeMap::new(),
+            });
+        }
+
         for dependency in &raw.dependencies {
             if dependency.object_type != "VIEW" || dependency.referenced_owner_oracle_maintained {
                 continue;
@@ -4260,6 +5048,27 @@ impl<'a> OracleSnapshotMapper<'a> {
                     )),
                     format!(
                         "materialized-view target for Oracle view dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
+                "SEQUENCE" => required(
+                    sequence_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )),
+                    format!(
+                        "sequence target for Oracle view dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
+                "FUNCTION" | "PROCEDURE" => required(
+                    routine_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                        dependency.referenced_type.clone(),
+                    )),
+                    format!(
+                        "routine target for Oracle view dependency {}.{}",
                         dependency.referenced_owner, dependency.referenced_name
                     ),
                 )?,
@@ -4337,6 +5146,33 @@ impl<'a> OracleSnapshotMapper<'a> {
                     )?,
                     MetadataRelationshipKind::DependsOn,
                 ),
+                "SEQUENCE" => (
+                    required(
+                        sequence_keys.get(&(
+                            dependency.referenced_owner.clone(),
+                            dependency.referenced_name.clone(),
+                        )),
+                        format!(
+                            "sequence target for Oracle materialized-view dependency {}.{}",
+                            dependency.referenced_owner, dependency.referenced_name
+                        ),
+                    )?,
+                    MetadataRelationshipKind::DependsOn,
+                ),
+                "FUNCTION" | "PROCEDURE" => (
+                    required(
+                        routine_keys.get(&(
+                            dependency.referenced_owner.clone(),
+                            dependency.referenced_name.clone(),
+                            dependency.referenced_type.clone(),
+                        )),
+                        format!(
+                            "routine target for Oracle materialized-view dependency {}.{}",
+                            dependency.referenced_owner, dependency.referenced_name
+                        ),
+                    )?,
+                    MetadataRelationshipKind::DependsOn,
+                ),
                 other => {
                     return Err(CatalogError::Mapping(format!(
                         "unmapped Oracle materialized-view dependency target type '{other}'"
@@ -4356,6 +5192,95 @@ impl<'a> OracleSnapshotMapper<'a> {
                 ordinal: None,
                 properties,
             });
+        }
+
+        for dependency in raw
+            .dependencies
+            .iter()
+            .filter(|dependency| {
+                matches!(dependency.object_type.as_str(), "FUNCTION" | "PROCEDURE")
+            })
+            .filter(|dependency| !dependency.referenced_owner_oracle_maintained)
+        {
+            let source_identity = (
+                dependency.owner.clone(),
+                dependency.name.clone(),
+                dependency.object_type.clone(),
+            );
+            let source_position = required(
+                routine_positions.get(&source_identity),
+                format!(
+                    "source position for Oracle routine dependency {}.{}",
+                    dependency.owner, dependency.name
+                ),
+            )?;
+            let target_key = match dependency.referenced_type.as_str() {
+                "TABLE" => match materialized_view_keys.get(&(
+                    dependency.referenced_owner.clone(),
+                    dependency.referenced_name.clone(),
+                )) {
+                    Some(key) => key,
+                    None => required(
+                        table_keys.get(&(
+                            dependency.referenced_owner.clone(),
+                            dependency.referenced_name.clone(),
+                        )),
+                        format!(
+                            "table target for Oracle routine dependency {}.{}",
+                            dependency.referenced_owner, dependency.referenced_name
+                        ),
+                    )?,
+                },
+                "VIEW" => required(
+                    view_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )),
+                    format!(
+                        "view target for Oracle routine dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
+                "MATERIALIZED VIEW" => required(
+                    materialized_view_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )),
+                    format!(
+                        "materialized-view target for Oracle routine dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
+                "SEQUENCE" => required(
+                    sequence_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )),
+                    format!(
+                        "sequence target for Oracle routine dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
+                "FUNCTION" | "PROCEDURE" => required(
+                    routine_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                        dependency.referenced_type.clone(),
+                    )),
+                    format!(
+                        "routine target for Oracle routine dependency {}.{}",
+                        dependency.referenced_owner, dependency.referenced_name
+                    ),
+                )?,
+                other => {
+                    return Err(CatalogError::Mapping(format!(
+                        "unmapped Oracle routine dependency target type '{other}'"
+                    )));
+                }
+            };
+            routines[*source_position]
+                .depends_on
+                .push(target_key.clone());
         }
 
         let identities = raw
@@ -4824,53 +5749,79 @@ impl<'a> OracleSnapshotMapper<'a> {
                     dependency.owner, dependency.name
                 ),
             )?;
-            let target_key = match dependency.referenced_type.as_str() {
-                "TABLE" => match materialized_view_keys.get(&(
-                    dependency.referenced_owner.clone(),
-                    dependency.referenced_name.clone(),
-                )) {
-                    Some(key) => key,
-                    None => required(
-                        table_keys.get(&(
+            let (target_key, relationship_kind) = match dependency.referenced_type.as_str() {
+                "TABLE" => (
+                    match materialized_view_keys.get(&(
+                        dependency.referenced_owner.clone(),
+                        dependency.referenced_name.clone(),
+                    )) {
+                        Some(key) => key,
+                        None => required(
+                            table_keys.get(&(
+                                dependency.referenced_owner.clone(),
+                                dependency.referenced_name.clone(),
+                            )),
+                            format!(
+                                "table target for Oracle trigger dependency {}.{}",
+                                dependency.referenced_owner, dependency.referenced_name
+                            ),
+                        )?,
+                    },
+                    MetadataRelationshipKind::DependsOn,
+                ),
+                "VIEW" => (
+                    required(
+                        view_keys.get(&(
                             dependency.referenced_owner.clone(),
                             dependency.referenced_name.clone(),
                         )),
                         format!(
-                            "table target for Oracle trigger dependency {}.{}",
+                            "view target for Oracle trigger dependency {}.{}",
                             dependency.referenced_owner, dependency.referenced_name
                         ),
                     )?,
-                },
-                "VIEW" => required(
-                    view_keys.get(&(
-                        dependency.referenced_owner.clone(),
-                        dependency.referenced_name.clone(),
-                    )),
-                    format!(
-                        "view target for Oracle trigger dependency {}.{}",
-                        dependency.referenced_owner, dependency.referenced_name
-                    ),
-                )?,
-                "MATERIALIZED VIEW" => required(
-                    materialized_view_keys.get(&(
-                        dependency.referenced_owner.clone(),
-                        dependency.referenced_name.clone(),
-                    )),
-                    format!(
-                        "materialized-view target for Oracle trigger dependency {}.{}",
-                        dependency.referenced_owner, dependency.referenced_name
-                    ),
-                )?,
-                "SEQUENCE" => required(
-                    sequence_keys.get(&(
-                        dependency.referenced_owner.clone(),
-                        dependency.referenced_name.clone(),
-                    )),
-                    format!(
-                        "sequence target for Oracle trigger dependency {}.{}",
-                        dependency.referenced_owner, dependency.referenced_name
-                    ),
-                )?,
+                    MetadataRelationshipKind::DependsOn,
+                ),
+                "MATERIALIZED VIEW" => (
+                    required(
+                        materialized_view_keys.get(&(
+                            dependency.referenced_owner.clone(),
+                            dependency.referenced_name.clone(),
+                        )),
+                        format!(
+                            "materialized-view target for Oracle trigger dependency {}.{}",
+                            dependency.referenced_owner, dependency.referenced_name
+                        ),
+                    )?,
+                    MetadataRelationshipKind::DependsOn,
+                ),
+                "SEQUENCE" => (
+                    required(
+                        sequence_keys.get(&(
+                            dependency.referenced_owner.clone(),
+                            dependency.referenced_name.clone(),
+                        )),
+                        format!(
+                            "sequence target for Oracle trigger dependency {}.{}",
+                            dependency.referenced_owner, dependency.referenced_name
+                        ),
+                    )?,
+                    MetadataRelationshipKind::DependsOn,
+                ),
+                "FUNCTION" | "PROCEDURE" => (
+                    required(
+                        routine_keys.get(&(
+                            dependency.referenced_owner.clone(),
+                            dependency.referenced_name.clone(),
+                            dependency.referenced_type.clone(),
+                        )),
+                        format!(
+                            "routine target for Oracle trigger dependency {}.{}",
+                            dependency.referenced_owner, dependency.referenced_name
+                        ),
+                    )?,
+                    MetadataRelationshipKind::Invokes,
+                ),
                 other => {
                     return Err(CatalogError::Mapping(format!(
                         "unmapped Oracle trigger dependency target type '{other}'"
@@ -4878,7 +5829,7 @@ impl<'a> OracleSnapshotMapper<'a> {
                 }
             };
             metadata.relationships.push(MetadataRelationship {
-                kind: MetadataRelationshipKind::DependsOn,
+                kind: relationship_kind,
                 from_key: source_key.clone(),
                 to_key: target_key.clone(),
                 ordinal: None,
@@ -4901,7 +5852,7 @@ impl<'a> OracleSnapshotMapper<'a> {
                 indexes,
                 views,
                 triggers,
-                routines: Vec::new(),
+                routines,
                 capabilities: oracle_complete_capabilities(&self.scope),
             },
             metadata,
@@ -4956,7 +5907,7 @@ impl<'a> OracleSnapshotMapper<'a> {
                 CapabilityCheck {
                     name: "independent_inventory_reconciliation".to_owned(),
                     evidence: format!(
-                        "{} non-secondary USER/DBA_OBJECTS rows reconciled against table, index, sequence, view, materialized-view, and trigger detail catalogs",
+                        "{} non-secondary USER/DBA_OBJECTS rows reconciled against table, index, sequence, view, materialized-view, trigger, and routine detail catalogs",
                         raw.inventory.iter().filter(|object| !object.secondary).count()
                     ),
                 },
@@ -5195,6 +6146,85 @@ fn oracle_trigger_properties(
     properties
 }
 
+fn oracle_routine_properties(
+    routine: &RawRoutine,
+    inventory_object: &RawInventoryObject,
+) -> BTreeMap<String, MetadataValue> {
+    let mut properties = inventory_properties(inventory_object);
+    insert_i64(&mut properties, "object_id", routine.object_id);
+    insert_i64(&mut properties, "subprogram_id", routine.subprogram_id);
+    insert_optional_string(&mut properties, "overload", routine.overload.as_deref());
+    insert_string(&mut properties, "object_type", &routine.object_type);
+    insert_bool(&mut properties, "aggregate", routine.aggregate);
+    insert_bool(&mut properties, "pipelined", routine.pipelined);
+    insert_bool(&mut properties, "parallel", routine.parallel);
+    insert_bool(&mut properties, "interface", routine.interface);
+    insert_bool(&mut properties, "deterministic", routine.deterministic);
+    insert_string(&mut properties, "authid", &routine.authid);
+    insert_optional_string(
+        &mut properties,
+        "polymorphic",
+        routine.polymorphic.as_deref(),
+    );
+    properties
+}
+
+fn oracle_routine_argument_properties(
+    argument: &RawRoutineArgument,
+) -> BTreeMap<String, MetadataValue> {
+    let mut properties = BTreeMap::new();
+    insert_i64(&mut properties, "position", argument.position);
+    insert_i64(&mut properties, "sequence", argument.sequence);
+    insert_i64(&mut properties, "data_level", argument.data_level);
+    insert_string(
+        &mut properties,
+        "data_type",
+        format_oracle_argument_type(argument),
+    );
+    insert_string(&mut properties, "mode", &argument.mode);
+    insert_bool(&mut properties, "defaulted", argument.defaulted);
+    insert_optional_i64(&mut properties, "default_length", argument.default_length);
+    insert_optional_string(
+        &mut properties,
+        "default_value",
+        argument.default_value.as_deref(),
+    );
+    insert_optional_i64(&mut properties, "data_length", argument.data_length);
+    insert_optional_i64(&mut properties, "data_precision", argument.data_precision);
+    insert_optional_i64(&mut properties, "data_scale", argument.data_scale);
+    insert_optional_string(&mut properties, "pls_type", argument.pls_type.as_deref());
+    insert_optional_i64(&mut properties, "char_length", argument.char_length);
+    insert_optional_string(&mut properties, "char_used", argument.char_used.as_deref());
+    properties
+}
+
+fn format_oracle_argument_type(argument: &RawRoutineArgument) -> String {
+    let data_type = argument
+        .data_type
+        .as_deref()
+        .unwrap_or("UNSPECIFIED")
+        .to_owned();
+    match data_type.as_str() {
+        "NUMBER" => match (argument.data_precision, argument.data_scale) {
+            (Some(precision), Some(scale)) => format!("{data_type}({precision},{scale})"),
+            (Some(precision), None) => format!("{data_type}({precision})"),
+            _ => data_type,
+        },
+        "CHAR" | "VARCHAR2" | "NCHAR" | "NVARCHAR2" => argument
+            .char_length
+            .map(|length| {
+                let unit = match argument.char_used.as_deref() {
+                    Some("C") => " CHAR",
+                    Some("B") => " BYTE",
+                    _ => "",
+                };
+                format!("{data_type}({length}{unit})")
+            })
+            .unwrap_or(data_type),
+        _ => data_type,
+    }
+}
+
 fn constraint_properties(constraint: &RawConstraint) -> BTreeMap<String, MetadataValue> {
     let mut properties = BTreeMap::new();
     insert_string(&mut properties, "status", &constraint.status);
@@ -5387,6 +6417,12 @@ fn discovery_counts_from_catalog(
                 })
         })
         .count();
+    let routine_dependency_count = raw
+        .dependencies
+        .iter()
+        .filter(|dependency| matches!(dependency.object_type.as_str(), "FUNCTION" | "PROCEDURE"))
+        .filter(|dependency| !dependency.referenced_owner_oracle_maintained)
+        .count();
 
     set_object_count(&mut objects, ObjectCategory::Database, 1);
     set_object_count(&mut objects, ObjectCategory::Schema, scope.owners.len());
@@ -5396,6 +6432,12 @@ fn discovery_counts_from_catalog(
     set_object_count(&mut objects, ObjectCategory::Sequence, raw.sequences.len());
     set_object_count(&mut objects, ObjectCategory::View, raw.views.len());
     set_object_count(&mut objects, ObjectCategory::Trigger, raw.triggers.len());
+    set_object_count(&mut objects, ObjectCategory::Routine, raw.routines.len());
+    set_object_count(
+        &mut objects,
+        ObjectCategory::RoutineParameter,
+        raw.routine_arguments.len(),
+    );
     set_object_count(
         &mut objects,
         ObjectCategory::ViewColumn,
@@ -5506,6 +6548,16 @@ fn discovery_counts_from_catalog(
     );
     set_relationship_count(
         &mut relationships,
+        RelationshipCategory::SchemaHasRoutine,
+        raw.routines.len(),
+    );
+    set_relationship_count(
+        &mut relationships,
+        RelationshipCategory::RoutineDependency,
+        routine_dependency_count,
+    );
+    set_relationship_count(
+        &mut relationships,
         RelationshipCategory::MetadataParent,
         scope.principals.len()
             + raw.sequences.len()
@@ -5513,7 +6565,8 @@ fn discovery_counts_from_catalog(
             + raw.materialized_views.len()
             + materialized_view_column_count
             + materialized_view_constraint_count
-            + materialized_view_index_count,
+            + materialized_view_index_count
+            + raw.routine_arguments.len(),
     );
     set_relationship_count(
         &mut relationships,
@@ -5521,6 +6574,7 @@ fn discovery_counts_from_catalog(
         raw.identity_columns.len()
             + materialized_view_dependency_count
             + trigger_dependency_count
+            + raw.routine_arguments.len()
             + raw
                 .constraints
                 .iter()
@@ -5761,7 +6815,7 @@ mod tests {
             .admin
             .execute(
                 &format!(
-                    "GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW, CREATE MATERIALIZED VIEW, CREATE TRIGGER TO {}",
+                    "GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE VIEW, CREATE MATERIALIZED VIEW, CREATE TRIGGER, CREATE PROCEDURE TO {}",
                     cleanup.username
                 ),
                 &[],
@@ -5798,6 +6852,18 @@ mod tests {
                 &[],
             )
             .expect("create view");
+        setup
+            .execute(
+                "CREATE OR REPLACE FUNCTION NORMALIZE_LABEL(P_LABEL IN VARCHAR2) RETURN VARCHAR2 DETERMINISTIC AUTHID CURRENT_USER AS BEGIN RETURN UPPER(P_LABEL); END;",
+                &[],
+            )
+            .expect("create standalone function");
+        setup
+            .execute(
+                "CREATE OR REPLACE PROCEDURE UPDATE_CHILD_LABEL(P_ID IN NUMBER, P_LABEL IN VARCHAR2 DEFAULT 'new', P_ROWS OUT NUMBER) AUTHID DEFINER AS BEGIN UPDATE CHILD_ENTITY SET LABEL = P_LABEL WHERE ID = P_ID; P_ROWS := SQL%ROWCOUNT; END;",
+                &[],
+            )
+            .expect("create standalone procedure");
         drop(setup);
 
         let complete = analyze_oracle(&user_url, "oracle-live", Vec::new(), Vec::new(), 30_000);
@@ -5854,6 +6920,28 @@ mod tests {
                 .filter(|object| object.key.object_kind == ObjectKind::ViewColumn)
                 .count(),
             2
+        );
+        assert_eq!(certified.snapshot.schema.routines.len(), 2);
+        let procedure = certified
+            .snapshot
+            .schema
+            .routines
+            .iter()
+            .find(|routine| routine.name == "UPDATE_CHILD_LABEL")
+            .expect("standalone procedure is mapped");
+        assert!(procedure
+            .depends_on
+            .iter()
+            .any(|key| key.object_kind == ObjectKind::Table && key.object_name == "CHILD_ENTITY"));
+        assert_eq!(
+            certified
+                .snapshot
+                .metadata
+                .objects
+                .iter()
+                .filter(|object| object.key.object_kind == ObjectKind::RoutineParameter)
+                .count(),
+            5
         );
 
         let setup = Connection::connect(&cleanup.username, password, &connect_string)
@@ -5930,7 +7018,7 @@ mod tests {
             .expect("reconnect as isolated Oracle test user");
         setup
             .execute(
-                "CREATE OR REPLACE TRIGGER CHILD_LABEL_BIU BEFORE INSERT OR UPDATE ON CHILD_ENTITY FOR EACH ROW BEGIN :NEW.LABEL := UPPER(:NEW.LABEL); END;",
+                "CREATE OR REPLACE TRIGGER CHILD_LABEL_BIU BEFORE INSERT OR UPDATE ON CHILD_ENTITY FOR EACH ROW BEGIN :NEW.LABEL := NORMALIZE_LABEL(:NEW.LABEL); END;",
                 &[],
             )
             .expect("create static trigger");
@@ -5956,6 +7044,17 @@ mod tests {
         assert_eq!(trigger.timing.as_deref(), Some("BEFORE"));
         assert_eq!(trigger.events, ["INSERT", "UPDATE"]);
         assert_eq!(trigger.table_key.object_name, "CHILD_ENTITY");
+        assert!(certified
+            .snapshot
+            .metadata
+            .relationships
+            .iter()
+            .any(|relationship| {
+                relationship.kind == MetadataRelationshipKind::Invokes
+                    && relationship.from_key == trigger.key
+                    && relationship.to_key.object_kind == ObjectKind::Routine
+                    && relationship.to_key.object_name == "NORMALIZE_LABEL"
+            }));
 
         let setup = Connection::connect(&cleanup.username, password, &connect_string)
             .expect("reconnect as isolated Oracle test user");
