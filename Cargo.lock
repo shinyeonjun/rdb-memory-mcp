@@ -382,6 +382,9 @@ name = "database-memory-cli"
 version = "0.1.2"
 dependencies = [
  "database-memory-core",
+ "database-memory-mcp",
+ "rmcp",
+ "serde",
  "serde_json",
 ]
 

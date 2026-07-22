@@ -11,6 +11,7 @@ pub mod graph_builder;
 pub mod graph_query;
 pub mod graph_store;
 pub mod impact_analysis;
+pub mod interface_contract;
 pub mod introspection;
 pub mod redact;
 pub mod relationship_trace;

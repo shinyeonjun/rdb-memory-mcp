@@ -122,11 +122,29 @@ pub(crate) fn analyze_sqlite_path_with_cancellation(
     connection_alias: &str,
     cancellation: &CancellationToken,
 ) -> AnalysisOutcome {
+    analyze_sqlite_path_scoped_with_cancellation(
+        path,
+        connection_alias,
+        vec![MAIN_CATALOG.to_owned()],
+        vec![MAIN_SCHEMA.to_owned()],
+        30_000,
+        cancellation,
+    )
+}
+
+pub(crate) fn analyze_sqlite_path_scoped_with_cancellation(
+    path: &Path,
+    connection_alias: &str,
+    requested_catalogs: Vec<String>,
+    requested_schemas: Vec<String>,
+    timeout_ms: u64,
+    cancellation: &CancellationToken,
+) -> AnalysisOutcome {
     let request = IntrospectionRequest {
         connection_alias: connection_alias.to_owned(),
-        requested_catalogs: vec![MAIN_CATALOG.to_owned()],
-        requested_schemas: vec![MAIN_SCHEMA.to_owned()],
-        timeout_ms: 30_000,
+        requested_catalogs,
+        requested_schemas,
+        timeout_ms,
     };
     DatabaseAnalysisService::new(SqlitePathCatalogAdapter::new(path))
         .analyze_with_cancellation(&request, cancellation)

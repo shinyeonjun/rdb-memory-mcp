@@ -9,9 +9,11 @@ pub use types::*;
 
 use rmcp::{handler::server::wrapper::Parameters, tool, tool_router};
 use tools::{
-    describe_table_for_request, find_column_for_request, find_table_for_request,
-    graph_stats_for_cache_path as graph_stats, impact_analysis_for_request,
-    index_database_for_request, list_databases_for_request, list_tables_for_request,
+    describe_object_for_request, describe_snapshot_for_request, describe_table_for_request,
+    find_column_for_request, find_objects_for_request, find_table_for_request,
+    get_contract_for_request, graph_stats_for_cache_path as graph_stats,
+    impact_analysis_for_request, index_database_for_request, list_databases_for_request,
+    list_objects_for_request, list_snapshots_for_request, list_tables_for_request,
     query_graph_for_request, schema_diff_for_request, tool_json, trace_relationships_for_request,
 };
 
@@ -22,6 +24,14 @@ pub struct DatabaseMemoryMcp;
 impl DatabaseMemoryMcp {
     pub fn new() -> Self {
         Self
+    }
+
+    #[tool(description = "Return the exact metadata-only product contract and support ledger")]
+    pub fn get_contract(
+        &self,
+        Parameters(request): Parameters<GetContractRequest>,
+    ) -> Result<String, String> {
+        tool_json::<_, String>(Ok(get_contract_for_request(request)))
     }
 
     #[tool(description = "Index database schema metadata into the local graph cache")]
@@ -38,6 +48,50 @@ impl DatabaseMemoryMcp {
         Parameters(request): Parameters<ListDatabasesRequest>,
     ) -> Result<String, String> {
         tool_json(list_databases_for_request(request))
+    }
+
+    #[tool(description = "List snapshots with complete or legacy-non-authoritative status")]
+    pub fn list_snapshots(
+        &self,
+        Parameters(request): Parameters<ListSnapshotsRequest>,
+    ) -> Result<String, String> {
+        tool_json(list_snapshots_for_request(request))
+    }
+
+    #[tool(
+        description = "Describe one snapshot and return its completeness proof when authoritative"
+    )]
+    pub fn describe_snapshot(
+        &self,
+        Parameters(request): Parameters<DescribeSnapshotRequest>,
+    ) -> Result<String, String> {
+        tool_json(describe_snapshot_for_request(request))
+    }
+
+    #[tool(description = "List any canonical database object kind with bounded pagination")]
+    pub fn list_objects(
+        &self,
+        Parameters(request): Parameters<ListObjectsRequest>,
+    ) -> Result<String, String> {
+        tool_json(list_objects_for_request(request))
+    }
+
+    #[tool(description = "Find any canonical database object kind by stable identity or name")]
+    pub fn find_objects(
+        &self,
+        Parameters(request): Parameters<FindObjectsRequest>,
+    ) -> Result<String, String> {
+        tool_json(find_objects_for_request(request))
+    }
+
+    #[tool(
+        description = "Describe one canonical object and its bounded incoming/outgoing relationships"
+    )]
+    pub fn describe_object(
+        &self,
+        Parameters(request): Parameters<DescribeObjectRequest>,
+    ) -> Result<String, String> {
+        tool_json(describe_object_for_request(request))
     }
 
     #[tool(description = "List table names for an indexed database alias")]
@@ -113,6 +167,6 @@ impl DatabaseMemoryMcp {
             .cache_path
             .as_deref()
             .unwrap_or(".database-memory/graph.sqlite");
-        tool_json(Ok(graph_stats(cache_path)))
+        tool_json::<_, String>(Ok(graph_stats(cache_path)))
     }
 }

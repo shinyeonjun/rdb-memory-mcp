@@ -512,6 +512,68 @@ fn mcp_pages_inventory_clamps_traversals_and_rejects_missing_start_nodes() {
     let _ = std::fs::remove_file(path);
 }
 
+#[test]
+fn generic_contract_tools_are_bounded_and_return_structured_errors() {
+    let path = temp_cache_path();
+    write_snapshot(&path, SNAPSHOT, &snapshot("sample", true, true));
+    let server = DatabaseMemoryMcp::new();
+
+    let contract: GetContractResult =
+        parse_tool(server.get_contract(Parameters(GetContractRequest {})));
+    assert_eq!(contract.contract_version, 2);
+    assert!(contract.metadata_only);
+    assert!(contract
+        .support
+        .iter()
+        .any(|entry| entry.source == "postgres" && entry.entrypoint_available));
+
+    let snapshots: ListSnapshotsResult =
+        parse_tool(server.list_snapshots(Parameters(ListSnapshotsRequest {
+            cache_path: Some(path.display().to_string()),
+        })));
+    assert_eq!(
+        snapshots.snapshots[0].authority,
+        database_memory_core::graph_store::SnapshotAuthority::LegacyNonAuthoritative
+    );
+
+    let objects: ObjectsResult = parse_tool(server.find_objects(Parameters(FindObjectsRequest {
+        snapshot: "sample".to_owned(),
+        query: "ord".to_owned(),
+        kind: Some("table".to_owned()),
+        offset: Some(0),
+        limit: Some(999),
+        cache_path: Some(path.display().to_string()),
+    })));
+    assert_eq!(objects.objects.len(), 1);
+    assert_eq!(objects.page.limit_applied, 500);
+    assert!(objects.page.limit_clamped);
+
+    let detail: DescribeObjectResult =
+        parse_tool(server.describe_object(Parameters(DescribeObjectRequest {
+            snapshot: "sample".to_owned(),
+            object_key: objects.objects[0].object_key.clone(),
+            relationship_limit: Some(1),
+            cache_path: Some(path.display().to_string()),
+        })));
+    assert_eq!(detail.object.kind, ObjectKind::Table);
+    assert_eq!(detail.relationship_page.limit_applied, 1);
+
+    let error = server
+        .list_objects(Parameters(ListObjectsRequest {
+            snapshot: "sample".to_owned(),
+            kind: Some("not-a-kind".to_owned()),
+            offset: None,
+            limit: None,
+            cache_path: Some(path.display().to_string()),
+        }))
+        .unwrap_err();
+    let error: Value = serde_json::from_str(&error).unwrap();
+    assert_eq!(error["status"], "failed");
+    assert_eq!(error["error"]["code"], "invalid_request");
+
+    let _ = std::fs::remove_file(path);
+}
+
 fn write_snapshot(path: &Path, snapshot_key: &str, snapshot: &SchemaSnapshot) {
     let store = GraphStore::open(path).unwrap();
     insert_schema_snapshot_graph(&store, snapshot_key, 0, snapshot).unwrap();

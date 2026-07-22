@@ -14,14 +14,20 @@ diff for Backend Visual Map's later integration layer.
 
 ## Current Facts
 
-- SQLite, SQLite DDL, PostgreSQL, MySQL, SQL Server, and Oracle sources exist.
-- The graph store, traversal, impact, diff, CLI, MCP, redaction, and atomic
-  replacement foundations exist.
-- The baseline workspace has 97 passing tests.
-- PostgreSQL dependencies are partial; MySQL, SQL Server, and Oracle are Level 1.
-- No persisted completeness proof exists.
-- Live network tests skip successfully when environment variables are absent.
-- Public discovery is centered on tables and columns.
+- Native complete strategies exist for SQLite/DDL, PostgreSQL 14-18, MySQL
+  8.0/8.4/9.7, MariaDB 10.11/11.4/11.8/12.3, SQL Server 2017-2025 Database
+  Engine, Oracle AI Database 26ai Free 23.26.2.0.0, and YugabyteDB YSQL
+  15.12-YB-2025.2.3.2-b0.
+- The optional ODBC path performs runtime capability negotiation and has a
+  certified SQL Server bridge. Other products fail closed. DB2 is explicitly
+  deferred because the owner declined the required IBM license/EULA decision.
+- Every new interface index stores a verified contract-v2 completeness proof;
+  failed analysis preserves the previous complete generation.
+- Generic CLI and MCP discovery covers all 26 canonical object kinds with
+  bounded database-side pagination and structured errors.
+- The default workspace has 201 passing tests; the ODBC-enabled workspace has
+  203. Live network cases remain environment-gated and fail closed when a
+  product/version or evidence requirement is not certified.
 
 ## Required Behavior
 
@@ -463,6 +469,8 @@ Rollback:
 
 ### Phase 9: Complete CLI And MCP Contract
 
+Status: Complete (2026-07-22)
+
 Goal:
 
 - Expose the complete graph safely to Backend Map and other read clients.
@@ -473,6 +481,21 @@ Deliverables:
 - Complete proof, support ledger, structured errors, bounded pagination.
 - CLI/MCP contract parity and compatibility tests.
 - Remove table-only assumptions from public inventory and traversal entrypoints.
+
+Completed:
+
+- Added one shared contract-v2 application service over the certified adapter
+  and graph-store ports. CLI and MCP no longer downgrade complete canonical
+  snapshots to legacy `SchemaSnapshot` payloads while indexing.
+- Added generic bounded list/find/describe operations for all 26 canonical
+  object kinds, snapshot authority/proof reads, structured errors, and a
+  generated runtime support ledger.
+- Preserved v1 table commands and cache reads as compatibility surfaces while
+  marking old snapshots `legacy_non_authoritative`.
+- Added CLI/MCP parity tests over one certified cache and fail-closed generation
+  replacement tests.
+- Bounded SQLite DDL loading, application, and catalog extraction with a real
+  deadline/cancellation path and a 64 MiB total input limit.
 
 Verification:
 

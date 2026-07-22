@@ -5,6 +5,10 @@ use database_memory_core::config::{
     ResolvedConnectionProfile,
 };
 use database_memory_core::impact_analysis::Direction;
+use database_memory_core::interface_contract::{
+    DEFAULT_OBJECT_PAGE_LIMIT, DEFAULT_RELATIONSHIP_LIMIT, DEFAULT_TIMEOUT_MS,
+};
+use database_memory_core::ObjectKind;
 
 pub(crate) const DEFAULT_TRAVERSAL_DEPTH: u32 = 3;
 pub(crate) const DEFAULT_RESULT_LIMIT: usize = 100;
@@ -23,6 +27,42 @@ pub(crate) enum Command {
         path: Option<PathBuf>,
         connection_string: Option<String>,
         alias: String,
+        requested_catalogs: Vec<String>,
+        requested_schemas: Vec<String>,
+        timeout_ms: u64,
+        format: OutputFormat,
+        cache_path: PathBuf,
+    },
+    ListSnapshots {
+        format: OutputFormat,
+        cache_path: PathBuf,
+    },
+    DescribeSnapshot {
+        selector: String,
+        format: OutputFormat,
+        cache_path: PathBuf,
+    },
+    ListObjects {
+        selector: String,
+        kind: Option<ObjectKind>,
+        offset: usize,
+        limit: usize,
+        format: OutputFormat,
+        cache_path: PathBuf,
+    },
+    FindObjects {
+        selector: String,
+        query: String,
+        kind: Option<ObjectKind>,
+        offset: usize,
+        limit: usize,
+        format: OutputFormat,
+        cache_path: PathBuf,
+    },
+    DescribeObject {
+        selector: String,
+        object_key: String,
+        relationship_limit: usize,
         format: OutputFormat,
         cache_path: PathBuf,
     },
@@ -89,6 +129,11 @@ pub(crate) fn parse_args_with_config(
     match args.next().as_deref() {
         Some("contract") => parse_contract_args(args),
         Some("index") => parse_index_args(args, &config_loader),
+        Some("list-snapshots") => parse_list_snapshots_args(args),
+        Some("describe-snapshot") => parse_describe_snapshot_args(args, &config_loader),
+        Some(command @ ("list-objects" | "find-objects" | "describe-object")) => {
+            parse_object_command(command, args, &config_loader)
+        }
         Some("describe-table") => parse_describe_table_args(args, &config_loader),
         Some("inventory") => parse_inventory_args(args, &config_loader),
         Some("find-table") => parse_find_args("find-table", args, &config_loader),
@@ -190,6 +235,9 @@ fn parse_index_args(
     let mut path = None;
     let mut alias = None;
     let mut connection_string = None;
+    let mut requested_catalogs = Vec::new();
+    let mut requested_schemas = Vec::new();
+    let mut timeout_ms = DEFAULT_TIMEOUT_MS;
     let mut format = OutputFormat::Text;
     let mut cache_path = None;
     let mut config_path = None;
@@ -207,6 +255,13 @@ fn parse_index_args(
             "--path" => path = Some(PathBuf::from(value)),
             "--connection-string" => connection_string = Some(value),
             "--alias" => alias = Some(value),
+            "--catalog" => requested_catalogs.push(value),
+            "--schema" => requested_schemas.push(value),
+            "--timeout-ms" => {
+                timeout_ms = value
+                    .parse()
+                    .map_err(|_| format!("invalid timeout '{value}'"))?;
+            }
             "--format" => format = parse_format(&value)?,
             "--cache-path" => cache_path = Some(PathBuf::from(value)),
             "--config-path" => config_path = Some(PathBuf::from(value)),
@@ -229,7 +284,7 @@ fn parse_index_args(
 
     match source.as_str() {
         "sqlite" | "ddl-sqlite" if path.is_none() => return Err("missing --path".to_owned()),
-        "postgres" | "yugabytedb" | "mysql" | "mariadb" | "sqlserver" | "oracle"
+        "postgres" | "yugabytedb" | "mysql" | "mariadb" | "sqlserver" | "oracle" | "odbc"
             if connection_string.is_none() =>
         {
             return Err("missing --connection-string".to_owned());
@@ -242,11 +297,199 @@ fn parse_index_args(
         path,
         connection_string,
         alias: alias.ok_or("missing --alias")?,
+        requested_catalogs,
+        requested_schemas,
+        timeout_ms,
         format,
         cache_path: cache_path
             .or_else(|| profile.and_then(|profile| profile.cache_path))
             .unwrap_or_else(default_cache_path),
     })
+}
+
+fn parse_list_snapshots_args(mut args: impl Iterator<Item = String>) -> Result<Command, String> {
+    let mut format = OutputFormat::Text;
+    let mut cache_path = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => format = OutputFormat::Json,
+            "--format" => {
+                format = parse_format(&args.next().ok_or("missing value for --format")?)?;
+            }
+            "--cache-path" => {
+                cache_path = Some(PathBuf::from(
+                    args.next().ok_or("missing value for --cache-path")?,
+                ));
+            }
+            _ => return Err(format!("unknown list-snapshots flag '{arg}'")),
+        }
+    }
+    Ok(Command::ListSnapshots {
+        format,
+        cache_path: cache_path.unwrap_or_else(default_cache_path),
+    })
+}
+
+fn parse_describe_snapshot_args(
+    args: impl Iterator<Item = String>,
+    config_loader: &impl Fn(&Path) -> Option<DatabaseMemoryConfig>,
+) -> Result<Command, String> {
+    let ParsedReadCommand {
+        mut positionals,
+        format,
+        cache_path,
+        ..
+    } = parse_read_command_args("describe-snapshot", args, config_loader)?;
+    if positionals.len() != 1 {
+        return Err("usage: database-memory describe-snapshot <alias-or-snapshot-key> [--format text|json] [--cache-path <path>]".to_owned());
+    }
+    Ok(Command::DescribeSnapshot {
+        selector: positionals.remove(0),
+        format,
+        cache_path,
+    })
+}
+
+fn parse_object_command(
+    command: &str,
+    args: impl Iterator<Item = String>,
+    config_loader: &impl Fn(&Path) -> Option<DatabaseMemoryConfig>,
+) -> Result<Command, String> {
+    let ParsedReadCommand {
+        mut positionals,
+        kind,
+        offset,
+        limit,
+        relationship_limit,
+        format,
+        cache_path,
+    } = parse_read_command_args(command, args, config_loader)?;
+    match command {
+        "list-objects" if positionals.len() == 1 => Ok(Command::ListObjects {
+            selector: positionals.remove(0),
+            kind,
+            offset,
+            limit,
+            format,
+            cache_path,
+        }),
+        "find-objects" if positionals.len() == 2 => Ok(Command::FindObjects {
+            selector: positionals.remove(0),
+            query: positionals.remove(0),
+            kind,
+            offset,
+            limit,
+            format,
+            cache_path,
+        }),
+        "describe-object" if positionals.len() == 2 && kind.is_none() => {
+            Ok(Command::DescribeObject {
+                selector: positionals.remove(0),
+                object_key: positionals.remove(0),
+                relationship_limit,
+                format,
+                cache_path,
+            })
+        }
+        "list-objects" => Err("usage: database-memory list-objects <alias-or-snapshot-key> [--kind <object-kind>] [--offset <n>] [--limit <n>] [--format text|json] [--cache-path <path>]".to_owned()),
+        "find-objects" => Err("usage: database-memory find-objects <alias-or-snapshot-key> <query> [--kind <object-kind>] [--offset <n>] [--limit <n>] [--format text|json] [--cache-path <path>]".to_owned()),
+        "describe-object" => Err("usage: database-memory describe-object <alias-or-snapshot-key> <object-key> [--relationship-limit <n>] [--format text|json] [--cache-path <path>]".to_owned()),
+        _ => unreachable!(),
+    }
+}
+
+struct ParsedReadCommand {
+    positionals: Vec<String>,
+    kind: Option<ObjectKind>,
+    offset: usize,
+    limit: usize,
+    relationship_limit: usize,
+    format: OutputFormat,
+    cache_path: PathBuf,
+}
+
+fn parse_read_command_args(
+    command: &str,
+    mut args: impl Iterator<Item = String>,
+    config_loader: &impl Fn(&Path) -> Option<DatabaseMemoryConfig>,
+) -> Result<ParsedReadCommand, String> {
+    let mut positionals = Vec::new();
+    let mut kind = None;
+    let mut offset = 0;
+    let mut limit = DEFAULT_OBJECT_PAGE_LIMIT;
+    let mut relationship_limit = DEFAULT_RELATIONSHIP_LIMIT;
+    let mut format = OutputFormat::Text;
+    let mut cache_path = None;
+    let mut config_path = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => format = OutputFormat::Json,
+            "--format" => {
+                format = parse_format(&args.next().ok_or("missing value for --format")?)?;
+            }
+            "--kind" if matches!(command, "list-objects" | "find-objects") => {
+                let value = args.next().ok_or("missing value for --kind")?;
+                kind = Some(value.parse().map_err(|_| {
+                    format!("unknown object kind '{value}'; use a contract object kind")
+                })?);
+            }
+            "--offset" if matches!(command, "list-objects" | "find-objects") => {
+                let value = args.next().ok_or("missing value for --offset")?;
+                offset = value
+                    .parse()
+                    .map_err(|_| format!("invalid object offset '{value}'"))?;
+            }
+            "--limit" if matches!(command, "list-objects" | "find-objects") => {
+                let value = args.next().ok_or("missing value for --limit")?;
+                limit = positive_usize("object limit", &value)?;
+            }
+            "--relationship-limit" if command == "describe-object" => {
+                let value = args
+                    .next()
+                    .ok_or("missing value for --relationship-limit")?;
+                relationship_limit = positive_usize("relationship limit", &value)?;
+            }
+            "--cache-path" => {
+                cache_path = Some(PathBuf::from(
+                    args.next().ok_or("missing value for --cache-path")?,
+                ));
+            }
+            "--config-path" => {
+                config_path = Some(PathBuf::from(
+                    args.next().ok_or("missing value for --config-path")?,
+                ));
+            }
+            _ if arg.starts_with("--") => return Err(format!("unknown {command} flag '{arg}'")),
+            _ => positionals.push(arg),
+        }
+    }
+    let config_path = config_path.unwrap_or_else(default_config_file_path);
+    let profile = profile_for_alias(
+        positionals.first().map(String::as_str),
+        &config_path,
+        config_loader,
+    );
+    Ok(ParsedReadCommand {
+        positionals,
+        kind,
+        offset,
+        limit,
+        relationship_limit,
+        format,
+        cache_path: cache_path
+            .or_else(|| profile.and_then(|profile| profile.cache_path))
+            .unwrap_or_else(default_cache_path),
+    })
+}
+
+fn positive_usize(label: &str, value: &str) -> Result<usize, String> {
+    let value = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid {label} '{value}'"))?;
+    if value == 0 {
+        return Err(format!("{label} must be at least 1"));
+    }
+    Ok(value)
 }
 
 fn parse_describe_table_args(
@@ -536,13 +779,12 @@ fn inventory_usage() -> &'static str {
 }
 
 fn usage() -> &'static str {
-    "usage: database-memory contract [--format text|json]\n       database-memory index --source sqlite --path <db> --alias <name> [--format text|json] [--cache-path <path>] [--config-path <path>]\n       database-memory index --source ddl-sqlite --path <sql-file-or-dir> --alias <name> [--format text|json] [--cache-path <path>]
-       database-memory index --source postgres --connection-string <url> --alias <name> [--format text|json] [--cache-path <path>]
-       database-memory index --source yugabytedb --connection-string <url> --alias <name> [--format text|json] [--cache-path <path>]
-       database-memory index --source mysql --connection-string <url> --alias <name> [--format text|json] [--cache-path <path>]
-       database-memory index --source mariadb --connection-string <url> --alias <name> [--format text|json] [--cache-path <path>]
-       database-memory index --source sqlserver --connection-string <ado-connection-string> --alias <name> [--format text|json] [--cache-path <path>]
-       database-memory index --source oracle --connection-string <user/password@connect_string> --alias <name> [--format text|json] [--cache-path <path>]
+    "usage: database-memory contract [--format text|json]\n       database-memory index --source <source> (--path <path> | --connection-string <secret>) --alias <name> [--catalog <name>]... [--schema <name>]... [--timeout-ms <n>] [--format text|json] [--cache-path <path>] [--config-path <path>]
+       database-memory list-snapshots [--format text|json] [--cache-path <path>]
+       database-memory describe-snapshot <alias-or-snapshot-key> [--format text|json] [--cache-path <path>]
+       database-memory list-objects <alias-or-snapshot-key> [--kind <object-kind>] [--offset <n>] [--limit <n>] [--format text|json] [--cache-path <path>]
+       database-memory find-objects <alias-or-snapshot-key> <query> [--kind <object-kind>] [--offset <n>] [--limit <n>] [--format text|json] [--cache-path <path>]
+       database-memory describe-object <alias-or-snapshot-key> <object-key> [--relationship-limit <n>] [--format text|json] [--cache-path <path>]
        database-memory describe-table <alias> [<table-name> | --object-key <stable-key>] [--format text|json] [--cache-path <path>] [--config-path <path>]
        database-memory inventory <alias> [--offset <n>] [--limit <n>] [--format json] [--cache-path <path>] [--config-path <path>]
        database-memory find-table <alias> <query> [--format text|json] [--cache-path <path>] [--config-path <path>]
@@ -593,6 +835,9 @@ mod tests {
                 path: Some(PathBuf::from("sample.sqlite")),
                 connection_string: None,
                 alias: "sample".to_owned(),
+                requested_catalogs: vec![],
+                requested_schemas: vec![],
+                timeout_ms: DEFAULT_TIMEOUT_MS,
                 format: OutputFormat::Text,
                 cache_path: PathBuf::from(".database-memory").join("graph.sqlite"),
             }
@@ -618,6 +863,9 @@ mod tests {
                 path: None,
                 connection_string: Some("postgresql://yugabyte@localhost:5433/yugabyte".to_owned()),
                 alias: "yb-local".to_owned(),
+                requested_catalogs: vec![],
+                requested_schemas: vec![],
+                timeout_ms: DEFAULT_TIMEOUT_MS,
                 format: OutputFormat::Text,
                 cache_path: PathBuf::from(".database-memory").join("graph.sqlite"),
             }
@@ -681,6 +929,80 @@ mod tests {
         )
         .unwrap_err()
         .contains("pass one table selector"));
+    }
+
+    #[test]
+    fn parses_complete_scope_and_generic_object_commands() {
+        assert_eq!(
+            parse_args(
+                [
+                    "index",
+                    "--source",
+                    "sqlserver",
+                    "--connection-string",
+                    "Driver=SQL Server;Server=localhost",
+                    "--alias",
+                    "prod",
+                    "--catalog",
+                    "app",
+                    "--schema",
+                    "dbo",
+                    "--timeout-ms",
+                    "45000",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .unwrap(),
+            Command::Index {
+                source: "sqlserver".to_owned(),
+                path: None,
+                connection_string: Some("Driver=SQL Server;Server=localhost".to_owned()),
+                alias: "prod".to_owned(),
+                requested_catalogs: vec!["app".to_owned()],
+                requested_schemas: vec!["dbo".to_owned()],
+                timeout_ms: 45_000,
+                format: OutputFormat::Text,
+                cache_path: default_cache_path(),
+            }
+        );
+
+        assert_eq!(
+            parse_args(
+                [
+                    "find-objects",
+                    "prod",
+                    "account",
+                    "--kind",
+                    "table",
+                    "--offset",
+                    "10",
+                    "--limit",
+                    "25",
+                    "--json",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .unwrap(),
+            Command::FindObjects {
+                selector: "prod".to_owned(),
+                query: "account".to_owned(),
+                kind: Some(ObjectKind::Table),
+                offset: 10,
+                limit: 25,
+                format: OutputFormat::Json,
+                cache_path: default_cache_path(),
+            }
+        );
+
+        assert!(parse_args(
+            ["list-objects", "prod", "--kind", "not-a-kind"]
+                .into_iter()
+                .map(str::to_owned)
+        )
+        .unwrap_err()
+        .contains("unknown object kind"));
     }
 
     #[test]

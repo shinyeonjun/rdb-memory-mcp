@@ -1,7 +1,9 @@
 use std::error::Error;
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::Connection;
@@ -11,7 +13,11 @@ use crate::adapters::sqlite::{
 };
 use crate::adapters::sqlite_sql::validate_schema_ddl;
 use crate::certification::CertifiedSchemaSnapshot;
+use crate::introspection::CancellationToken;
 use crate::SchemaSnapshot;
+
+const DEFAULT_DDL_TIMEOUT_MS: u64 = 30_000;
+const MAX_DDL_BYTES: u64 = 64 * 1024 * 1024;
 
 pub type SqliteDdlSourceResult<T> = Result<T, SqliteDdlSourceError>;
 
@@ -30,6 +36,12 @@ pub enum SqliteDdlSourceError {
         message: String,
     },
     NoSqlFiles(PathBuf),
+    InputTooLarge {
+        path: PathBuf,
+        bytes: u64,
+    },
+    Timeout(PathBuf),
+    Cancelled(PathBuf),
     Adapter(SqliteAdapterError),
 }
 
@@ -50,6 +62,21 @@ impl fmt::Display for SqliteDdlSourceError {
                 path.display()
             ),
             Self::NoSqlFiles(path) => write!(f, "no .sql files found in '{}'", path.display()),
+            Self::InputTooLarge { path, bytes } => write!(
+                f,
+                "SQLite DDL input '{}' is {bytes} bytes; the bounded limit is {MAX_DDL_BYTES} bytes",
+                path.display()
+            ),
+            Self::Timeout(path) => write!(
+                f,
+                "SQLite DDL analysis exceeded its deadline while processing '{}'",
+                path.display()
+            ),
+            Self::Cancelled(path) => write!(
+                f,
+                "SQLite DDL analysis was cancelled while processing '{}'",
+                path.display()
+            ),
             Self::Adapter(source) => {
                 write!(f, "failed to introspect SQLite DDL snapshot: {source}")
             }
@@ -62,7 +89,11 @@ impl Error for SqliteDdlSourceError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Apply { source, .. } => Some(source),
-            Self::InvalidStatement { .. } | Self::NoSqlFiles(_) => None,
+            Self::InvalidStatement { .. }
+            | Self::NoSqlFiles(_)
+            | Self::InputTooLarge { .. }
+            | Self::Timeout(_)
+            | Self::Cancelled(_) => None,
             Self::Adapter(source) => Some(source),
         }
     }
@@ -78,7 +109,9 @@ pub fn introspect_sqlite_ddl(
     path: &Path,
     connection_alias: &str,
 ) -> SqliteDdlSourceResult<SchemaSnapshot> {
-    let conn = load_ddl_connection(path)?;
+    let cancellation = CancellationToken::new();
+    let deadline = deadline(DEFAULT_DDL_TIMEOUT_MS);
+    let conn = load_ddl_connection(path, deadline, &cancellation)?;
     introspect_sqlite_ddl_connection(&conn, connection_alias).map_err(SqliteDdlSourceError::from)
 }
 
@@ -86,32 +119,130 @@ pub fn introspect_sqlite_ddl_complete(
     path: &Path,
     connection_alias: &str,
 ) -> SqliteDdlSourceResult<CertifiedSchemaSnapshot> {
-    let conn = load_ddl_connection(path)?;
-    introspect_sqlite_ddl_connection_complete(&conn, connection_alias)
-        .map_err(SqliteDdlSourceError::from)
+    introspect_sqlite_ddl_complete_bounded(
+        path,
+        connection_alias,
+        DEFAULT_DDL_TIMEOUT_MS,
+        &CancellationToken::new(),
+    )
 }
 
-fn load_ddl_connection(path: &Path) -> SqliteDdlSourceResult<Connection> {
+pub fn introspect_sqlite_ddl_complete_bounded(
+    path: &Path,
+    connection_alias: &str,
+    timeout_ms: u64,
+    cancellation: &CancellationToken,
+) -> SqliteDdlSourceResult<CertifiedSchemaSnapshot> {
+    let deadline = deadline(timeout_ms);
+    let conn = load_ddl_connection(path, deadline, cancellation)?;
+    checkpoint(path, deadline, cancellation)?;
+    match introspect_sqlite_ddl_connection_complete(&conn, connection_alias) {
+        Ok(snapshot) => {
+            checkpoint(path, deadline, cancellation)?;
+            conn.progress_handler(0, None::<fn() -> bool>);
+            Ok(snapshot)
+        }
+        Err(_) if cancellation.is_cancelled() => {
+            Err(SqliteDdlSourceError::Cancelled(path.to_path_buf()))
+        }
+        Err(_) if Instant::now() >= deadline => {
+            Err(SqliteDdlSourceError::Timeout(path.to_path_buf()))
+        }
+        Err(error) => Err(SqliteDdlSourceError::Adapter(error)),
+    }
+}
+
+fn load_ddl_connection(
+    path: &Path,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> SqliteDdlSourceResult<Connection> {
+    checkpoint(path, deadline, cancellation)?;
     let conn = Connection::open_in_memory().map_err(|source| SqliteDdlSourceError::Apply {
         path: PathBuf::from(":memory:"),
         source,
     })?;
     conn.authorizer(Some(authorize_ddl));
+    let progress_cancellation = cancellation.clone();
+    conn.progress_handler(
+        1_000,
+        Some(move || progress_cancellation.is_cancelled() || Instant::now() >= deadline),
+    );
 
+    let mut total_bytes = 0_u64;
     for file in sql_files(path)? {
-        let sql = fs::read_to_string(&file).map_err(|source| SqliteDdlSourceError::Io {
+        checkpoint(&file, deadline, cancellation)?;
+        let source = fs::File::open(&file).map_err(|source| SqliteDdlSourceError::Io {
             path: file.clone(),
             source,
         })?;
+        let bytes = source
+            .metadata()
+            .map_err(|source| SqliteDdlSourceError::Io {
+                path: file.clone(),
+                source,
+            })?
+            .len();
+        let remaining = MAX_DDL_BYTES.saturating_sub(total_bytes);
+        if bytes > remaining {
+            return Err(SqliteDdlSourceError::InputTooLarge {
+                path: file,
+                bytes: total_bytes.saturating_add(bytes),
+            });
+        }
+        let mut sql = String::with_capacity(usize::try_from(bytes).unwrap_or(usize::MAX));
+        let bytes_read = source
+            .take(remaining.saturating_add(1))
+            .read_to_string(&mut sql)
+            .map_err(|source| SqliteDdlSourceError::Io {
+                path: file.clone(),
+                source,
+            })? as u64;
+        total_bytes = total_bytes.saturating_add(bytes_read);
+        if total_bytes > MAX_DDL_BYTES {
+            return Err(SqliteDdlSourceError::InputTooLarge {
+                path: file,
+                bytes: total_bytes,
+            });
+        }
+        checkpoint(&file, deadline, cancellation)?;
         validate_schema_ddl(&sql).map_err(|message| SqliteDdlSourceError::InvalidStatement {
             path: file.clone(),
             message,
         })?;
-        conn.execute_batch(&sql)
-            .map_err(|source| SqliteDdlSourceError::Apply { path: file, source })?;
+        match conn.execute_batch(&sql) {
+            Ok(()) => {}
+            Err(_) if cancellation.is_cancelled() => {
+                return Err(SqliteDdlSourceError::Cancelled(file));
+            }
+            Err(_) if Instant::now() >= deadline => {
+                return Err(SqliteDdlSourceError::Timeout(file));
+            }
+            Err(source) => return Err(SqliteDdlSourceError::Apply { path: file, source }),
+        }
     }
     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
     Ok(conn)
+}
+
+fn deadline(timeout_ms: u64) -> Instant {
+    Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .unwrap_or_else(Instant::now)
+}
+
+fn checkpoint(
+    path: &Path,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> SqliteDdlSourceResult<()> {
+    if cancellation.is_cancelled() {
+        return Err(SqliteDdlSourceError::Cancelled(path.to_path_buf()));
+    }
+    if Instant::now() >= deadline {
+        return Err(SqliteDdlSourceError::Timeout(path.to_path_buf()));
+    }
+    Ok(())
 }
 
 fn authorize_ddl(context: AuthContext<'_>) -> Authorization {
@@ -236,6 +367,25 @@ mod ddl_source_tests {
             .object_counts
             .iter()
             .all(|count| count.discovered == count.emitted));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bounded_ddl_analysis_honors_deadline_and_cancellation_before_work() {
+        let dir = sample_dir("bounded");
+        write_migrations(&dir);
+
+        let timed_out =
+            introspect_sqlite_ddl_complete_bounded(&dir, "app", 0, &CancellationToken::new())
+                .unwrap_err();
+        assert!(matches!(timed_out, SqliteDdlSourceError::Timeout(_)));
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let cancelled =
+            introspect_sqlite_ddl_complete_bounded(&dir, "app", 30_000, &cancellation).unwrap_err();
+        assert!(matches!(cancelled, SqliteDdlSourceError::Cancelled(_)));
 
         let _ = fs::remove_dir_all(dir);
     }

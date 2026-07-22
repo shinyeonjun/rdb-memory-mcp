@@ -20,18 +20,15 @@ pub struct IndexDatabaseRequest {
     pub path: Option<String>,
     pub connection_string: Option<String>,
     pub alias: String,
+    #[serde(default)]
+    pub requested_catalogs: Vec<String>,
+    #[serde(default)]
+    pub requested_schemas: Vec<String>,
+    pub timeout_ms: Option<u64>,
     pub cache_path: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct IndexDatabaseResult {
-    pub snapshot_key: String,
-    pub tables_indexed: usize,
-    pub columns_indexed: usize,
-    pub constraints_indexed: usize,
-    pub indexes_indexed: usize,
-    pub cache_path: String,
-}
+pub type IndexDatabaseResult = database_memory_core::interface_contract::IndexResult;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListDatabasesRequest {
@@ -44,13 +41,67 @@ pub struct ListDatabasesResult {
     pub snapshots: Vec<SnapshotSummary>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SnapshotSummary {
-    pub snapshot_key: String,
-    pub source: Option<String>,
-    pub alias: String,
-    pub captured_at_unix_ms: i64,
+pub type SnapshotSummary = database_memory_core::interface_contract::SnapshotSummary;
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct GetContractRequest {}
+
+pub type GetContractResult = database_memory_core::interface_contract::ProductContract;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListSnapshotsRequest {
+    pub cache_path: Option<String>,
 }
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListSnapshotsResult {
+    pub contract_version: u32,
+    pub cache_path: String,
+    pub snapshots: Vec<SnapshotSummary>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DescribeSnapshotRequest {
+    #[serde(alias = "alias")]
+    pub snapshot: String,
+    pub cache_path: Option<String>,
+}
+
+pub type DescribeSnapshotResult = database_memory_core::interface_contract::SnapshotDetail;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListObjectsRequest {
+    #[serde(alias = "alias")]
+    pub snapshot: String,
+    pub kind: Option<String>,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+    pub cache_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindObjectsRequest {
+    #[serde(alias = "alias")]
+    pub snapshot: String,
+    pub query: String,
+    pub kind: Option<String>,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+    pub cache_path: Option<String>,
+}
+
+pub type ObjectsResult = database_memory_core::interface_contract::ObjectPage;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DescribeObjectRequest {
+    #[serde(alias = "alias")]
+    pub snapshot: String,
+    pub object_key: String,
+    pub relationship_limit: Option<usize>,
+    pub cache_path: Option<String>,
+}
+
+pub type DescribeObjectResult = database_memory_core::interface_contract::ObjectDetail;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListTablesRequest {

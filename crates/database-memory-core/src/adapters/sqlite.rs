@@ -5,8 +5,8 @@ use std::path::Path;
 use rusqlite::{Connection, OpenFlags};
 
 use super::sqlite_catalog::{
-    analyze_sqlite_path, analyze_sqlite_path_with_cancellation, certify_discovery,
-    discover_sqlite_connection,
+    analyze_sqlite_path, analyze_sqlite_path_scoped_with_cancellation,
+    analyze_sqlite_path_with_cancellation, certify_discovery, discover_sqlite_connection,
 };
 use crate::analysis_outcome::AnalysisOutcome;
 use crate::certification::{CertificationError, CertifiedSchemaSnapshot};
@@ -25,6 +25,41 @@ pub fn introspect_sqlite_complete_with_cancellation(
     cancellation: &CancellationToken,
 ) -> AnalysisOutcome {
     analyze_sqlite_path_with_cancellation(path, connection_alias, cancellation)
+}
+
+pub fn introspect_sqlite_complete_scoped(
+    path: &Path,
+    connection_alias: &str,
+    requested_catalogs: Vec<String>,
+    requested_schemas: Vec<String>,
+    timeout_ms: u64,
+) -> AnalysisOutcome {
+    introspect_sqlite_complete_scoped_with_cancellation(
+        path,
+        connection_alias,
+        requested_catalogs,
+        requested_schemas,
+        timeout_ms,
+        &CancellationToken::new(),
+    )
+}
+
+pub fn introspect_sqlite_complete_scoped_with_cancellation(
+    path: &Path,
+    connection_alias: &str,
+    requested_catalogs: Vec<String>,
+    requested_schemas: Vec<String>,
+    timeout_ms: u64,
+    cancellation: &CancellationToken,
+) -> AnalysisOutcome {
+    analyze_sqlite_path_scoped_with_cancellation(
+        path,
+        connection_alias,
+        requested_catalogs,
+        requested_schemas,
+        timeout_ms,
+        cancellation,
+    )
 }
 
 pub fn introspect_sqlite(

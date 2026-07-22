@@ -568,10 +568,15 @@ pub(crate) fn render_inventory(
         .get_snapshot(snapshot_key)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("snapshot '{snapshot_key}' not found in cache; run index first"))?;
-    let snapshot =
-        serde_json::from_str::<SchemaSnapshot>(&record.payload_json).map_err(|error| {
+    let snapshot = match store
+        .get_certified_snapshot(snapshot_key)
+        .map_err(|error| error.to_string())?
+    {
+        Some(certified) => certified.snapshot.schema,
+        None => serde_json::from_str::<SchemaSnapshot>(&record.payload_json).map_err(|error| {
             format!("snapshot '{snapshot_key}' payload is incompatible; re-index it: {error}")
-        })?;
+        })?,
+    };
     let warnings = capability_warnings(&snapshot.capabilities);
     let index = InventoryDescriptionIndex::new(&snapshot);
     let mut table_entries = snapshot

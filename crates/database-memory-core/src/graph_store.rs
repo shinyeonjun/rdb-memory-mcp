@@ -70,7 +70,8 @@ struct SnapshotCapabilitiesPayload {
     capabilities: AdapterCapabilities,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SnapshotAuthority {
     Complete,
     LegacyNonAuthoritative,
@@ -455,6 +456,131 @@ impl GraphStore {
         collect_nodes(rows)
     }
 
+    pub fn node_count_for_snapshot(&self, snapshot_key: &str) -> GraphStoreResult<u64> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM graph_nodes WHERE snapshot_key = ?1",
+            params![snapshot_key],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    pub fn find_nodes_page(
+        &self,
+        snapshot_key: &str,
+        label: Option<&str>,
+        query: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> GraphStoreResult<(u64, Vec<GraphNodeRecord>)> {
+        let normalized_query = query.map(str::trim).filter(|query| !query.is_empty());
+        match (label, normalized_query) {
+            (None, None) => {
+                let total = self.conn.query_row(
+                    "SELECT COUNT(*) FROM graph_nodes WHERE snapshot_key = ?1",
+                    params![snapshot_key],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let mut stmt = self.conn.prepare(
+                    "SELECT snapshot_key, node_key, label, display_name, payload_json
+                     FROM graph_nodes
+                     WHERE snapshot_key = ?1
+                     ORDER BY label, node_key
+                     LIMIT ?2 OFFSET ?3",
+                )?;
+                let rows = stmt.query_map(
+                    params![snapshot_key, sqlite_limit(limit), sqlite_offset(offset)],
+                    map_node,
+                )?;
+                Ok((total as u64, collect_nodes(rows)?))
+            }
+            (Some(label), None) => {
+                let total = self.conn.query_row(
+                    "SELECT COUNT(*) FROM graph_nodes
+                     WHERE snapshot_key = ?1 AND label = ?2",
+                    params![snapshot_key, label],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let mut stmt = self.conn.prepare(
+                    "SELECT snapshot_key, node_key, label, display_name, payload_json
+                     FROM graph_nodes
+                     WHERE snapshot_key = ?1 AND label = ?2
+                     ORDER BY node_key
+                     LIMIT ?3 OFFSET ?4",
+                )?;
+                let rows = stmt.query_map(
+                    params![
+                        snapshot_key,
+                        label,
+                        sqlite_limit(limit),
+                        sqlite_offset(offset)
+                    ],
+                    map_node,
+                )?;
+                Ok((total as u64, collect_nodes(rows)?))
+            }
+            (None, Some(query)) => {
+                let total = self.conn.query_row(
+                    "SELECT COUNT(*) FROM graph_nodes
+                     WHERE snapshot_key = ?1
+                       AND (instr(lower(node_key), lower(?2)) > 0
+                            OR instr(lower(COALESCE(display_name, '')), lower(?2)) > 0)",
+                    params![snapshot_key, query],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let mut stmt = self.conn.prepare(
+                    "SELECT snapshot_key, node_key, label, display_name, payload_json
+                     FROM graph_nodes
+                     WHERE snapshot_key = ?1
+                       AND (instr(lower(node_key), lower(?2)) > 0
+                            OR instr(lower(COALESCE(display_name, '')), lower(?2)) > 0)
+                     ORDER BY label, node_key
+                     LIMIT ?3 OFFSET ?4",
+                )?;
+                let rows = stmt.query_map(
+                    params![
+                        snapshot_key,
+                        query,
+                        sqlite_limit(limit),
+                        sqlite_offset(offset)
+                    ],
+                    map_node,
+                )?;
+                Ok((total as u64, collect_nodes(rows)?))
+            }
+            (Some(label), Some(query)) => {
+                let total = self.conn.query_row(
+                    "SELECT COUNT(*) FROM graph_nodes
+                     WHERE snapshot_key = ?1 AND label = ?2
+                       AND (instr(lower(node_key), lower(?3)) > 0
+                            OR instr(lower(COALESCE(display_name, '')), lower(?3)) > 0)",
+                    params![snapshot_key, label, query],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let mut stmt = self.conn.prepare(
+                    "SELECT snapshot_key, node_key, label, display_name, payload_json
+                     FROM graph_nodes
+                     WHERE snapshot_key = ?1 AND label = ?2
+                       AND (instr(lower(node_key), lower(?3)) > 0
+                            OR instr(lower(COALESCE(display_name, '')), lower(?3)) > 0)
+                     ORDER BY node_key
+                     LIMIT ?4 OFFSET ?5",
+                )?;
+                let rows = stmt.query_map(
+                    params![
+                        snapshot_key,
+                        label,
+                        query,
+                        sqlite_limit(limit),
+                        sqlite_offset(offset)
+                    ],
+                    map_node,
+                )?;
+                Ok((total as u64, collect_nodes(rows)?))
+            }
+        }
+    }
+
     pub fn delete_node(&self, snapshot_key: &str, node_key: &str) -> GraphStoreResult<()> {
         self.conn.execute(
             "DELETE FROM graph_nodes WHERE snapshot_key = ?1 AND node_key = ?2",
@@ -517,6 +643,15 @@ impl GraphStore {
         )?;
         let rows = stmt.query_map(params![snapshot_key], map_edge)?;
         collect_edges(rows)
+    }
+
+    pub fn edge_count_for_snapshot(&self, snapshot_key: &str) -> GraphStoreResult<u64> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM graph_edges WHERE snapshot_key = ?1",
+            params![snapshot_key],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count as u64)
     }
 
     pub fn edges_from(
@@ -771,6 +906,10 @@ fn collect_edges(
 
 fn sqlite_limit(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
+}
+
+fn sqlite_offset(offset: usize) -> i64 {
+    i64::try_from(offset).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]

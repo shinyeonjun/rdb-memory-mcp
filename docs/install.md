@@ -18,6 +18,18 @@ Build the whole workspace in release mode:
 cargo build --release
 ```
 
+The generic ODBC entrypoint is intentionally optional. Build it explicitly and
+install a matching 64-bit driver on the host:
+
+```powershell
+cargo build --release --features database-memory-core/odbc
+```
+
+ODBC driver presence is not a completeness claim. The current ODBC strategy
+certifies only the SQL Server bridge for the same native-certified SQL Server
+versions; every other product fails closed until it has its own live-certified
+strategy.
+
 Release binaries are written under `target/release/`:
 
 - CLI: `target/release/database-memory` on macOS/Linux, `target/release/database-memory.exe` on Windows.

@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use database_memory_core::graph_builder::insert_schema_snapshot_graph;
 use database_memory_core::graph_query::{
     query_graph as run_query_graph, GraphQuery, GraphQueryResult, GraphQueryTraversal,
     PayloadArrayMinLen,
@@ -11,6 +11,12 @@ use database_memory_core::graph_store::{GraphNodeRecord, GraphStore};
 use database_memory_core::impact_analysis::{
     impact_analysis_bounded as run_impact_analysis, Direction, ImpactAnalysisResult,
 };
+use database_memory_core::interface_contract::{
+    describe_object as describe_generic_object, describe_snapshot, index_complete_source,
+    list_objects as list_generic_objects, list_snapshot_summaries, product_contract,
+    CompleteIndexRequest, InterfaceError, InterfaceStage, DEFAULT_TIMEOUT_MS,
+    INTERFACE_CONTRACT_VERSION,
+};
 use database_memory_core::relationship_trace::{
     trace_relationships_bounded as run_trace_relationships, GraphPath,
 };
@@ -18,8 +24,8 @@ use database_memory_core::schema_diff::{
     schema_diff_bounded as run_schema_diff, BoundedSchemaDiff,
 };
 use database_memory_core::{
-    capability_warnings, introspect_schema_source, ColumnObject, ConstraintKind, ConstraintObject,
-    IndexObject, ObjectKey, ObjectKind,
+    capability_warnings, ColumnObject, ConstraintKind, ConstraintObject, IndexObject, ObjectKey,
+    ObjectKind,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -41,29 +47,27 @@ struct Page<T> {
 
 pub(crate) fn index_database_for_request(
     request: IndexDatabaseRequest,
-) -> Result<IndexDatabaseResult, String> {
+) -> Result<IndexDatabaseResult, InterfaceError> {
     let cache_path = cache_path(request.cache_path);
-    ensure_parent_dir(&cache_path).map_err(|err| err.to_string())?;
-    let source_path = request.path.as_deref().map(Path::new);
-    let snapshot = introspect_schema_source(
-        &request.source,
-        source_path,
-        request.connection_string.as_deref(),
-        &request.alias,
-    )?;
-    let store = GraphStore::open(&cache_path).map_err(|err| err.to_string())?;
-    let snapshot_key = format!("{}:{}", request.source, request.alias);
-    insert_schema_snapshot_graph(&store, &snapshot_key, now_unix_ms(), &snapshot)
-        .map_err(|err| err.to_string())?;
-
-    Ok(IndexDatabaseResult {
-        snapshot_key,
-        tables_indexed: snapshot.tables.len(),
-        columns_indexed: snapshot.columns.len(),
-        constraints_indexed: snapshot.constraints.len(),
-        indexes_indexed: snapshot.indexes.len(),
-        cache_path: cache_path.display().to_string(),
-    })
+    ensure_parent_dir(&cache_path)
+        .map_err(|error| InterfaceError::storage("could not create cache directory", error))?;
+    let mut complete = CompleteIndexRequest::new(
+        request.source,
+        request.path.map(PathBuf::from),
+        request.connection_string,
+        request.alias,
+    );
+    complete.requested_catalogs = request.requested_catalogs;
+    complete.requested_schemas = request.requested_schemas;
+    complete.timeout_ms = request.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+    let store = GraphStore::open(&cache_path)
+        .map_err(|error| InterfaceError::storage("could not open graph cache", error))?;
+    index_complete_source(
+        &store,
+        &complete,
+        now_unix_ms(),
+        cache_path.display().to_string(),
+    )
 }
 
 pub(crate) fn list_databases_for_request(
@@ -78,22 +82,112 @@ pub(crate) fn list_databases_for_request(
     }
 
     let store = GraphStore::open(&cache_path).map_err(|err| err.to_string())?;
-    let snapshots = store
-        .list_snapshots()
-        .map_err(|err| err.to_string())?
-        .into_iter()
-        .map(|snapshot| SnapshotSummary {
-            alias: alias_from_snapshot_key(&snapshot.snapshot_key),
-            snapshot_key: snapshot.snapshot_key,
-            source: snapshot.source,
-            captured_at_unix_ms: snapshot.captured_at_unix_ms,
-        })
-        .collect();
+    let snapshots = list_snapshot_summaries(&store).map_err(|error| error.to_string())?;
 
     Ok(ListDatabasesResult {
         cache_path: cache_path.display().to_string(),
         snapshots,
     })
+}
+
+pub(crate) fn get_contract_for_request(_: GetContractRequest) -> GetContractResult {
+    product_contract()
+}
+
+pub(crate) fn list_snapshots_for_request(
+    request: ListSnapshotsRequest,
+) -> Result<ListSnapshotsResult, InterfaceError> {
+    let cache_path = cache_path(request.cache_path);
+    if !cache_path.exists() {
+        return Ok(ListSnapshotsResult {
+            contract_version: INTERFACE_CONTRACT_VERSION,
+            cache_path: cache_path.display().to_string(),
+            snapshots: Vec::new(),
+        });
+    }
+    let store = GraphStore::open(&cache_path)
+        .map_err(|error| InterfaceError::storage("could not open graph cache", error))?;
+    Ok(ListSnapshotsResult {
+        contract_version: INTERFACE_CONTRACT_VERSION,
+        cache_path: cache_path.display().to_string(),
+        snapshots: list_snapshot_summaries(&store)?,
+    })
+}
+
+pub(crate) fn describe_snapshot_for_request(
+    request: DescribeSnapshotRequest,
+) -> Result<DescribeSnapshotResult, InterfaceError> {
+    let cache_path = cache_path(request.cache_path);
+    let store = open_existing_contract_store(&cache_path)?;
+    describe_snapshot(&store, &request.snapshot)
+}
+
+pub(crate) fn list_objects_for_request(
+    request: ListObjectsRequest,
+) -> Result<ObjectsResult, InterfaceError> {
+    let cache_path = cache_path(request.cache_path);
+    let store = open_existing_contract_store(&cache_path)?;
+    list_generic_objects(
+        &store,
+        &request.snapshot,
+        parse_object_kind(request.kind.as_deref())?,
+        None,
+        request.offset.unwrap_or(0),
+        request.limit,
+    )
+}
+
+pub(crate) fn find_objects_for_request(
+    request: FindObjectsRequest,
+) -> Result<ObjectsResult, InterfaceError> {
+    let cache_path = cache_path(request.cache_path);
+    let store = open_existing_contract_store(&cache_path)?;
+    list_generic_objects(
+        &store,
+        &request.snapshot,
+        parse_object_kind(request.kind.as_deref())?,
+        Some(&request.query),
+        request.offset.unwrap_or(0),
+        request.limit,
+    )
+}
+
+pub(crate) fn describe_object_for_request(
+    request: DescribeObjectRequest,
+) -> Result<DescribeObjectResult, InterfaceError> {
+    let cache_path = cache_path(request.cache_path);
+    let store = open_existing_contract_store(&cache_path)?;
+    describe_generic_object(
+        &store,
+        &request.snapshot,
+        &request.object_key,
+        request.relationship_limit,
+    )
+}
+
+fn parse_object_kind(kind: Option<&str>) -> Result<Option<ObjectKind>, InterfaceError> {
+    kind.map(|kind| {
+        kind.parse().map_err(|_| {
+            InterfaceError::invalid_request(
+                InterfaceStage::ObjectLookup,
+                format!("unknown object kind '{kind}'"),
+                "use an object kind listed by get_contract",
+            )
+        })
+    })
+    .transpose()
+}
+
+fn open_existing_contract_store(cache_path: &Path) -> Result<GraphStore, InterfaceError> {
+    if !cache_path.exists() {
+        return Err(InterfaceError::invalid_request(
+            InterfaceStage::SnapshotLookup,
+            format!("cache path '{}' was not found", cache_path.display()),
+            "run index_database first or provide an existing cache_path",
+        ));
+    }
+    GraphStore::open(cache_path)
+        .map_err(|error| InterfaceError::storage("could not open graph cache", error))
 }
 
 pub(crate) fn list_tables_for_request(
@@ -980,8 +1074,19 @@ fn schema_diff_json(
     })
 }
 
-pub(crate) fn tool_json<T: Serialize>(result: Result<T, String>) -> Result<String, String> {
-    result.and_then(|value| serde_json::to_string(&value).map_err(|error| error.to_string()))
+pub(crate) fn tool_json<T, E>(result: Result<T, E>) -> Result<String, String>
+where
+    T: Serialize,
+    E: Serialize + fmt::Display,
+{
+    match result {
+        Ok(value) => serde_json::to_string(&value).map_err(|error| error.to_string()),
+        Err(error) => Err(serde_json::to_string(&json!({
+            "status": "failed",
+            "error": error,
+        }))
+        .unwrap_or_else(|_| error.to_string())),
+    }
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<(), std::io::Error> {
