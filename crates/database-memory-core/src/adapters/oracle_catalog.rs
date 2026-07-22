@@ -955,6 +955,86 @@ struct RawPartitionKeyColumn {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct RawLob {
+    owner: String,
+    table: String,
+    column: String,
+    segment_name: String,
+    tablespace: Option<String>,
+    index_name: String,
+    chunk: i64,
+    pctversion: Option<i64>,
+    retention: Option<i64>,
+    freepools: Option<i64>,
+    cache: String,
+    logging: String,
+    encrypt: String,
+    compression: String,
+    deduplication: String,
+    in_row: String,
+    format: String,
+    partitioned: String,
+    securefile: String,
+    segment_created: String,
+    retention_type: Option<String>,
+    retention_value: Option<i64>,
+    value_based: Option<String>,
+    max_inline: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawLobPartition {
+    owner: String,
+    table: String,
+    column: String,
+    lob_name: String,
+    table_partition: String,
+    name: String,
+    index_partition_name: String,
+    position: i64,
+    composite: String,
+    chunk: i64,
+    pctversion: Option<i64>,
+    cache: String,
+    in_row: String,
+    tablespace: Option<String>,
+    retention: Option<String>,
+    logging: String,
+    encrypt: String,
+    compression: String,
+    deduplication: String,
+    securefile: String,
+    segment_created: String,
+    max_inline: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawLobSubpartition {
+    owner: String,
+    table: String,
+    column: String,
+    lob_name: String,
+    lob_partition_name: String,
+    table_subpartition: String,
+    name: String,
+    index_subpartition_name: String,
+    position: i64,
+    chunk: i64,
+    pctversion: Option<i64>,
+    cache: String,
+    in_row: String,
+    tablespace: Option<String>,
+    retention: Option<String>,
+    logging: String,
+    encrypt: String,
+    compression: String,
+    deduplication: String,
+    securefile: String,
+    segment_created: String,
+    max_inline: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RawUserType {
     owner: String,
     name: String,
@@ -1241,6 +1321,9 @@ struct RawOracleCatalog {
     index_partitions: Vec<RawIndexPartition>,
     index_subpartitions: Vec<RawIndexSubpartition>,
     partition_key_columns: Vec<RawPartitionKeyColumn>,
+    lobs: Vec<RawLob>,
+    lob_partitions: Vec<RawLobPartition>,
+    lob_subpartitions: Vec<RawLobSubpartition>,
     dependencies: Vec<RawDependency>,
 }
 
@@ -1320,6 +1403,12 @@ impl RawOracleCatalog {
             .map_err(|error| error.catalog_context("index-subpartition"))?;
         let partition_key_columns = read_partition_key_columns(connection, scope, deadline)
             .map_err(|error| error.catalog_context("partition-key-column"))?;
+        let lobs =
+            read_lobs(connection, scope, deadline).map_err(|error| error.catalog_context("lob"))?;
+        let lob_partitions = read_lob_partitions(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("lob-partition"))?;
+        let lob_subpartitions = read_lob_subpartitions(connection, scope, deadline)
+            .map_err(|error| error.catalog_context("lob-subpartition"))?;
         let dependencies = read_dependencies(connection, scope, deadline)
             .map_err(|error| error.catalog_context("dependency"))?;
         if Instant::now() >= deadline {
@@ -1355,6 +1444,9 @@ impl RawOracleCatalog {
             index_partitions,
             index_subpartitions,
             partition_key_columns,
+            lobs,
+            lob_partitions,
+            lob_subpartitions,
             dependencies,
         })
     }
@@ -4544,6 +4636,7 @@ fn read_indexes(
                 JOIN USER_TABLES t ON t.TABLE_NAME = i.TABLE_NAME
                 WHERE t.SECONDARY = 'N'
                   AND t.DROPPED = 'NO'
+                  AND i.INDEX_TYPE <> 'LOB'
                 ORDER BY i.TABLE_NAME, i.INDEX_NAME
                 "
             }
@@ -4570,6 +4663,7 @@ fn read_indexes(
                 WHERE i.TABLE_OWNER = :1
                   AND t.SECONDARY = 'N'
                   AND t.DROPPED = 'NO'
+                  AND i.INDEX_TYPE <> 'LOB'
                 ORDER BY i.OWNER, i.TABLE_NAME, i.INDEX_NAME
                 "
             }
@@ -4661,6 +4755,7 @@ fn attach_index_columns(
                 JOIN USER_TABLES t ON t.TABLE_NAME = ic.TABLE_NAME
                 WHERE t.SECONDARY = 'N'
                   AND t.DROPPED = 'NO'
+                  AND i.INDEX_TYPE <> 'LOB'
                 ORDER BY ic.TABLE_NAME, ic.INDEX_NAME, ic.COLUMN_POSITION
                 "
             }
@@ -4685,6 +4780,7 @@ fn attach_index_columns(
                 WHERE ic.TABLE_OWNER = :1
                   AND t.SECONDARY = 'N'
                   AND t.DROPPED = 'NO'
+                  AND i.INDEX_TYPE <> 'LOB'
                 ORDER BY ic.INDEX_OWNER, ic.TABLE_NAME, ic.INDEX_NAME, ic.COLUMN_POSITION
                 "
             }
@@ -5062,8 +5158,16 @@ fn read_partitioned_indexes(
     for owner in &scope.owners {
         prepare_call(connection, deadline)?;
         let (view, owner_expression, owner_filter) = match scope.mode {
-            DictionaryScopeMode::User => ("USER_PART_INDEXES", ":1", ""),
-            DictionaryScopeMode::Dba => ("DBA_PART_INDEXES", "OWNER", "WHERE OWNER = :1"),
+            DictionaryScopeMode::User => (
+                "USER_PART_INDEXES",
+                ":1",
+                "WHERE INDEX_NAME IN (SELECT INDEX_NAME FROM USER_INDEXES WHERE INDEX_TYPE <> 'LOB')",
+            ),
+            DictionaryScopeMode::Dba => (
+                "DBA_PART_INDEXES",
+                "OWNER",
+                "WHERE OWNER = :1 AND INDEX_NAME IN (SELECT INDEX_NAME FROM DBA_INDEXES WHERE OWNER = :1 AND INDEX_TYPE <> 'LOB')",
+            ),
         };
         let sql = format!(
             "
@@ -5155,11 +5259,15 @@ fn read_index_partitions(
     for owner in &scope.owners {
         prepare_call(connection, deadline)?;
         let (view, owner_expression, owner_filter) = match scope.mode {
-            DictionaryScopeMode::User => ("USER_IND_PARTITIONS", ":1", ""),
+            DictionaryScopeMode::User => (
+                "USER_IND_PARTITIONS",
+                ":1",
+                "WHERE INDEX_NAME IN (SELECT INDEX_NAME FROM USER_INDEXES WHERE INDEX_TYPE <> 'LOB')",
+            ),
             DictionaryScopeMode::Dba => (
                 "DBA_IND_PARTITIONS",
                 "INDEX_OWNER",
-                "WHERE INDEX_OWNER = :1",
+                "WHERE INDEX_OWNER = :1 AND INDEX_NAME IN (SELECT INDEX_NAME FROM DBA_INDEXES WHERE OWNER = :1 AND INDEX_TYPE <> 'LOB')",
             ),
         };
         let sql = format!(
@@ -5252,11 +5360,15 @@ fn read_index_subpartitions(
     for owner in &scope.owners {
         prepare_call(connection, deadline)?;
         let (view, owner_expression, owner_filter) = match scope.mode {
-            DictionaryScopeMode::User => ("USER_IND_SUBPARTITIONS", ":1", ""),
+            DictionaryScopeMode::User => (
+                "USER_IND_SUBPARTITIONS",
+                ":1",
+                "WHERE INDEX_NAME IN (SELECT INDEX_NAME FROM USER_INDEXES WHERE INDEX_TYPE <> 'LOB')",
+            ),
             DictionaryScopeMode::Dba => (
                 "DBA_IND_SUBPARTITIONS",
                 "INDEX_OWNER",
-                "WHERE INDEX_OWNER = :1",
+                "WHERE INDEX_OWNER = :1 AND INDEX_NAME IN (SELECT INDEX_NAME FROM DBA_INDEXES WHERE OWNER = :1 AND INDEX_TYPE <> 'LOB')",
             ),
         };
         let sql = format!(
@@ -5346,14 +5458,26 @@ fn read_partition_key_columns(
         for owner in &scope.owners {
             prepare_call(connection, deadline)?;
             let (view, owner_expression, owner_filter) = match (scope.mode, subpartition) {
-                (DictionaryScopeMode::User, false) => ("USER_PART_KEY_COLUMNS", ":1", ""),
-                (DictionaryScopeMode::User, true) => ("USER_SUBPART_KEY_COLUMNS", ":1", ""),
-                (DictionaryScopeMode::Dba, false) => {
-                    ("DBA_PART_KEY_COLUMNS", "OWNER", "WHERE OWNER = :1")
-                }
-                (DictionaryScopeMode::Dba, true) => {
-                    ("DBA_SUBPART_KEY_COLUMNS", "OWNER", "WHERE OWNER = :1")
-                }
+                (DictionaryScopeMode::User, false) => (
+                    "USER_PART_KEY_COLUMNS",
+                    ":1",
+                    "WHERE OBJECT_TYPE <> 'INDEX' OR NAME NOT IN (SELECT INDEX_NAME FROM USER_INDEXES WHERE INDEX_TYPE = 'LOB')",
+                ),
+                (DictionaryScopeMode::User, true) => (
+                    "USER_SUBPART_KEY_COLUMNS",
+                    ":1",
+                    "WHERE OBJECT_TYPE <> 'INDEX' OR NAME NOT IN (SELECT INDEX_NAME FROM USER_INDEXES WHERE INDEX_TYPE = 'LOB')",
+                ),
+                (DictionaryScopeMode::Dba, false) => (
+                    "DBA_PART_KEY_COLUMNS",
+                    "OWNER",
+                    "WHERE OWNER = :1 AND (OBJECT_TYPE <> 'INDEX' OR NAME NOT IN (SELECT INDEX_NAME FROM DBA_INDEXES WHERE OWNER = :1 AND INDEX_TYPE = 'LOB'))",
+                ),
+                (DictionaryScopeMode::Dba, true) => (
+                    "DBA_SUBPART_KEY_COLUMNS",
+                    "OWNER",
+                    "WHERE OWNER = :1 AND (OBJECT_TYPE <> 'INDEX' OR NAME NOT IN (SELECT INDEX_NAME FROM DBA_INDEXES WHERE OWNER = :1 AND INDEX_TYPE = 'LOB'))",
+                ),
             };
             let sql = format!(
                 "
@@ -5401,6 +5525,406 @@ fn read_partition_key_columns(
             ))
     });
     Ok(columns)
+}
+
+fn read_lobs(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawLob>, CatalogError> {
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+    );
+    let mut lobs = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let (view, owner_expression, owner_filter) = match scope.mode {
+            DictionaryScopeMode::User => ("USER_LOBS", ":1", ""),
+            DictionaryScopeMode::Dba => ("DBA_LOBS", "OWNER", "WHERE OWNER = :1"),
+        };
+        let sql = format!(
+            "
+            SELECT {owner_expression},
+                   TABLE_NAME,
+                   COLUMN_NAME,
+                   SEGMENT_NAME,
+                   TABLESPACE_NAME,
+                   INDEX_NAME,
+                   CHUNK,
+                   PCTVERSION,
+                   RETENTION,
+                   FREEPOOLS,
+                   CACHE,
+                   LOGGING,
+                   ENCRYPT,
+                   COMPRESSION,
+                   DEDUPLICATION,
+                   IN_ROW,
+                   FORMAT,
+                   PARTITIONED,
+                   SECUREFILE,
+                   SEGMENT_CREATED,
+                   RETENTION_TYPE,
+                   RETENTION_VALUE,
+                   VALUE_BASED,
+                   MAX_INLINE
+            FROM {view}
+            {owner_filter}
+            ORDER BY TABLE_NAME, COLUMN_NAME
+            "
+        );
+        for row in connection.query_as::<Row>(&sql, &[owner])? {
+            let (
+                owner,
+                table,
+                column,
+                segment_name,
+                tablespace,
+                index_name,
+                chunk,
+                pctversion,
+                retention,
+                freepools,
+                cache,
+                logging,
+                encrypt,
+                compression,
+                deduplication,
+                in_row,
+                format,
+                partitioned,
+                securefile,
+                segment_created,
+                retention_type,
+                retention_value,
+                value_based,
+                max_inline,
+            ) = row?;
+            lobs.push(RawLob {
+                owner,
+                table,
+                column,
+                segment_name,
+                tablespace: normalize_optional_token(tablespace),
+                index_name,
+                chunk,
+                pctversion,
+                retention,
+                freepools,
+                cache: cache.trim().to_owned(),
+                logging: logging.trim().to_owned(),
+                encrypt: encrypt.trim().to_owned(),
+                compression: compression.trim().to_owned(),
+                deduplication: deduplication.trim().to_owned(),
+                in_row: in_row.trim().to_owned(),
+                format: format.trim().to_owned(),
+                partitioned: partitioned.trim().to_owned(),
+                securefile: securefile.trim().to_owned(),
+                segment_created: segment_created.trim().to_owned(),
+                retention_type: normalize_optional_token(retention_type),
+                retention_value,
+                value_based: normalize_optional_token(value_based),
+                max_inline,
+            });
+        }
+    }
+    lobs.sort_by(|left, right| {
+        (&left.owner, &left.table, &left.column).cmp(&(&right.owner, &right.table, &right.column))
+    });
+    Ok(lobs)
+}
+
+fn read_lob_partitions(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawLobPartition>, CatalogError> {
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        i64,
+        Option<i64>,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<i64>,
+    );
+    let mut partitions = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let (view, owner_expression, owner_filter) = match scope.mode {
+            DictionaryScopeMode::User => ("USER_LOB_PARTITIONS", ":1", ""),
+            DictionaryScopeMode::Dba => (
+                "DBA_LOB_PARTITIONS",
+                "TABLE_OWNER",
+                "WHERE TABLE_OWNER = :1",
+            ),
+        };
+        let sql = format!(
+            "
+            SELECT {owner_expression},
+                   TABLE_NAME,
+                   COLUMN_NAME,
+                   LOB_NAME,
+                   PARTITION_NAME,
+                   LOB_PARTITION_NAME,
+                   LOB_INDPART_NAME,
+                   PARTITION_POSITION,
+                   COMPOSITE,
+                   CHUNK,
+                   PCTVERSION,
+                   CACHE,
+                   IN_ROW,
+                   TABLESPACE_NAME,
+                   RETENTION,
+                   LOGGING,
+                   ENCRYPT,
+                   COMPRESSION,
+                   DEDUPLICATION,
+                   SECUREFILE,
+                   SEGMENT_CREATED,
+                   MAX_INLINE
+            FROM {view}
+            {owner_filter}
+            ORDER BY TABLE_NAME, COLUMN_NAME, PARTITION_POSITION
+            "
+        );
+        for row in connection.query_as::<Row>(&sql, &[owner])? {
+            let (
+                owner,
+                table,
+                column,
+                lob_name,
+                table_partition,
+                name,
+                index_partition_name,
+                position,
+                composite,
+                chunk,
+                pctversion,
+                cache,
+                in_row,
+                tablespace,
+                retention,
+                logging,
+                encrypt,
+                compression,
+                deduplication,
+                securefile,
+                segment_created,
+                max_inline,
+            ) = row?;
+            partitions.push(RawLobPartition {
+                owner,
+                table,
+                column,
+                lob_name,
+                table_partition,
+                name,
+                index_partition_name,
+                position,
+                composite: composite.trim().to_owned(),
+                chunk,
+                pctversion,
+                cache: cache.trim().to_owned(),
+                in_row: in_row.trim().to_owned(),
+                tablespace: normalize_optional_token(tablespace),
+                retention: normalize_optional_token(retention),
+                logging: logging.trim().to_owned(),
+                encrypt: encrypt.trim().to_owned(),
+                compression: compression.trim().to_owned(),
+                deduplication: deduplication.trim().to_owned(),
+                securefile: securefile.trim().to_owned(),
+                segment_created: segment_created.trim().to_owned(),
+                max_inline,
+            });
+        }
+    }
+    partitions.sort_by(|left, right| {
+        (&left.owner, &left.table, &left.column, left.position).cmp(&(
+            &right.owner,
+            &right.table,
+            &right.column,
+            right.position,
+        ))
+    });
+    Ok(partitions)
+}
+
+fn read_lob_subpartitions(
+    connection: &Connection,
+    scope: &DictionaryScope,
+    deadline: Instant,
+) -> Result<Vec<RawLobSubpartition>, CatalogError> {
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        Option<i64>,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<i64>,
+    );
+    let mut subpartitions = Vec::new();
+    for owner in &scope.owners {
+        prepare_call(connection, deadline)?;
+        let (view, owner_expression, owner_filter) = match scope.mode {
+            DictionaryScopeMode::User => ("USER_LOB_SUBPARTITIONS", ":1", ""),
+            DictionaryScopeMode::Dba => (
+                "DBA_LOB_SUBPARTITIONS",
+                "TABLE_OWNER",
+                "WHERE TABLE_OWNER = :1",
+            ),
+        };
+        let sql = format!(
+            "
+            SELECT {owner_expression},
+                   TABLE_NAME,
+                   COLUMN_NAME,
+                   LOB_NAME,
+                   LOB_PARTITION_NAME,
+                   SUBPARTITION_NAME,
+                   LOB_SUBPARTITION_NAME,
+                   LOB_INDSUBPART_NAME,
+                   SUBPARTITION_POSITION,
+                   CHUNK,
+                   PCTVERSION,
+                   CACHE,
+                   IN_ROW,
+                   TABLESPACE_NAME,
+                   RETENTION,
+                   LOGGING,
+                   ENCRYPT,
+                   COMPRESSION,
+                   DEDUPLICATION,
+                   SECUREFILE,
+                   SEGMENT_CREATED,
+                   MAX_INLINE
+            FROM {view}
+            {owner_filter}
+            ORDER BY TABLE_NAME, COLUMN_NAME, LOB_PARTITION_NAME, SUBPARTITION_POSITION
+            "
+        );
+        for row in connection.query_as::<Row>(&sql, &[owner])? {
+            let (
+                owner,
+                table,
+                column,
+                lob_name,
+                lob_partition_name,
+                table_subpartition,
+                name,
+                index_subpartition_name,
+                position,
+                chunk,
+                pctversion,
+                cache,
+                in_row,
+                tablespace,
+                retention,
+                logging,
+                encrypt,
+                compression,
+                deduplication,
+                securefile,
+                segment_created,
+                max_inline,
+            ) = row?;
+            subpartitions.push(RawLobSubpartition {
+                owner,
+                table,
+                column,
+                lob_name,
+                lob_partition_name,
+                table_subpartition,
+                name,
+                index_subpartition_name,
+                position,
+                chunk,
+                pctversion,
+                cache: cache.trim().to_owned(),
+                in_row: in_row.trim().to_owned(),
+                tablespace: normalize_optional_token(tablespace),
+                retention: normalize_optional_token(retention),
+                logging: logging.trim().to_owned(),
+                encrypt: encrypt.trim().to_owned(),
+                compression: compression.trim().to_owned(),
+                deduplication: deduplication.trim().to_owned(),
+                securefile: securefile.trim().to_owned(),
+                segment_created: segment_created.trim().to_owned(),
+                max_inline,
+            });
+        }
+    }
+    subpartitions.sort_by(|left, right| {
+        (
+            &left.owner,
+            &left.table,
+            &left.column,
+            &left.lob_partition_name,
+            left.position,
+        )
+            .cmp(&(
+                &right.owner,
+                &right.table,
+                &right.column,
+                &right.lob_partition_name,
+                right.position,
+            ))
+    });
+    Ok(subpartitions)
 }
 
 fn normalize_partition_high_value(
@@ -5629,6 +6153,9 @@ fn validate_raw_catalog(
                     | "TABLE SUBPARTITION"
                     | "INDEX PARTITION"
                     | "INDEX SUBPARTITION"
+                    | "LOB"
+                    | "LOB PARTITION"
+                    | "LOB SUBPARTITION"
             )
         })
         .take(8)
@@ -5664,7 +6191,12 @@ fn validate_raw_catalog(
         }
         let partition_subobject = matches!(
             object.object_type.as_str(),
-            "TABLE PARTITION" | "TABLE SUBPARTITION" | "INDEX PARTITION" | "INDEX SUBPARTITION"
+            "TABLE PARTITION"
+                | "TABLE SUBPARTITION"
+                | "INDEX PARTITION"
+                | "INDEX SUBPARTITION"
+                | "LOB PARTITION"
+                | "LOB SUBPARTITION"
         );
         if partition_subobject != object.subobject.is_some() {
             return Err(CatalogError::Mapping(format!(
@@ -7523,10 +8055,10 @@ fn validate_raw_catalog(
         .iter()
         .filter(|object| object.object_type == "INDEX")
         .count();
-    if inventory_index_count != raw.indexes.len() {
+    if inventory_index_count != raw.indexes.len() + raw.lobs.len() {
         return Err(CatalogError::Mapping(format!(
-            "Oracle index inventory mismatch: USER/DBA_OBJECTS reports {inventory_index_count}, USER/DBA_INDEXES reports {}",
-            raw.indexes.len()
+            "Oracle index inventory mismatch: USER/DBA_OBJECTS reports {inventory_index_count}, regular indexes plus LOB indexes report {}",
+            raw.indexes.len() + raw.lobs.len()
         )));
     }
 
@@ -7537,6 +8069,14 @@ fn validate_raw_catalog(
         &tables,
         &column_keys,
         &indexes,
+    )?;
+    validate_lob_catalog(
+        raw,
+        scope,
+        &inventory_keys,
+        &inventory_subobject_keys,
+        &tables,
+        &column_keys,
     )?;
 
     Ok(())
@@ -7550,6 +8090,11 @@ fn validate_partition_catalog(
     column_keys: &BTreeSet<(String, String, String)>,
     indexes: &BTreeSet<(String, String)>,
 ) -> Result<(), CatalogError> {
+    let lob_index_names = raw
+        .lobs
+        .iter()
+        .map(|lob| (lob.owner.clone(), lob.index_name.clone()))
+        .collect::<BTreeSet<_>>();
     let raw_tables = raw
         .tables
         .iter()
@@ -7977,7 +8522,9 @@ fn validate_partition_catalog(
     }
     let inventory_index_partition_count = inventory_subobject_keys
         .iter()
-        .filter(|key| key.1 == "INDEX PARTITION")
+        .filter(|key| {
+            key.1 == "INDEX PARTITION" && !lob_index_names.contains(&(key.0.clone(), key.2.clone()))
+        })
         .count();
     if inventory_index_partition_count != raw.index_partitions.len() {
         return Err(CatalogError::Mapping(format!(
@@ -8068,7 +8615,10 @@ fn validate_partition_catalog(
     }
     let inventory_index_subpartition_count = inventory_subobject_keys
         .iter()
-        .filter(|key| key.1 == "INDEX SUBPARTITION")
+        .filter(|key| {
+            key.1 == "INDEX SUBPARTITION"
+                && !lob_index_names.contains(&(key.0.clone(), key.2.clone()))
+        })
         .count();
     if inventory_index_subpartition_count != raw.index_subpartitions.len() {
         return Err(CatalogError::Mapping(format!(
@@ -8215,6 +8765,464 @@ fn validate_partition_catalog(
         return Err(CatalogError::Mapping(
             "Oracle partition-key catalogs contain unclaimed or missing rows".to_owned(),
         ));
+    }
+
+    Ok(())
+}
+
+fn validate_lob_catalog(
+    raw: &RawOracleCatalog,
+    scope: &DictionaryScope,
+    inventory_keys: &BTreeSet<(String, String, String)>,
+    inventory_subobject_keys: &BTreeSet<(String, String, String, String)>,
+    tables: &BTreeSet<(String, String)>,
+    column_keys: &BTreeSet<(String, String, String)>,
+) -> Result<(), CatalogError> {
+    let raw_tables = raw
+        .tables
+        .iter()
+        .map(|table| ((table.owner.clone(), table.name.clone()), table))
+        .collect::<BTreeMap<_, _>>();
+    let mut lobs = BTreeMap::new();
+    let mut segment_names = BTreeSet::new();
+    let mut index_names = BTreeSet::new();
+    for lob in &raw.lobs {
+        ensure_owner(scope, &lob.owner, "LOB")?;
+        let table = raw_tables
+            .get(&(lob.owner.clone(), lob.table.clone()))
+            .copied()
+            .ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle LOB {}.{}.{} has no parent table",
+                    lob.owner, lob.table, lob.column
+                ))
+            })?;
+        if !tables.contains(&(lob.owner.clone(), lob.table.clone()))
+            || !column_keys.contains(&(lob.owner.clone(), lob.table.clone(), lob.column.clone()))
+        {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle LOB {}.{}.{} has no parent column",
+                lob.owner, lob.table, lob.column
+            )));
+        }
+        ensure_yes_no(
+            &lob.partitioned,
+            &format!(
+                "Oracle LOB {}.{}.{} partitioned",
+                lob.owner, lob.table, lob.column
+            ),
+        )?;
+        ensure_yes_no(
+            &lob.securefile,
+            &format!(
+                "Oracle LOB {}.{}.{} securefile",
+                lob.owner, lob.table, lob.column
+            ),
+        )?;
+        if (lob.partitioned == "YES") != table.partitioned
+            || lob.chunk <= 0
+            || lob.pctversion.is_some_and(|value| value < 0)
+            || lob.retention.is_some_and(|value| value < 0)
+            || lob.freepools.is_some_and(|value| value < 0)
+            || lob.retention_value.is_some_and(|value| value < 0)
+            || lob.max_inline.is_some_and(|value| value < 0)
+            || [
+                lob.cache.as_str(),
+                lob.logging.as_str(),
+                lob.encrypt.as_str(),
+                lob.compression.as_str(),
+                lob.deduplication.as_str(),
+                lob.in_row.as_str(),
+                lob.format.as_str(),
+                lob.segment_created.as_str(),
+            ]
+            .iter()
+            .any(|value| value.is_empty())
+        {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle LOB metadata is malformed for {}.{}.{}",
+                lob.owner, lob.table, lob.column
+            )));
+        }
+        if !inventory_keys.contains(&(
+            lob.owner.clone(),
+            "LOB".to_owned(),
+            lob.segment_name.clone(),
+        )) || !inventory_keys.contains(&(
+            lob.owner.clone(),
+            "INDEX".to_owned(),
+            lob.index_name.clone(),
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle LOB {}.{}.{} is missing its segment or index inventory row",
+                lob.owner, lob.table, lob.column
+            )));
+        }
+        if !segment_names.insert((lob.owner.clone(), lob.segment_name.clone()))
+            || !index_names.insert((lob.owner.clone(), lob.index_name.clone()))
+        {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle LOB segment or index identity for {}.{}.{}",
+                lob.owner, lob.table, lob.column
+            )));
+        }
+        let identity = (lob.owner.clone(), lob.table.clone(), lob.column.clone());
+        if lobs.insert(identity.clone(), lob).is_some() {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle LOB column {}.{}.{}",
+                identity.0, identity.1, identity.2
+            )));
+        }
+    }
+    let inventory_lob_count = inventory_keys.iter().filter(|key| key.1 == "LOB").count();
+    if inventory_lob_count != raw.lobs.len() {
+        return Err(CatalogError::Mapping(format!(
+            "Oracle LOB inventory mismatch: USER/DBA_OBJECTS reports {inventory_lob_count}, USER/DBA_LOBS reports {}",
+            raw.lobs.len()
+        )));
+    }
+
+    let table_partitions = raw
+        .table_partitions
+        .iter()
+        .map(|partition| {
+            (
+                (
+                    partition.owner.clone(),
+                    partition.table.clone(),
+                    partition.name.clone(),
+                ),
+                partition,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut lob_partitions = BTreeMap::new();
+    let mut lob_partitions_by_lob =
+        BTreeMap::<(String, String, String), Vec<&RawLobPartition>>::new();
+    let mut lob_index_partition_names = BTreeSet::new();
+    for partition in &raw.lob_partitions {
+        ensure_owner(scope, &partition.owner, "LOB partition")?;
+        let lob = lobs
+            .get(&(
+                partition.owner.clone(),
+                partition.table.clone(),
+                partition.column.clone(),
+            ))
+            .copied()
+            .ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle LOB partition {}.{}.{} has no parent LOB",
+                    partition.owner, partition.table, partition.name
+                ))
+            })?;
+        let table_partition = table_partitions
+            .get(&(
+                partition.owner.clone(),
+                partition.table.clone(),
+                partition.table_partition.clone(),
+            ))
+            .copied()
+            .ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle LOB partition {}.{}.{} has no table partition {}",
+                    partition.owner, partition.table, partition.name, partition.table_partition
+                ))
+            })?;
+        positive_u32(partition.position, "Oracle LOB partition position")?;
+        if lob.segment_name != partition.lob_name
+            || partition.position != table_partition.position
+            || partition.composite != table_partition.composite
+            || partition.chunk <= 0
+            || partition.pctversion.is_some_and(|value| value < 0)
+            || partition.max_inline.is_some_and(|value| value < 0)
+            || [
+                partition.cache.as_str(),
+                partition.in_row.as_str(),
+                partition.logging.as_str(),
+                partition.encrypt.as_str(),
+                partition.compression.as_str(),
+                partition.deduplication.as_str(),
+                partition.securefile.as_str(),
+                partition.segment_created.as_str(),
+            ]
+            .iter()
+            .any(|value| value.is_empty())
+        {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle LOB partition metadata is inconsistent for {}.{}.{}",
+                partition.owner, partition.table, partition.name
+            )));
+        }
+        if !inventory_subobject_keys.contains(&(
+            partition.owner.clone(),
+            "LOB PARTITION".to_owned(),
+            partition.lob_name.clone(),
+            partition.name.clone(),
+        )) || !inventory_subobject_keys.contains(&(
+            partition.owner.clone(),
+            "INDEX PARTITION".to_owned(),
+            lob.index_name.clone(),
+            partition.index_partition_name.clone(),
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle LOB partition {}.{}.{} is missing its segment or index inventory row",
+                partition.owner, partition.table, partition.name
+            )));
+        }
+        if !lob_index_partition_names.insert((
+            partition.owner.clone(),
+            lob.index_name.clone(),
+            partition.index_partition_name.clone(),
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle LOB index partition {}.{}",
+                partition.owner, partition.index_partition_name
+            )));
+        }
+        let identity = (
+            partition.owner.clone(),
+            partition.lob_name.clone(),
+            partition.name.clone(),
+        );
+        if lob_partitions.insert(identity.clone(), partition).is_some() {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle LOB partition {}.{}.{}",
+                identity.0, identity.1, identity.2
+            )));
+        }
+        lob_partitions_by_lob
+            .entry((
+                partition.owner.clone(),
+                partition.table.clone(),
+                partition.column.clone(),
+            ))
+            .or_default()
+            .push(partition);
+    }
+    for (identity, lob) in &lobs {
+        let partitions = lob_partitions_by_lob
+            .get(identity)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let expected = if lob.partitioned == "YES" {
+            raw.table_partitions
+                .iter()
+                .filter(|partition| partition.owner == lob.owner && partition.table == lob.table)
+                .count()
+        } else {
+            0
+        };
+        if partitions.len() != expected {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle LOB partition count mismatch for {}.{}.{}",
+                identity.0, identity.1, identity.2
+            )));
+        }
+        ensure_contiguous_positions(
+            partitions.iter().map(|partition| partition.position),
+            &format!(
+                "Oracle LOB partitions {}.{}.{}",
+                identity.0, identity.1, identity.2
+            ),
+        )?;
+    }
+    let inventory_lob_partition_count = inventory_subobject_keys
+        .iter()
+        .filter(|key| key.1 == "LOB PARTITION")
+        .count();
+    let inventory_lob_index_partition_count = inventory_subobject_keys
+        .iter()
+        .filter(|key| {
+            key.1 == "INDEX PARTITION" && index_names.contains(&(key.0.clone(), key.2.clone()))
+        })
+        .count();
+    if inventory_lob_partition_count != raw.lob_partitions.len()
+        || inventory_lob_index_partition_count != raw.lob_partitions.len()
+        || lob_index_partition_names.len() != raw.lob_partitions.len()
+    {
+        return Err(CatalogError::Mapping(format!(
+            "Oracle LOB-partition inventory mismatch: LOB={inventory_lob_partition_count}, INDEX={inventory_lob_index_partition_count}, catalog={}",
+            lob_index_partition_names.len()
+        )));
+    }
+
+    let table_subpartitions = raw
+        .table_subpartitions
+        .iter()
+        .map(|subpartition| {
+            (
+                (
+                    subpartition.owner.clone(),
+                    subpartition.table.clone(),
+                    subpartition.name.clone(),
+                ),
+                subpartition,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut lob_subpartition_identities = BTreeSet::new();
+    let mut lob_subpartitions_by_partition =
+        BTreeMap::<(String, String, String), Vec<&RawLobSubpartition>>::new();
+    let mut lob_index_subpartition_names = BTreeSet::new();
+    for subpartition in &raw.lob_subpartitions {
+        ensure_owner(scope, &subpartition.owner, "LOB subpartition")?;
+        let lob = lobs
+            .get(&(
+                subpartition.owner.clone(),
+                subpartition.table.clone(),
+                subpartition.column.clone(),
+            ))
+            .copied()
+            .ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle LOB subpartition {}.{}.{} has no parent LOB",
+                    subpartition.owner, subpartition.table, subpartition.name
+                ))
+            })?;
+        let parent = lob_partitions
+            .get(&(
+                subpartition.owner.clone(),
+                subpartition.lob_name.clone(),
+                subpartition.lob_partition_name.clone(),
+            ))
+            .copied()
+            .ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle LOB subpartition {}.{}.{} has no parent LOB partition",
+                    subpartition.owner, subpartition.table, subpartition.name
+                ))
+            })?;
+        let table_subpartition = table_subpartitions
+            .get(&(
+                subpartition.owner.clone(),
+                subpartition.table.clone(),
+                subpartition.table_subpartition.clone(),
+            ))
+            .copied()
+            .ok_or_else(|| {
+                CatalogError::Mapping(format!(
+                    "Oracle LOB subpartition {}.{}.{} has no table subpartition {}",
+                    subpartition.owner,
+                    subpartition.table,
+                    subpartition.name,
+                    subpartition.table_subpartition
+                ))
+            })?;
+        positive_u32(subpartition.position, "Oracle LOB subpartition position")?;
+        if subpartition.lob_name != lob.segment_name
+            || table_subpartition.partition != parent.table_partition
+            || subpartition.position != table_subpartition.position
+            || subpartition.chunk <= 0
+            || subpartition.pctversion.is_some_and(|value| value < 0)
+            || subpartition.max_inline.is_some_and(|value| value < 0)
+            || [
+                subpartition.cache.as_str(),
+                subpartition.in_row.as_str(),
+                subpartition.logging.as_str(),
+                subpartition.encrypt.as_str(),
+                subpartition.compression.as_str(),
+                subpartition.deduplication.as_str(),
+                subpartition.securefile.as_str(),
+                subpartition.segment_created.as_str(),
+            ]
+            .iter()
+            .any(|value| value.is_empty())
+        {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle LOB subpartition metadata is inconsistent for {}.{}.{}",
+                subpartition.owner, subpartition.table, subpartition.name
+            )));
+        }
+        if !inventory_subobject_keys.contains(&(
+            subpartition.owner.clone(),
+            "LOB SUBPARTITION".to_owned(),
+            subpartition.lob_name.clone(),
+            subpartition.name.clone(),
+        )) || !inventory_subobject_keys.contains(&(
+            subpartition.owner.clone(),
+            "INDEX SUBPARTITION".to_owned(),
+            lob.index_name.clone(),
+            subpartition.index_subpartition_name.clone(),
+        )) {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle LOB subpartition {}.{}.{} is missing its segment or index inventory row",
+                subpartition.owner, subpartition.table, subpartition.name
+            )));
+        }
+        let identity = (
+            subpartition.owner.clone(),
+            subpartition.lob_name.clone(),
+            subpartition.name.clone(),
+        );
+        if !lob_subpartition_identities.insert(identity.clone())
+            || !lob_index_subpartition_names.insert((
+                subpartition.owner.clone(),
+                lob.index_name.clone(),
+                subpartition.index_subpartition_name.clone(),
+            ))
+        {
+            return Err(CatalogError::Mapping(format!(
+                "duplicate Oracle LOB subpartition {}.{}.{}",
+                identity.0, identity.1, identity.2
+            )));
+        }
+        lob_subpartitions_by_partition
+            .entry((
+                subpartition.owner.clone(),
+                subpartition.lob_name.clone(),
+                subpartition.lob_partition_name.clone(),
+            ))
+            .or_default()
+            .push(subpartition);
+    }
+    for (identity, partition) in &lob_partitions {
+        let subpartitions = lob_subpartitions_by_partition
+            .get(identity)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let expected = table_partitions
+            .get(&(
+                partition.owner.clone(),
+                partition.table.clone(),
+                partition.table_partition.clone(),
+            ))
+            .map_or(0, |table_partition| {
+                table_partition.subpartition_count as usize
+            });
+        if subpartitions.len() != expected {
+            return Err(CatalogError::Mapping(format!(
+                "Oracle LOB subpartition count mismatch for {}.{}.{}",
+                identity.0, identity.1, identity.2
+            )));
+        }
+        ensure_contiguous_positions(
+            subpartitions
+                .iter()
+                .map(|subpartition| subpartition.position),
+            &format!(
+                "Oracle LOB subpartitions {}.{}.{}",
+                identity.0, identity.1, identity.2
+            ),
+        )?;
+    }
+    let inventory_lob_subpartition_count = inventory_subobject_keys
+        .iter()
+        .filter(|key| key.1 == "LOB SUBPARTITION")
+        .count();
+    let inventory_lob_index_subpartition_count = inventory_subobject_keys
+        .iter()
+        .filter(|key| {
+            key.1 == "INDEX SUBPARTITION" && index_names.contains(&(key.0.clone(), key.2.clone()))
+        })
+        .count();
+    if inventory_lob_subpartition_count != raw.lob_subpartitions.len()
+        || inventory_lob_index_subpartition_count != raw.lob_subpartitions.len()
+        || lob_index_subpartition_names.len() != raw.lob_subpartitions.len()
+    {
+        return Err(CatalogError::Mapping(format!(
+            "Oracle LOB-subpartition inventory mismatch: LOB={inventory_lob_subpartition_count}, INDEX={inventory_lob_index_subpartition_count}, catalog={}",
+            lob_index_subpartition_names.len()
+        )));
     }
 
     Ok(())
@@ -10610,6 +11618,7 @@ impl<'a> OracleSnapshotMapper<'a> {
                 properties: oracle_table_partition_properties(partition, inventory_object),
             });
         }
+        let mut table_subpartition_keys = BTreeMap::new();
         for subpartition in &raw.table_subpartitions {
             let parent_key = required(
                 table_partition_keys.get(&(
@@ -10645,6 +11654,14 @@ impl<'a> OracleSnapshotMapper<'a> {
                     subpartition.owner, subpartition.table, subpartition.name
                 ),
             )?;
+            table_subpartition_keys.insert(
+                (
+                    subpartition.owner.clone(),
+                    subpartition.table.clone(),
+                    subpartition.name.clone(),
+                ),
+                key.clone(),
+            );
             metadata.objects.push(MetadataObject {
                 key,
                 parent_key: Some(parent_key.clone()),
@@ -10746,6 +11763,268 @@ impl<'a> OracleSnapshotMapper<'a> {
                 extension_kind: Some("oracle_index_subpartition".to_owned()),
                 definition: subpartition.high_value.clone(),
                 properties: oracle_index_subpartition_properties(subpartition, inventory_object),
+            });
+        }
+
+        let mut lob_keys = BTreeMap::new();
+        for lob in &raw.lobs {
+            let parent_key = required(
+                column_keys.get(&(lob.owner.clone(), lob.table.clone(), lob.column.clone())),
+                format!(
+                    "parent column for Oracle LOB {}.{}.{}",
+                    lob.owner, lob.table, lob.column
+                ),
+            )?;
+            let segment_inventory = required(
+                inventory.get(&(
+                    lob.owner.clone(),
+                    "LOB".to_owned(),
+                    lob.segment_name.clone(),
+                )),
+                format!(
+                    "inventory row for Oracle LOB segment {}.{}",
+                    lob.owner, lob.segment_name
+                ),
+            )?;
+            let index_inventory = required(
+                inventory.get(&(
+                    lob.owner.clone(),
+                    "INDEX".to_owned(),
+                    lob.index_name.clone(),
+                )),
+                format!(
+                    "inventory row for Oracle LOB index {}.{}",
+                    lob.owner, lob.index_name
+                ),
+            )?;
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &lob.owner,
+                ObjectKind::Extension,
+                &lob.table,
+                Some(format!("column:{}:lob:{}", lob.column, lob.segment_name)),
+            );
+            lob_keys.insert(
+                (lob.owner.clone(), lob.table.clone(), lob.column.clone()),
+                key.clone(),
+            );
+            metadata.objects.push(MetadataObject {
+                key,
+                parent_key: Some(parent_key.clone()),
+                name: lob.segment_name.clone(),
+                extension_kind: Some("oracle_lob_storage".to_owned()),
+                definition: None,
+                properties: oracle_lob_properties(lob, segment_inventory, index_inventory),
+            });
+        }
+
+        let lobs_by_identity = raw
+            .lobs
+            .iter()
+            .map(|lob| {
+                (
+                    (lob.owner.clone(), lob.table.clone(), lob.column.clone()),
+                    lob,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut lob_partition_keys = BTreeMap::new();
+        for partition in &raw.lob_partitions {
+            let lob_identity = (
+                partition.owner.clone(),
+                partition.table.clone(),
+                partition.column.clone(),
+            );
+            let lob = required(
+                lobs_by_identity.get(&lob_identity),
+                format!(
+                    "parent LOB for Oracle partition {}.{}.{}",
+                    partition.owner, partition.table, partition.name
+                ),
+            )?;
+            let parent_key = required(
+                lob_keys.get(&lob_identity),
+                format!(
+                    "parent LOB key for Oracle partition {}.{}.{}",
+                    partition.owner, partition.table, partition.name
+                ),
+            )?;
+            let table_partition_key = required(
+                table_partition_keys.get(&(
+                    partition.owner.clone(),
+                    partition.table.clone(),
+                    partition.table_partition.clone(),
+                )),
+                format!(
+                    "table partition key for Oracle LOB partition {}.{}.{}",
+                    partition.owner, partition.table, partition.name
+                ),
+            )?;
+            let segment_inventory = required(
+                subobject_inventory.get(&(
+                    partition.owner.clone(),
+                    "LOB PARTITION".to_owned(),
+                    partition.lob_name.clone(),
+                    partition.name.clone(),
+                )),
+                format!(
+                    "inventory row for Oracle LOB partition {}.{}.{}",
+                    partition.owner, partition.table, partition.name
+                ),
+            )?;
+            let index_inventory = required(
+                subobject_inventory.get(&(
+                    partition.owner.clone(),
+                    "INDEX PARTITION".to_owned(),
+                    lob.index_name.clone(),
+                    partition.index_partition_name.clone(),
+                )),
+                format!(
+                    "inventory row for Oracle LOB index partition {}.{}",
+                    partition.owner, partition.index_partition_name
+                ),
+            )?;
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &partition.owner,
+                ObjectKind::Extension,
+                &partition.table,
+                Some(format!(
+                    "column:{}:lob:{}:partition:{}",
+                    partition.column, partition.lob_name, partition.name
+                )),
+            );
+            lob_partition_keys.insert(
+                (
+                    partition.owner.clone(),
+                    partition.lob_name.clone(),
+                    partition.name.clone(),
+                ),
+                key.clone(),
+            );
+            metadata.objects.push(MetadataObject {
+                key: key.clone(),
+                parent_key: Some(parent_key.clone()),
+                name: partition.name.clone(),
+                extension_kind: Some("oracle_lob_partition".to_owned()),
+                definition: None,
+                properties: oracle_lob_partition_properties(
+                    partition,
+                    segment_inventory,
+                    index_inventory,
+                ),
+            });
+            metadata.relationships.push(MetadataRelationship {
+                kind: MetadataRelationshipKind::Extension(
+                    "oracle_lob_partition_storage".to_owned(),
+                ),
+                from_key: key,
+                to_key: table_partition_key.clone(),
+                ordinal: Some(positive_u32(
+                    partition.position,
+                    "Oracle LOB partition relationship ordinal",
+                )?),
+                properties: BTreeMap::new(),
+            });
+        }
+
+        for subpartition in &raw.lob_subpartitions {
+            let lob = required(
+                lobs_by_identity.get(&(
+                    subpartition.owner.clone(),
+                    subpartition.table.clone(),
+                    subpartition.column.clone(),
+                )),
+                format!(
+                    "parent LOB for Oracle subpartition {}.{}.{}",
+                    subpartition.owner, subpartition.table, subpartition.name
+                ),
+            )?;
+            let parent_key = required(
+                lob_partition_keys.get(&(
+                    subpartition.owner.clone(),
+                    subpartition.lob_name.clone(),
+                    subpartition.lob_partition_name.clone(),
+                )),
+                format!(
+                    "parent LOB partition key for Oracle subpartition {}.{}.{}",
+                    subpartition.owner, subpartition.table, subpartition.name
+                ),
+            )?;
+            let table_subpartition_key = required(
+                table_subpartition_keys.get(&(
+                    subpartition.owner.clone(),
+                    subpartition.table.clone(),
+                    subpartition.table_subpartition.clone(),
+                )),
+                format!(
+                    "table subpartition key for Oracle LOB subpartition {}.{}.{}",
+                    subpartition.owner, subpartition.table, subpartition.name
+                ),
+            )?;
+            let segment_inventory = required(
+                subobject_inventory.get(&(
+                    subpartition.owner.clone(),
+                    "LOB SUBPARTITION".to_owned(),
+                    subpartition.lob_name.clone(),
+                    subpartition.name.clone(),
+                )),
+                format!(
+                    "inventory row for Oracle LOB subpartition {}.{}.{}",
+                    subpartition.owner, subpartition.table, subpartition.name
+                ),
+            )?;
+            let index_inventory = required(
+                subobject_inventory.get(&(
+                    subpartition.owner.clone(),
+                    "INDEX SUBPARTITION".to_owned(),
+                    lob.index_name.clone(),
+                    subpartition.index_subpartition_name.clone(),
+                )),
+                format!(
+                    "inventory row for Oracle LOB index subpartition {}.{}",
+                    subpartition.owner, subpartition.index_subpartition_name
+                ),
+            )?;
+            let key = oracle_key(
+                self.connection_alias,
+                &database_name,
+                &subpartition.owner,
+                ObjectKind::Extension,
+                &subpartition.table,
+                Some(format!(
+                    "column:{}:lob:{}:partition:{}:subpartition:{}",
+                    subpartition.column,
+                    subpartition.lob_name,
+                    subpartition.lob_partition_name,
+                    subpartition.name
+                )),
+            );
+            metadata.objects.push(MetadataObject {
+                key: key.clone(),
+                parent_key: Some(parent_key.clone()),
+                name: subpartition.name.clone(),
+                extension_kind: Some("oracle_lob_subpartition".to_owned()),
+                definition: None,
+                properties: oracle_lob_subpartition_properties(
+                    subpartition,
+                    segment_inventory,
+                    index_inventory,
+                ),
+            });
+            metadata.relationships.push(MetadataRelationship {
+                kind: MetadataRelationshipKind::Extension(
+                    "oracle_lob_subpartition_storage".to_owned(),
+                ),
+                from_key: key,
+                to_key: table_subpartition_key.clone(),
+                ordinal: Some(positive_u32(
+                    subpartition.position,
+                    "Oracle LOB subpartition relationship ordinal",
+                )?),
+                properties: BTreeMap::new(),
             });
         }
 
@@ -11076,7 +12355,7 @@ impl<'a> OracleSnapshotMapper<'a> {
                 CapabilityCheck {
                     name: "independent_inventory_reconciliation".to_owned(),
                     evidence: format!(
-                        "{} non-secondary USER/DBA_OBJECTS rows reconciled against table, index, partition, sequence, view, materialized-view, synonym, type, trigger, routine, and package detail catalogs",
+                        "{} non-secondary USER/DBA_OBJECTS rows reconciled against table, index, partition, LOB storage, sequence, view, materialized-view, synonym, type, trigger, routine, and package detail catalogs",
                         raw.inventory.iter().filter(|object| !object.secondary).count()
                     ),
                 },
@@ -11548,6 +12827,155 @@ fn oracle_index_subpartition_properties(
         &subpartition.segment_created,
     );
     properties
+}
+
+fn oracle_lob_properties(
+    lob: &RawLob,
+    segment_inventory: &RawInventoryObject,
+    index_inventory: &RawInventoryObject,
+) -> BTreeMap<String, MetadataValue> {
+    let mut properties = inventory_properties(segment_inventory);
+    insert_string(&mut properties, "column", &lob.column);
+    insert_string(&mut properties, "segment_name", &lob.segment_name);
+    insert_string(&mut properties, "index_name", &lob.index_name);
+    insert_optional_string(&mut properties, "tablespace", lob.tablespace.as_deref());
+    insert_i64(&mut properties, "chunk", lob.chunk);
+    insert_optional_i64(&mut properties, "pctversion", lob.pctversion);
+    insert_optional_i64(&mut properties, "retention", lob.retention);
+    insert_optional_i64(&mut properties, "freepools", lob.freepools);
+    insert_string(&mut properties, "cache", &lob.cache);
+    insert_string(&mut properties, "logging", &lob.logging);
+    insert_string(&mut properties, "encrypt", &lob.encrypt);
+    insert_string(&mut properties, "compression", &lob.compression);
+    insert_string(&mut properties, "deduplication", &lob.deduplication);
+    insert_string(&mut properties, "in_row", &lob.in_row);
+    insert_string(&mut properties, "format", &lob.format);
+    insert_bool(&mut properties, "partitioned", lob.partitioned == "YES");
+    insert_bool(&mut properties, "securefile", lob.securefile == "YES");
+    insert_string(&mut properties, "segment_created", &lob.segment_created);
+    insert_optional_string(
+        &mut properties,
+        "retention_type",
+        lob.retention_type.as_deref(),
+    );
+    insert_optional_i64(&mut properties, "retention_value", lob.retention_value);
+    insert_optional_string(&mut properties, "value_based", lob.value_based.as_deref());
+    insert_optional_i64(&mut properties, "max_inline", lob.max_inline);
+    add_oracle_lob_index_inventory_properties(&mut properties, index_inventory);
+    properties
+}
+
+fn oracle_lob_partition_properties(
+    partition: &RawLobPartition,
+    segment_inventory: &RawInventoryObject,
+    index_inventory: &RawInventoryObject,
+) -> BTreeMap<String, MetadataValue> {
+    let mut properties = inventory_properties(segment_inventory);
+    insert_string(
+        &mut properties,
+        "table_partition",
+        &partition.table_partition,
+    );
+    insert_string(&mut properties, "lob_name", &partition.lob_name);
+    insert_string(
+        &mut properties,
+        "lob_index_partition_name",
+        &partition.index_partition_name,
+    );
+    insert_i64(&mut properties, "position", partition.position);
+    insert_bool(&mut properties, "composite", partition.composite == "YES");
+    insert_i64(&mut properties, "chunk", partition.chunk);
+    insert_optional_i64(&mut properties, "pctversion", partition.pctversion);
+    insert_string(&mut properties, "cache", &partition.cache);
+    insert_string(&mut properties, "in_row", &partition.in_row);
+    insert_optional_string(
+        &mut properties,
+        "tablespace",
+        partition.tablespace.as_deref(),
+    );
+    insert_optional_string(&mut properties, "retention", partition.retention.as_deref());
+    insert_string(&mut properties, "logging", &partition.logging);
+    insert_string(&mut properties, "encrypt", &partition.encrypt);
+    insert_string(&mut properties, "compression", &partition.compression);
+    insert_string(&mut properties, "deduplication", &partition.deduplication);
+    insert_string(&mut properties, "securefile", &partition.securefile);
+    insert_string(
+        &mut properties,
+        "segment_created",
+        &partition.segment_created,
+    );
+    insert_optional_i64(&mut properties, "max_inline", partition.max_inline);
+    add_oracle_lob_index_inventory_properties(&mut properties, index_inventory);
+    properties
+}
+
+fn oracle_lob_subpartition_properties(
+    subpartition: &RawLobSubpartition,
+    segment_inventory: &RawInventoryObject,
+    index_inventory: &RawInventoryObject,
+) -> BTreeMap<String, MetadataValue> {
+    let mut properties = inventory_properties(segment_inventory);
+    insert_string(
+        &mut properties,
+        "lob_partition_name",
+        &subpartition.lob_partition_name,
+    );
+    insert_string(
+        &mut properties,
+        "table_subpartition",
+        &subpartition.table_subpartition,
+    );
+    insert_string(
+        &mut properties,
+        "lob_index_subpartition_name",
+        &subpartition.index_subpartition_name,
+    );
+    insert_i64(&mut properties, "position", subpartition.position);
+    insert_i64(&mut properties, "chunk", subpartition.chunk);
+    insert_optional_i64(&mut properties, "pctversion", subpartition.pctversion);
+    insert_string(&mut properties, "cache", &subpartition.cache);
+    insert_string(&mut properties, "in_row", &subpartition.in_row);
+    insert_optional_string(
+        &mut properties,
+        "tablespace",
+        subpartition.tablespace.as_deref(),
+    );
+    insert_optional_string(
+        &mut properties,
+        "retention",
+        subpartition.retention.as_deref(),
+    );
+    insert_string(&mut properties, "logging", &subpartition.logging);
+    insert_string(&mut properties, "encrypt", &subpartition.encrypt);
+    insert_string(&mut properties, "compression", &subpartition.compression);
+    insert_string(
+        &mut properties,
+        "deduplication",
+        &subpartition.deduplication,
+    );
+    insert_string(&mut properties, "securefile", &subpartition.securefile);
+    insert_string(
+        &mut properties,
+        "segment_created",
+        &subpartition.segment_created,
+    );
+    insert_optional_i64(&mut properties, "max_inline", subpartition.max_inline);
+    add_oracle_lob_index_inventory_properties(&mut properties, index_inventory);
+    properties
+}
+
+fn add_oracle_lob_index_inventory_properties(
+    properties: &mut BTreeMap<String, MetadataValue>,
+    inventory: &RawInventoryObject,
+) {
+    insert_i64(properties, "lob_index_object_id", inventory.object_id);
+    insert_optional_i64(
+        properties,
+        "lob_index_data_object_id",
+        inventory.data_object_id,
+    );
+    insert_string(properties, "lob_index_status", &inventory.status);
+    insert_bool(properties, "lob_index_generated", inventory.generated);
 }
 
 fn oracle_trigger_definition(trigger: &RawTrigger) -> Result<String, CatalogError> {
@@ -12330,7 +13758,10 @@ fn discovery_counts_from_catalog(
             + raw.table_partitions.len()
             + raw.table_subpartitions.len()
             + raw.index_partitions.len()
-            + raw.index_subpartitions.len(),
+            + raw.index_subpartitions.len()
+            + raw.lobs.len()
+            + raw.lob_partitions.len()
+            + raw.lob_subpartitions.len(),
     );
     set_object_count(&mut objects, ObjectCategory::Trigger, raw.triggers.len());
     set_object_count(
@@ -12477,6 +13908,9 @@ fn discovery_counts_from_catalog(
             + raw.table_subpartitions.len()
             + raw.index_partitions.len()
             + raw.index_subpartitions.len()
+            + raw.lobs.len()
+            + raw.lob_partitions.len()
+            + raw.lob_subpartitions.len()
             + raw.type_methods.len()
             + raw.type_method_parameters.len()
             + raw.view_columns.len()
@@ -12511,6 +13945,8 @@ fn discovery_counts_from_catalog(
             + raw.package_arguments.len()
             + raw.type_method_parameters.len()
             + package_dependency_count
+            + raw.lob_partitions.len()
+            + raw.lob_subpartitions.len()
             + raw
                 .constraints
                 .iter()
@@ -12820,7 +14256,13 @@ mod tests {
             .expect("create typed-column table");
         setup
             .execute(
-                "CREATE TABLE PARTITIONED_EVENTS (ID NUMBER, EVENT_DATE DATE, REGION VARCHAR2(10), PAYLOAD VARCHAR2(50)) PARTITION BY RANGE (EVENT_DATE) SUBPARTITION BY HASH (REGION) SUBPARTITIONS 2 (PARTITION P_2025 VALUES LESS THAN (DATE '2026-01-01'), PARTITION P_MAX VALUES LESS THAN (MAXVALUE))",
+                "CREATE TABLE LOB_DOCUMENTS (ID NUMBER, CONTENT CLOB, BINARY_CONTENT BLOB)",
+                &[],
+            )
+            .expect("create unpartitioned LOB table");
+        setup
+            .execute(
+                "CREATE TABLE PARTITIONED_EVENTS (ID NUMBER, EVENT_DATE DATE, REGION VARCHAR2(10), PAYLOAD CLOB) LOB (PAYLOAD) STORE AS SECUREFILE PARTITION BY RANGE (EVENT_DATE) SUBPARTITION BY HASH (REGION) SUBPARTITIONS 2 (PARTITION P_2025 VALUES LESS THAN (DATE '2026-01-01'), PARTITION P_MAX VALUES LESS THAN (MAXVALUE))",
                 &[],
             )
             .expect("create composite-partitioned table");
@@ -12894,7 +14336,34 @@ mod tests {
         let certified = complete
             .certified_snapshot()
             .expect("simple Oracle schema must be certified");
-        assert_eq!(certified.snapshot.schema.tables.len(), 4);
+        let dba_complete = analyze_oracle(
+            &admin_url,
+            "oracle-dba-live",
+            Vec::new(),
+            vec![cleanup.username.clone()],
+            30_000,
+        );
+        assert_eq!(
+            dba_complete.status(),
+            AnalysisStatus::Complete,
+            "Oracle DBA-scope analysis failed: {:?}",
+            dba_complete.failure()
+        );
+        let dba_certified = dba_complete
+            .certified_snapshot()
+            .expect("DBA-scoped Oracle schema must be certified");
+        assert_eq!(dba_certified.snapshot.schema.tables.len(), 5);
+        assert_eq!(
+            dba_certified
+                .snapshot
+                .metadata
+                .objects
+                .iter()
+                .filter(|object| { object.extension_kind.as_deref() == Some("oracle_lob_storage") })
+                .count(),
+            3
+        );
+        assert_eq!(certified.snapshot.schema.tables.len(), 5);
         assert!(certified
             .snapshot
             .schema
@@ -13151,22 +14620,129 @@ mod tests {
         assert!(table_partitions.iter().any(|partition| {
             partition.name == "P_MAX" && partition.definition.as_deref() == Some("MAXVALUE")
         }));
-        assert_eq!(
-            certified
+        let table_subpartitions = certified
+            .snapshot
+            .metadata
+            .objects
+            .iter()
+            .filter(|object| {
+                object.extension_kind.as_deref() == Some("oracle_table_subpartition")
+                    && object.parent_key.as_ref().is_some_and(|parent| {
+                        table_partitions
+                            .iter()
+                            .any(|partition| partition.key == *parent)
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(table_subpartitions.len(), 4);
+        let lob_storage = certified
+            .snapshot
+            .metadata
+            .objects
+            .iter()
+            .filter(|object| object.extension_kind.as_deref() == Some("oracle_lob_storage"))
+            .collect::<Vec<_>>();
+        assert_eq!(lob_storage.len(), 3);
+        let payload_column = certified
+            .snapshot
+            .schema
+            .columns
+            .iter()
+            .find(|column| column.table_key == partitioned_table.key && column.name == "PAYLOAD")
+            .expect("partitioned LOB column is mapped");
+        let payload_lob = lob_storage
+            .iter()
+            .find(|object| object.parent_key.as_ref() == Some(&payload_column.key))
+            .expect("partitioned LOB storage is mapped");
+        assert!(matches!(
+            payload_lob.properties.get("partitioned"),
+            Some(MetadataValue::Boolean(true))
+        ));
+        assert!(matches!(
+            payload_lob.properties.get("securefile"),
+            Some(MetadataValue::Boolean(true))
+        ));
+        let lob_partitions = certified
+            .snapshot
+            .metadata
+            .objects
+            .iter()
+            .filter(|object| {
+                object.extension_kind.as_deref() == Some("oracle_lob_partition")
+                    && object.parent_key.as_ref() == Some(&payload_lob.key)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lob_partitions.len(), 2);
+        for partition in &lob_partitions {
+            assert!(certified
                 .snapshot
                 .metadata
-                .objects
+                .relationships
                 .iter()
-                .filter(|object| {
-                    object.extension_kind.as_deref() == Some("oracle_table_subpartition")
-                        && object.parent_key.as_ref().is_some_and(|parent| {
-                            table_partitions
-                                .iter()
-                                .any(|partition| partition.key == *parent)
-                        })
-                })
+                .any(|relationship| {
+                    matches!(
+                        &relationship.kind,
+                        MetadataRelationshipKind::Extension(kind)
+                            if kind == "oracle_lob_partition_storage"
+                    ) && relationship.from_key == partition.key
+                        && table_partitions
+                            .iter()
+                            .any(|table_partition| table_partition.key == relationship.to_key)
+                }));
+        }
+        let lob_subpartitions = certified
+            .snapshot
+            .metadata
+            .objects
+            .iter()
+            .filter(|object| {
+                object.extension_kind.as_deref() == Some("oracle_lob_subpartition")
+                    && object.parent_key.as_ref().is_some_and(|parent| {
+                        lob_partitions
+                            .iter()
+                            .any(|partition| partition.key == *parent)
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lob_subpartitions.len(), 4);
+        for subpartition in &lob_subpartitions {
+            assert!(certified
+                .snapshot
+                .metadata
+                .relationships
+                .iter()
+                .any(|relationship| {
+                    matches!(
+                        &relationship.kind,
+                        MetadataRelationshipKind::Extension(kind)
+                            if kind == "oracle_lob_subpartition_storage"
+                    ) && relationship.from_key == subpartition.key
+                        && table_subpartitions
+                            .iter()
+                            .any(|table_subpartition| table_subpartition.key == relationship.to_key)
+                }));
+        }
+        for storage in &lob_storage {
+            let Some(MetadataValue::String(index_name)) = storage.properties.get("index_name")
+            else {
+                panic!("LOB storage must expose its generated index name");
+            };
+            assert!(certified
+                .snapshot
+                .schema
+                .indexes
+                .iter()
+                .all(|index| index.name != *index_name));
+        }
+        assert_eq!(
+            lob_storage
+                .iter()
+                .filter(|storage| matches!(
+                    storage.properties.get("partitioned"),
+                    Some(MetadataValue::Boolean(false))
+                ))
                 .count(),
-            4
+            2
         );
         for (index_name, locality, partition_count, subpartition_count) in [
             ("IX_PART_EVENTS_LOCAL", "LOCAL", 2, 4),
@@ -13319,7 +14895,7 @@ mod tests {
         let certified = complete
             .certified_snapshot()
             .expect("Oracle materialized-view schema must be certified");
-        assert_eq!(certified.snapshot.schema.tables.len(), 4);
+        assert_eq!(certified.snapshot.schema.tables.len(), 5);
         assert!(certified
             .snapshot
             .schema
